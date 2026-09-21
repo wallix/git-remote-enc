@@ -1,0 +1,22 @@
+[package]
+name = "enccore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+# The encrypted-remote library: manifest format, crypto (age + SSH
+# signatures), the git-hosted backend, local trust state and the push/fetch
+# logic. The `git-remote-enc` binary is a thin protocol loop over this crate.
+
+[dependencies]
+anyhow = { workspace = true }
+age = { workspace = true }
+ssh-key = { workspace = true }
+sha2 = { workspace = true }
+rpassword = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+# RUSTSEC ignore list read by `cargo audit` (CI and `task audit`).
+[advisories]
+ignore = [
+  # rsa 0.9: Marvin attack (timing side channel in RSA private-key
+  # operations). Pulled in by age's `ssh` feature and ssh-key's `rsa` feature
+  # for ssh-rsa participants; no fixed upstream release exists. Residual risk:
+  # the private-key operation runs locally, on the user's own machine, when
+  # decrypting a manifest with an ssh-rsa identity; an attacker would need to
+  # time that local process. ssh-ed25519 participants are unaffected and are
+  # the recommended key type.
+  "RUSTSEC-2023-0071",
+]

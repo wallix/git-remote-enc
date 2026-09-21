@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target
+
+# release output
+dist/
+
+.DS_Store
+
+# editors
+.idea/
+.vscode/settings.json
+.fleet/
+
+# exuberant ctags
+tags
+
+/tmp

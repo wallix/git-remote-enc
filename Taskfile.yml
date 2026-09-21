@@ -1,0 +1,70 @@
+# The project's own Taskfile (task-rs, native Jinja dialect).
+version: '3'
+templater: jinja
+
+tasks:
+  default:
+    cmds:
+      - task: lint
+      - task: test
+
+  build:
+    desc: Build the git-remote-enc binary (debug)
+    cmds:
+      - cargo build -p git-remote-enc
+
+  install:
+    desc: Install the git-remote-enc binary
+    aliases: [i]
+    cmds:
+      - cargo install --path crates/git-remote-enc
+
+  test:
+    desc: Run the test suite
+    aliases: [t]
+    cmds:
+      - cargo test --workspace --locked
+
+  lint:
+    desc: Run clippy on all targets
+    aliases: [l]
+    cmds:
+      - cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  fmt:
+    desc: Format all sources
+    aliases: [f, format]
+    cmds:
+      - cargo fmt --all
+
+  fmt:check:
+    desc: Check that all sources are formatted
+    cmds:
+      - cargo fmt --all -- --check
+
+  audit:
+    desc: Scan the dependency tree for RUSTSEC advisories
+    cmds:
+      - cargo audit --deny warnings
+
+  release:build:
+    desc: Build the reproducible static-musl release binary (dist/git-remote-enc) via build.sh
+    cmds:
+      - ./build.sh {{ CLI_ARGS }}
+
+  release:verify:
+    desc: Build twice from a clean copy and assert byte-identical binaries
+    cmds:
+      - ./build.sh --verify
+
+  release:e2e:
+    desc: Run the release end-to-end gate over the archives in dist/
+    cmds:
+      - ./tests/release-e2e.sh
+
+  clean:
+    desc: Clean build artifacts
+    aliases: [clear]
+    cmds:
+      - cargo clean
+      - rm -rf dist/
