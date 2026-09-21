@@ -1,0 +1,27 @@
+[package]
+name = "git-remote-enc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "git-remote-enc"
+path = "src/main.rs"
+
+[dependencies]
+enccore = { path = "../enccore" }
+# anyhow only here, at the application boundary: the helper reports one error
+# chain to git's stderr and exits non-zero.
+anyhow = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# The black-box suite generates throwaway ed25519 keys and age identities
+# instead of touching ~/.ssh.
+ssh-key = { workspace = true }
+age = { workspace = true }

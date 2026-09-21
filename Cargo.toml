@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = ["crates/enccore", "crates/git-remote-enc"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = [
+    "Vincent Vanackere <vvanackere@wallix.com>",
+    "WALLIX",
+]
+license = "Apache-2.0"
+repository = "https://github.com/wallix/git-remote-enc"
+homepage = "https://github.com/wallix/git-remote-enc"
+description = "git remote helper storing an end-to-end encrypted repository inside an ordinary git repository (GitLab, GitHub, any host)"
+
+# Smaller, faster, more deterministic release binaries: cross-crate inlining +
+# dead-code elimination (thin LTO, one codegen unit) and symbol stripping.
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+# Deny-lints applied to every workspace member (each crate opts in with
+# `[lints] workspace = true`). Tests relax them at the crate root with
+# `#![cfg_attr(test, allow(...))]`, never here.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+
+# Single source of truth for dependency versions. Members reference these with
+# `<dep>.workspace = true` and add only the per-crate features they need.
+[workspace.dependencies]
+anyhow = "1"
+# The age file format (X25519 recipients, ChaCha20-Poly1305 STREAM payload)
+# for every ciphertext the helper stores: the manifest, encrypted to the
+# participants, and each pack, encrypted to a fresh per-pack key. The `ssh`
+# feature accepts ssh-ed25519 / ssh-rsa public keys as recipients and OpenSSH
+# private keys as identities, so a participant is identified by the SSH key
+# they already use with the hosting service. Reimplementing the format is
+# correctness-critical; the crate is the reference implementation.
+age = { version = "0.12", default-features = false, features = ["ssh"] }
+# OpenSSH key parsing (including passphrase-encrypted private keys) and SSH
+# signatures (`ssh-keygen -Y sign` format) for manifest authentication, so the
+# same SSH key both decrypts and signs. Pure Rust, musl-static friendly.
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "rsa", "ecdsa", "encryption", "std"] }
+# SHA-256 names the encrypted packs in the manifest and keys the per-remote
+# local state directory. No stdlib hash.
+sha2 = "0.11"
+# Reading a key passphrase from /dev/tty with echo disabled needs termios,
+# which std does not expose. stdout is git's protocol channel, so the prompt
+# must go to the tty, which this crate does by default.
+rpassword = "7"

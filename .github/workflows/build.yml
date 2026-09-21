@@ -1,0 +1,153 @@
+name: Build
+
+# Builds and packages release artifacts. CI runs only the Linux jobs; releases
+# run the full matrix.
+#
+# Linux uses build.sh and the pinned devcontainer: the binaries are reproducible
+# and, on a release, rebuilt from a clean copy and required to match. macOS uses
+# the pinned runner image's rustup with the same remapping and epoch; those
+# binaries are reproducible only on the same runner image. package.sh creates
+# every archive on Linux so archive bytes come from one archiver.
+#
+# Windows is not built: the helper reads /dev/urandom and prompts on /dev/tty,
+# and git remote helpers there are an unusual setup anyway.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        type: string
+        required: true
+      retention-days:
+        type: number
+        required: true
+      linux-only:
+        type: boolean
+        default: false
+      verify-reproducible:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Linux builds are native to the runner architecture.
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: ubuntu-24.04
+          - arch: aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and package (linux-${{ matrix.arch }})
+        run: ./build.sh --docker --target=${{ matrix.arch }} --package ${{ inputs.verify-reproducible && '--verify' || '' }}
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-archive-linux-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            dist/git-remote-enc-linux-${{ matrix.arch }}.tar.gz
+            dist/git-remote-enc-linux-${{ matrix.arch }}.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: ${{ inputs.retention-days }}
+
+      # Keep the archiver-independent binary digest and pinned inputs as a release asset.
+      - name: Name the build manifest for its platform
+        run: cp dist/git-remote-enc.sha256 dist/git-remote-enc-linux-${{ matrix.arch }}.build-info.txt
+
+      - name: Upload build manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-manifest-linux-${{ matrix.arch }}-${{ github.sha }}
+          path: dist/git-remote-enc-linux-${{ matrix.arch }}.build-info.txt
+          if-no-files-found: error
+          overwrite: true
+          retention-days: ${{ inputs.retention-days }}
+
+  # Native builds use the toolchain rust-toolchain.toml pins, via the runner's rustup.
+  native:
+    if: ${{ !inputs.linux-only }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-x86_64
+            target: x86_64-apple-darwin
+            runs-on: macos-15
+          - platform: macos-aarch64
+            target: aarch64-apple-darwin
+            runs-on: macos-15
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain and target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (${{ matrix.platform }})
+        env:
+          SOURCE_DATE_EPOCH: 0
+          CARGO_INCREMENTAL: 0
+        run: |
+          set -euo pipefail
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=$cargo_home=/cargo"
+          echo "RUSTFLAGS=$RUSTFLAGS"
+          cargo build --release -p git-remote-enc --target ${{ matrix.target }} --locked
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-binary-${{ matrix.platform }}-${{ github.sha }}
+          path: target/${{ matrix.target }}/release/git-remote-enc
+          if-no-files-found: error
+          overwrite: true
+          retention-days: ${{ inputs.retention-days }}
+
+  # Package native binaries with the same Linux archiver used for Linux builds.
+  package:
+    if: ${{ !inputs.linux-only }}
+    needs: native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep artifacts separate because their binary names overlap.
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact-prefix }}-binary-*-${{ github.sha }}
+          path: ${{ runner.temp }}/binaries
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          for platform in macos-x86_64 macos-aarch64; do
+            dir="${{ runner.temp }}/binaries/${{ inputs.artifact-prefix }}-binary-$platform-${{ github.sha }}"
+            ./package.sh --platform "$platform" --binary "$dir/git-remote-enc"
+          done
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-archive-native-${{ github.sha }}
+          path: |
+            dist/git-remote-enc-macos-x86_64.tar.gz
+            dist/git-remote-enc-macos-x86_64.sha256
+            dist/git-remote-enc-macos-aarch64.tar.gz
+            dist/git-remote-enc-macos-aarch64.sha256
+          if-no-files-found: error
+          overwrite: true
+          retention-days: ${{ inputs.retention-days }}

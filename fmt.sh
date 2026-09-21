@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Run rustfmt on all sources in the devcontainer's locked Nix toolchain. ./update.sh
+# keeps its version aligned with rust-toolchain.toml and CI. Like build.sh, prefer
+# vk on PATH (microVM); --docker forces Docker. Forward extra arguments to cargo fmt
+# (e.g. --check).
+set -euo pipefail
+cd "$(dirname "$0")"
+
+FORCE_DOCKER=""
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --docker) FORCE_DOCKER=1 ;;
+    *) args+=("$arg") ;;
+  esac
+done
+
+if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
+  # Dogfood the vk on PATH: it builds the devcontainer image and runs cargo fmt in a microVM
+  # with the repo mounted at the workdir; virtiofs writes the reformatted files back as the
+  # host user. No --net — rustfmt neither compiles nor fetches.
+  echo "fmt.sh: formatting with vk from PATH ($(command -v vk)); pass --docker to force Docker" >&2
+  exec vk run \
+    --file .devcontainer/Dockerfile --context .devcontainer --target enc-build \
+    --workdir "$PWD" \
+    -- cargo fmt --all "${args[@]}"
+fi
+
+docker build --target enc-build -t enc-build -f .devcontainer/Dockerfile .devcontainer
+
+docker run --rm \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD":/work -w /work \
+  enc-build \
+  cargo fmt --all "${args[@]}"

@@ -1,0 +1,5 @@
+# Pin the toolchain so every developer and CI build with the same compiler.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
