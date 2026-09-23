@@ -55,7 +55,7 @@ impl Identity {
 }
 
 /// Load every identity in `paths`. Each file is either an OpenSSH private
-/// key (`ssh-ed25519` or `ssh-rsa`; passphrase-protected keys are decrypted
+/// key (`ssh-ed25519`; passphrase-protected keys are decrypted
 /// with a prompt on the tty) or an age identity file.
 pub fn load_identities(paths: &[PathBuf]) -> Result<Vec<Identity>> {
     let mut out = Vec::new();
@@ -84,12 +84,12 @@ fn load_ssh_identity(path: &Path, pem: &str) -> Result<Identity> {
             .decrypt(passphrase.as_bytes())
             .with_context(|| format!("decrypting SSH key {}", path.display()))?;
     }
-    match key.algorithm() {
-        ssh_key::Algorithm::Ed25519 | ssh_key::Algorithm::Rsa { .. } => {}
-        other => bail!(
-            "{}: {other} keys cannot be used for encryption; use an ssh-ed25519 or ssh-rsa key",
-            path.display()
-        ),
+    if key.algorithm() != ssh_key::Algorithm::Ed25519 {
+        bail!(
+            "{}: {} keys are not supported; use an ssh-ed25519 key",
+            path.display(),
+            key.algorithm()
+        );
     }
     // age parses the key itself; hand it the decrypted key re-serialised.
     let plain = key
@@ -161,15 +161,22 @@ impl Participant {
         }
         let public = PublicKey::from_openssh(text)
             .with_context(|| format!("invalid participant key `{text}`"))?;
+        // ssh-rsa is refused: the `rsa` crate age uses for it has an
+        // unfixed timing side channel (RUSTSEC-2023-0071).
+        if public.algorithm() != ssh_key::Algorithm::Ed25519 {
+            bail!(
+                "participant `{text}`: {} keys are not supported; use an ssh-ed25519 or age1… key",
+                public.algorithm()
+            );
+        }
         // age's parser wants exactly `<type> <base64>`; drop any comment.
         let bare = text
             .split_whitespace()
             .take(2)
             .collect::<Vec<_>>()
             .join(" ");
-        let recipient = age::ssh::Recipient::from_str(&bare).map_err(|e| {
-            anyhow!("participant `{text}` cannot be an age recipient: {e:?} (only ssh-ed25519 and ssh-rsa are supported)")
-        })?;
+        let recipient = age::ssh::Recipient::from_str(&bare)
+            .map_err(|e| anyhow!("participant `{text}` cannot be an age recipient: {e:?}"))?;
         Ok(Participant::Ssh {
             text: text.to_owned(),
             public,
@@ -429,6 +436,9 @@ mod tests {
         let p = Participant::parse(&id.to_public().to_string()).unwrap();
         assert!(!p.can_sign());
         assert!(Participant::parse("garbage").is_err());
+        let rsa = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQDMedYM//B0/qDeXYaDBhekHB6LuonqH4bymUIoew/eq0NKMmJfSGBQFJV7oYTg/iIDILdtFdk09BNUZJT/Dfu6qRSwmUHJwU+ARneNuvEjoNkVdpDhCTyLEhSuvaHE/GuQs83x6srPYdTxvaW6mIrfB5H5cIVdKbzq1DQ0XeB8KQ== rsa";
+        let err = Participant::parse(rsa).err().unwrap().to_string();
+        assert!(err.contains("not supported"), "{err}");
     }
 
     #[test]

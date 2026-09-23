@@ -15,8 +15,8 @@ signed manifest can read refs, history or the participant list itself. Pushes
 and fetches are incremental, concurrent pushes are safe, and a non-fast-forward
 push is rejected exactly as on a plain remote.
 
-Participants are identified by the SSH keys they already use (`ssh-ed25519`,
-`ssh-rsa`), or by age public keys for read-only access. Encryption is
+Participants are identified by the `ssh-ed25519` keys they already use, or by
+age public keys for read-only access (`ssh-rsa` is not supported). Encryption is
 [age](https://age-encryption.org) (X25519, ChaCha20-Poly1305); authentication is
 SSH signatures.
 

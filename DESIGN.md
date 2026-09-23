@@ -129,7 +129,7 @@ generation 42
 repo 3f9c6e4d0b1a2c7e8d9f0a1b2c3d4e5f
 head refs/heads/main
 participant ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop
-participant ssh-rsa AAAAB3NzaC1yc2EAAA... bob@ci
+participant ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... bob@ci
 participant age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
 ref 7f3a...c1 refs/heads/main
 ref 91b2...4e refs/tags/v1.0
@@ -143,7 +143,7 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 | `generation <n>` | strictly increasing per push; anti-rollback (section 6.2) |
 | `repo <hex>` | random id chosen at creation; detects a recreated remote |
 | `head <ref>` | what `HEAD` points to on clone (first pushed branch by default) |
-| `participant <key>` | an `ssh-ed25519`/`ssh-rsa` public key (may read, may push) or an `age1…` recipient (read-only, cannot sign) |
+| `participant <key>` | an `ssh-ed25519` public key (may read, may push) or an `age1…` recipient (read-only, cannot sign) |
 | `ref <oid> <name>` | a git ref and its object id, as in `git ls-remote` |
 | `pack <sha256> <age-secret-key>` | a pack blob and the X25519 identity that decrypts it, in append order |
 | `extn <name> …` | reserved: unknown items are preserved verbatim by writers that do not understand them |
@@ -319,7 +319,7 @@ revocation means a fresh remote and a re-push (`git push --mirror`).
 
 ### 6.5 Key material on the client
 
-Identities are OpenSSH private keys (`ssh-ed25519`, `ssh-rsa`; passphrase
+Identities are OpenSSH private keys (`ssh-ed25519`; passphrase
 protected keys are decrypted with a prompt on `/dev/tty`) or age identity
 files. ssh-agent cannot be used for decryption: X25519 key agreement is not an
 agent operation. The same SSH key signs; signing therefore also uses the key

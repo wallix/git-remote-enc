@@ -2,11 +2,11 @@
 [advisories]
 ignore = [
   # rsa 0.9: Marvin attack (timing side channel in RSA private-key
-  # operations). Pulled in by age's `ssh` feature and ssh-key's `rsa` feature
-  # for ssh-rsa participants; no fixed upstream release exists. Residual risk:
-  # the private-key operation runs locally, on the user's own machine, when
-  # decrypting a manifest with an ssh-rsa identity; an attacker would need to
-  # time that local process. ssh-ed25519 participants are unaffected and are
-  # the recommended key type.
+  # operations); no fixed upstream release exists. It is in the tree only
+  # because age's `ssh` feature, which the helper needs for ssh-ed25519
+  # recipients, depends on it unconditionally. The helper refuses ssh-rsa
+  # participants and identities before age sees them, so no RSA key is ever
+  # parsed into it and no RSA operation runs. Residual risk: none while that
+  # check stands; drop this entry when age releases a fixed `rsa`.
   "RUSTSEC-2023-0071",
 ]
