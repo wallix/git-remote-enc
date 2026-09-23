@@ -531,6 +531,25 @@ fn access_control() {
 }
 
 #[test]
+fn option_like_urls_are_refused() {
+    let sb = Sandbox::new("optionurl");
+    let (alice, _) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    let witness = sb.root.join("pwned");
+    for url in [
+        format!("enc::--upload-pack=touch {}", witness.display()),
+        format!("enc::-u touch {}", witness.display()),
+    ] {
+        let id = format!("enc.identity={}", alice.display());
+        let err = sb.git_fails(&a, &["-c", &id, "fetch", &url, "main"]);
+        assert!(err.contains("starts with `-`"), "{err}");
+        let err = sb.git_fails(&a, &["-c", &id, "push", &url, "main"]);
+        assert!(err.contains("starts with `-`"), "{err}");
+    }
+    assert!(!witness.exists(), "the URL was run as a git option");
+}
+
+#[test]
 fn rollback_and_recreation_are_refused() {
     let sb = Sandbox::new("rollback");
     let host = sb.host();

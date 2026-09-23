@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Security: an `enc::` URL starting with `-` could make git run an arbitrary
+  command (`enc::--upload-pack=…`). Such URLs are now refused, and the backend
+  URL can no longer be read as a git option.
+
 ## v0.1.0 - 2026-09-21
 
 - Initial implementation: `enc::<git-url>[#<branch>]` remotes store an
