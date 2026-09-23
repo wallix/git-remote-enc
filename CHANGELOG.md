@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The undocumented `GIT_ENC_PASSPHRASE` environment variable is no longer
+  read: a passphrase-protected key is unlocked only from the terminal.
 - Security: `git-remote-enc manifest` no longer prints the pack keys, which
   decrypt the whole history; `--show-keys` prints them.
 - Security: an `enc::` URL starting with `-` could make git run an arbitrary
