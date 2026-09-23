@@ -51,8 +51,13 @@ URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
 Inspect the decrypted manifest of a remote from inside a repository:
 
 ```bash
-git-remote-enc manifest secret        # a remote name, or an enc:: URL
+git-remote-enc manifest secret              # a remote name, or an enc:: URL
+git-remote-enc manifest --show-keys secret  # also print the pack keys
 ```
+
+Pack keys are replaced by `<redacted>` unless `--show-keys` is given: together
+they decrypt the whole history, so keep them out of terminals, logs and bug
+reports.
 
 ## License
 

@@ -32,14 +32,14 @@ fn run() -> Result<()> {
             println!("git-remote-enc {}", enccore::version::VERSION);
             Ok(())
         }
-        [cmd, target] if cmd == "manifest" => {
-            // A configured remote name resolves to its URL and its config.
-            let (name, url) = match enccore::git::config(&format!("remote.{target}.url"))? {
-                Some(url) => (Some(target.as_str()), url),
-                None => (None, target.clone()),
+        [cmd, rest @ ..] if cmd == "manifest" && matches!(rest.len(), 1 | 2) => {
+            let (with_keys, target) = match rest {
+                [flag, target] if flag == "--show-keys" => (true, target),
+                [target] => (false, target),
+                _ => usage(),
             };
-            let mut remote = Remote::open(name, &url)?;
-            match remote.manifest_text()? {
+            let mut remote = open_by_name_or_url(target)?;
+            match remote.manifest_text(with_keys)? {
                 Some(text) => print!("{text}"),
                 None => bail!("no encrypted remote at {}", remote.url()),
             }
@@ -47,13 +47,24 @@ fn run() -> Result<()> {
         }
         [name, url] => helper(Remote::open(Some(name), url)?),
         [url] => helper(Remote::open(None, url)?),
-        _ => {
-            eprintln!(
-                "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest <remote|url>\n       git-remote-enc --version"
-            );
-            std::process::exit(2);
-        }
+        _ => usage(),
     }
+}
+
+fn usage() -> ! {
+    eprintln!(
+        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc --version"
+    );
+    std::process::exit(2);
+}
+
+/// A configured remote name resolves to its URL and its config.
+fn open_by_name_or_url(target: &str) -> Result<Remote> {
+    let (name, url) = match enccore::git::config(&format!("remote.{target}.url"))? {
+        Some(url) => (Some(target), url),
+        None => (None, target.to_owned()),
+    };
+    Remote::open(name, &url)
 }
 
 fn helper(mut remote: Remote) -> Result<()> {

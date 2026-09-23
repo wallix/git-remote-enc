@@ -282,23 +282,26 @@ fn push_clone_fetch_roundtrip() {
     let ls = sb.git_ok(&b, &["ls-remote", "origin"]);
     assert!(!ls.contains("refs/heads/tmp"));
 
-    // The inspection subcommand, by remote name, shows the participants.
-    let out = sb
-        .cmd(&a, "git-remote-enc")
-        .args(["manifest", "enc"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let m = String::from_utf8(out.stdout).unwrap();
+    // The inspection subcommand, by remote name, shows the participants
+    // but not the pack keys unless asked.
+    let manifest = |args: &[&str]| {
+        let out = sb.cmd(&a, "git-remote-enc").args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let m = manifest(&["manifest", "enc"]);
     assert!(m.starts_with("enc-manifest 1\n"), "{m}");
     assert!(m.contains("participant ssh-ed25519"));
     // Three pushes carried objects; the tag, branch and deletion pushes
     // only moved refs and stored no pack.
     assert_eq!(m.matches("\npack ").count(), 3, "{m}");
+    assert!(!m.contains("AGE-SECRET-KEY-"), "{m}");
+    let m = manifest(&["manifest", "--show-keys", "enc"]);
+    assert_eq!(m.matches(" AGE-SECRET-KEY-").count(), 3, "{m}");
 }
 
 #[test]

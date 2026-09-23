@@ -5,6 +5,8 @@ use std::fmt;
 
 pub const FORMAT_VERSION: u32 = 1;
 const HEADER: &str = "enc-manifest";
+/// Stands in for a pack key in a displayed manifest.
+pub const REDACTED_KEY: &str = "<redacted>";
 
 /// A pack blob and the age identity that decrypts it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +125,16 @@ impl Manifest {
     }
 
     pub fn serialize(&self) -> String {
+        self.render(true)
+    }
+
+    /// [`Manifest::serialize`] with every pack key replaced by
+    /// [`REDACTED_KEY`], for display.
+    pub fn serialize_redacted(&self) -> String {
+        self.render(false)
+    }
+
+    fn render(&self, with_keys: bool) -> String {
         let mut out = format!(
             "{HEADER} {FORMAT_VERSION}\ngeneration {}\nrepo {}\n",
             self.generation, self.repo_id
@@ -137,7 +149,8 @@ impl Manifest {
             out.push_str(&format!("ref {oid} {name}\n"));
         }
         for p in &self.packs {
-            out.push_str(&format!("pack {} {}\n", p.id, p.key));
+            let key = if with_keys { &p.key } else { REDACTED_KEY };
+            out.push_str(&format!("pack {} {key}\n", p.id));
         }
         for e in &self.extensions {
             out.push_str(e);
@@ -216,6 +229,9 @@ mod tests {
         assert_eq!(m.packs.len(), 1);
         assert_eq!(m.extensions, vec!["extn future stuff"]);
         assert_eq!(m.serialize(), SAMPLE);
+        let shown = m.serialize_redacted();
+        assert!(!shown.contains("AGE-SECRET-KEY"), "{shown}");
+        assert_eq!(shown, SAMPLE.replace("AGE-SECRET-KEY-1X", REDACTED_KEY));
     }
 
     #[test]
