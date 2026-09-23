@@ -210,7 +210,7 @@ for-push`.
    pack contains only new objects and may use deltas against remote objects
    (thin). An empty pack (object count 0 in the header) is not stored.
 4. **Encrypt + hash** the pack stream into a temporary file under
-   `$GIT_DIR/enc/`, then `git hash-object -w` it.
+   `<common>/enc/`, then `git hash-object -w` it.
 5. **New manifest:** refs updated, pack line appended, `generation + 1`,
    participants from config if set else unchanged, `head` set if absent.
    Sign with the local signing key, encrypt to the participants.
@@ -252,15 +252,17 @@ that must already be present.
 
 ### 5.4 Local state
 
-Per remote, keyed by `sha256(url ‖ branch)[..16]`:
+Per remote, keyed by `sha256(url ‖ branch)[..16]`, under the repository's
+common directory (`git rev-parse --git-common-dir`: the main `.git`, shared by
+every linked worktree, so trust accepted in one worktree holds in all):
 
 - `refs/enc/<key>` — tracking ref for the backend branch. Its existence is
   what makes the next fetch/push incremental; it must not be deleted after a
   run.
-- `$GIT_DIR/enc/<key>/have` — pack names already indexed.
-- `$GIT_DIR/enc/<key>/trust` — the last accepted manifest's `generation`,
+- `<common>/enc/<key>/have` — pack names already indexed.
+- `<common>/enc/<key>/trust` — the last accepted manifest's `generation`,
   `repo` id and participant list (section 6).
-- `$GIT_DIR/enc/<key>/tmp/` — temporary files for the pack pipeline.
+- `<common>/enc/<key>/tmp/` — temporary files for the pack pipeline.
 
 The encrypted blobs live in the local object store (reachable from the
 tracking ref) next to the decrypted objects, so a repository costs roughly

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Linked worktrees share the repository's trust state for a remote instead of
+  starting from first contact.
 - Breaking: `ssh-rsa` keys are no longer accepted as participants or
   identities (the RSA implementation has an unfixed timing side channel,
   RUSTSEC-2023-0071). A remote whose participant list names an `ssh-rsa` key

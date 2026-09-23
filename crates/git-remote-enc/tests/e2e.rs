@@ -534,6 +534,25 @@ fn access_control() {
 }
 
 #[test]
+fn worktrees_share_the_trust_state() {
+    let sb = Sandbox::new("worktree");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    let wt = sb.root.join("alice-wt");
+    sb.git_ok(&a, &["worktree", "add", "-q", wt.to_str().unwrap()]);
+    let out = sb.git(&wt, &["fetch", "enc"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("first contact"), "{err}");
+}
+
+#[test]
 fn option_like_urls_are_refused() {
     let sb = Sandbox::new("optionurl");
     let (alice, _) = sb.keypair("alice");

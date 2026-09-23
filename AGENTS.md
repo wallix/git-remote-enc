@@ -47,8 +47,8 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with two crates:
   generation counter), `crypto.rs` (identities, recipients, age
   encrypt/decrypt streams, SSH sign/verify), `backend.rs` (the git-hosted
   store: tracking ref, tree/commit construction, fetch, lease push), `state.rs`
-  (per-remote local state under `$GIT_DIR/enc/`: indexed packs and the trusted
-  participant set), `remote.rs` (connect, list, fetch, push), `config.rs`
+  (per-remote local state under `<git common dir>/enc/`: indexed packs and the
+  trusted participant set), `remote.rs` (connect, list, fetch, push), `config.rs`
   (git-config surface).
 - **`crates/git-remote-enc/`** — the binary: the remote-helper protocol loop
   (`capabilities`, `list`, `fetch`, `push`) plus the `manifest` inspection
