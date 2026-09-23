@@ -19,6 +19,7 @@ age = { workspace = true }
 ssh-key = { workspace = true }
 sha2 = { workspace = true }
 rpassword = { workspace = true }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

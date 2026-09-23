@@ -7,6 +7,7 @@ use std::str::FromStr;
 use age::secrecy::ExposeSecret;
 use anyhow::{Context, Result, anyhow, bail};
 use ssh_key::PrivateKey;
+use zeroize::Zeroizing;
 
 use crate::backend::{Backend, DEFAULT_BRANCH, PushOutcome};
 use crate::config::Config;
@@ -366,13 +367,13 @@ impl Remote {
 
     /// The decrypted manifest for display. Pack keys decrypt the whole
     /// history, so they are shown only when `with_keys` is set.
-    pub fn manifest_text(&mut self, with_keys: bool) -> Result<Option<String>> {
+    pub fn manifest_text(&mut self, with_keys: bool) -> Result<Option<Zeroizing<String>>> {
         self.connect()?;
         Ok(self.manifest.as_ref().map(|m| {
             if with_keys {
                 m.serialize()
             } else {
-                m.serialize_redacted()
+                Zeroizing::new(m.serialize_redacted())
             }
         }))
     }
@@ -555,7 +556,7 @@ impl Remote {
         if let Some(p) = &pack {
             m.packs.push(Pack {
                 id: p.id.clone(),
-                key: p.key.clone(),
+                key: String::clone(&p.key),
             });
         }
 
@@ -670,7 +671,7 @@ impl Remote {
         Ok(Some(BuiltPack {
             path,
             id,
-            key: key.to_string().expose_secret().to_owned(),
+            key: Zeroizing::new(key.to_string().expose_secret().to_owned()),
         }))
     }
 }
@@ -697,7 +698,7 @@ fn trust_in(m: &Manifest, text: &str) -> Trust {
 struct BuiltPack {
     path: PathBuf,
     id: String,
-    key: String,
+    key: Zeroizing<String>,
 }
 
 #[cfg(test)]

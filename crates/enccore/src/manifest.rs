@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use zeroize::{Zeroize, Zeroizing};
+
 pub const FORMAT_VERSION: u32 = 1;
 const HEADER: &str = "enc-manifest";
 /// Stands in for a pack key in a displayed manifest.
@@ -20,6 +22,12 @@ pub struct Pack {
 impl Pack {
     pub fn blob_name(&self) -> String {
         format!("{}.age", self.id)
+    }
+}
+
+impl Drop for Pack {
+    fn drop(&mut self) {
+        self.key.zeroize();
     }
 }
 
@@ -124,8 +132,9 @@ impl Manifest {
         Ok(m)
     }
 
-    pub fn serialize(&self) -> String {
-        self.render(true)
+    /// The manifest text, pack keys included: wiped when dropped.
+    pub fn serialize(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.render(true))
     }
 
     /// [`Manifest::serialize`] with every pack key replaced by
@@ -202,8 +211,14 @@ pub fn split_envelope(envelope: &[u8]) -> Option<(&str, &str)> {
     Some((body, sig))
 }
 
-pub fn join_envelope(manifest: &str, signature_pem: &str) -> Vec<u8> {
-    let mut v = manifest.as_bytes().to_vec();
+pub fn join_envelope(manifest: &str, signature_pem: &str) -> Zeroizing<Vec<u8>> {
+    let mut v = Zeroizing::new(Vec::with_capacity(
+        manifest
+            .len()
+            .saturating_add(signature_pem.len())
+            .saturating_add(1),
+    ));
+    v.extend_from_slice(manifest.as_bytes());
     if !manifest.ends_with('\n') {
         v.push(b'\n');
     }
@@ -228,7 +243,7 @@ mod tests {
         assert_eq!(m.refs.len(), 1);
         assert_eq!(m.packs.len(), 1);
         assert_eq!(m.extensions, vec!["extn future stuff"]);
-        assert_eq!(m.serialize(), SAMPLE);
+        assert_eq!(*m.serialize(), SAMPLE);
         let shown = m.serialize_redacted();
         assert!(!shown.contains("AGE-SECRET-KEY"), "{shown}");
         assert_eq!(shown, SAMPLE.replace("AGE-SECRET-KEY-1X", REDACTED_KEY));

@@ -40,7 +40,7 @@ fn run() -> Result<()> {
             };
             let mut remote = open_by_name_or_url(target)?;
             match remote.manifest_text(with_keys)? {
-                Some(text) => print!("{text}"),
+                Some(text) => print!("{}", text.as_str()),
                 None => bail!("no encrypted remote at {}", remote.url()),
             }
             Ok(())
