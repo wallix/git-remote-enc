@@ -475,6 +475,7 @@ dependencies = [
  "rpassword",
  "sha2 0.11.0",
  "ssh-key",
+ "zeroize",
 ]
 
 [[package]]

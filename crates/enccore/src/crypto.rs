@@ -10,6 +10,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
+use zeroize::{Zeroize, Zeroizing};
 
 /// SSH signature namespace; distinct from git's own `git` namespace so a
 /// manifest signature can never be replayed as a commit signature.
@@ -80,6 +81,12 @@ pub struct TrustKey {
     key: [u8; 32],
 }
 
+impl Drop for TrustKey {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
 impl TrustKey {
     const DOMAIN: &'static [u8] = b"git-remote-enc local trust state v1";
 
@@ -131,15 +138,18 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
             *b = *k;
         }
     }
-    let pad = |byte: u8| block.map(|b| b ^ byte);
-    let inner = Sha256::new()
-        .chain_update(pad(0x36))
+    // The padded blocks are the key, and the inner hash is key-dependent.
+    let pad = |byte: u8| Zeroizing::new(block.map(|b| b ^ byte));
+    let mut inner = Sha256::new()
+        .chain_update(*pad(0x36))
         .chain_update(data)
         .finalize();
     let outer = Sha256::new()
-        .chain_update(pad(0x5c))
+        .chain_update(*pad(0x5c))
         .chain_update(inner)
         .finalize();
+    block.zeroize();
+    inner.zeroize();
     let mut out = [0u8; 32];
     for (o, b) in out.iter_mut().zip(outer) {
         *o = b;
@@ -170,9 +180,10 @@ fn load_ssh_identity(path: &Path, pem: &str) -> Result<Identity> {
     if key.is_encrypted() {
         // Only from the terminal: an environment variable would leak into
         // child processes, /proc/<pid>/environ and CI logs.
-        let passphrase =
+        let passphrase = Zeroizing::new(
             rpassword::prompt_password(format!("enc: passphrase for {}: ", path.display()))
-                .context("reading passphrase from the terminal")?;
+                .context("reading passphrase from the terminal")?,
+        );
         key = key
             .decrypt(passphrase.as_bytes())
             .with_context(|| format!("decrypting SSH key {}", path.display()))?;
@@ -373,9 +384,10 @@ pub fn decrypt_stream<R: BufRead>(
         .map_err(|e| anyhow!("pack does not decrypt with its manifest key: {e}"))
 }
 
-pub fn decrypt_to_vec(identities: &[Identity], input: &[u8]) -> Result<Vec<u8>> {
+/// The plaintext is wiped when dropped: here it is always a manifest.
+pub fn decrypt_to_vec(identities: &[Identity], input: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let mut r = decrypt_with_identities(identities, input)?;
-    let mut out = Vec::new();
+    let mut out = Zeroizing::new(Vec::new());
     r.read_to_end(&mut out)?;
     Ok(out)
 }
@@ -544,7 +556,7 @@ mod tests {
         std::fs::write(&path, pem.as_bytes()).unwrap();
         let ids = load_identities(&[path]).unwrap();
         let ct = encrypt_to_participants(&[participant], b"secret", Vec::new()).unwrap();
-        assert_eq!(decrypt_to_vec(&ids, &ct).unwrap(), b"secret");
+        assert_eq!(*decrypt_to_vec(&ids, &ct).unwrap(), b"secret");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

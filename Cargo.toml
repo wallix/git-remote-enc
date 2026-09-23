@@ -51,6 +51,10 @@ ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "e
 # SHA-256 names the encrypted packs in the manifest and keys the per-remote
 # local state directory. No stdlib hash.
 sha2 = "0.11"
+# Wiping secrets (pack keys, the decrypted manifest, passphrases, derived
+# keys) from memory when they are dropped. Already in the tree through age
+# and ssh-key, which use it for their own key types.
+zeroize = "1"
 # Reading a key passphrase from /dev/tty with echo disabled needs termios,
 # which std does not expose. stdout is git's protocol channel, so the prompt
 # must go to the tty, which this crate does by default.
