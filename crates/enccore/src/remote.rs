@@ -173,25 +173,30 @@ impl Remote {
         let envelope = crypto::decrypt_to_vec(identities, &blob)?;
         let (text, sig) =
             split_envelope(&envelope).ok_or_else(|| anyhow!("manifest is not signed"))?;
-        let m = Manifest::parse(text).context("parsing manifest")?;
 
         // Who may have signed this: the previously accepted participant list,
-        // or on first contact the configured one, or (TOFU) the manifest's own.
+        // or on first contact the configured one. Either way the signature is
+        // checked before the manifest text is parsed. Only trust on first use
+        // takes the signer list from the unauthenticated manifest itself.
         let trust = self.state.trust()?;
-        let allowed_texts = match (&trust, &self.cfg.participants) {
-            (Some(t), _) => t.participants.clone(),
-            (None, Some(p)) => p.clone(),
-            (None, None) => m.participants.clone(),
+        let (allowed_texts, parsed) = match (&trust, &self.cfg.participants) {
+            (Some(t), _) => (t.participants.clone(), None),
+            (None, Some(p)) => (p.clone(), None),
+            (None, None) => {
+                let m = Manifest::parse(text).context("parsing manifest")?;
+                (m.participants.clone(), Some(m))
+            }
         };
         let allowed = Participant::parse_all(&allowed_texts)?;
         let signer = crypto::verify(&allowed, text.as_bytes(), sig)?
             .and_then(|i| allowed.get(i))
             .ok_or_else(|| {
-                anyhow!(
-                    "manifest (generation {}) is not signed by a trusted participant; refusing it",
-                    m.generation
-                )
+                anyhow!("manifest is not signed by a trusted participant; refusing it")
             })?;
+        let m = match parsed {
+            Some(m) => m,
+            None => Manifest::parse(text).context("parsing manifest")?,
+        };
 
         match &trust {
             Some(t) => {
