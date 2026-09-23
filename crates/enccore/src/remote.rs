@@ -1041,4 +1041,15 @@ mod tests {
         assert!(RefSpec::parse("nocolon").is_err());
         assert!(RefSpec::parse("a:").is_err());
     }
+
+    #[test]
+    fn refspec_parser_survives_corrupted_input() {
+        for input in crate::mutate::variants(b"+refs/heads/a:refs/heads/b", 20_000) {
+            if let Ok(s) = std::str::from_utf8(&input)
+                && let Ok(r) = RefSpec::parse(s)
+            {
+                assert!(!r.dst.is_empty());
+            }
+        }
+    }
 }

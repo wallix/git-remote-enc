@@ -457,4 +457,10 @@ ed25519 keys:
 - rollback of the backend branch to an older tip is refused.
 
 Unit tests cover manifest parsing/serialization, refspec parsing and the trust
-rules.
+rules. Every parser of untrusted input (manifest, envelope, refspec,
+participant keys, SSH signatures, the local trust file) also gets thousands
+of deterministic mutations of a valid input (`enccore/src/mutate.rs`: bit
+flips, insertions, deletions, truncation, duplicated and dropped lines) and
+must return an error or a consistent value, never panic. This stands in for
+coverage-guided fuzzing, which needs a nightly toolchain the pinned one does
+not provide.

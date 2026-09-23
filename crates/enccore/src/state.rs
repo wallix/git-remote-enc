@@ -287,7 +287,25 @@ mod tests {
             "generation 3\nrepo r\nparticipant age1x\n",
         )
         .unwrap();
-        assert_eq!(s.trust(&[ours]).unwrap().map(|t| t.generation), Some(3));
+        assert_eq!(
+            s.trust(std::slice::from_ref(&ours))
+                .unwrap()
+                .map(|t| t.generation),
+            Some(3)
+        );
+
+        // Corrupted files are errors or authenticated reads, never panics,
+        // and an authenticated read only ever returns what was saved.
+        s.save_trust(&t, &ours).unwrap();
+        let saved = fs::read(s.dir().join("trust")).unwrap();
+        for input in crate::mutate::variants(&saved, 3_000) {
+            fs::write(s.dir().join("trust"), &input).unwrap();
+            if let Ok(Some(got)) = s.trust(std::slice::from_ref(&ours))
+                && std::str::from_utf8(&input).is_ok_and(|i| i.contains("\nmac "))
+            {
+                assert_eq!(got, t, "{}", String::from_utf8_lossy(&input));
+            }
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 }

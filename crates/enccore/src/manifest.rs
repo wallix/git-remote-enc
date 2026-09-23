@@ -307,6 +307,23 @@ mod tests {
     }
 
     #[test]
+    fn parser_survives_corrupted_input() {
+        for input in crate::mutate::variants(SAMPLE.as_bytes(), 20_000) {
+            let Ok(text) = std::str::from_utf8(&input) else {
+                assert!(split_envelope(&input).is_none());
+                continue;
+            };
+            // Whatever parses must serialize to something that parses back
+            // to the same manifest.
+            if let Ok(m) = Manifest::parse(text) {
+                assert_eq!(Manifest::parse(&m.serialize()), Ok(m.clone()), "{text:?}");
+                let _ = m.serialize_redacted();
+            }
+            let _ = split_envelope(&input);
+        }
+    }
+
+    #[test]
     fn envelope() {
         let env = join_envelope(
             "enc-manifest 1\n",
