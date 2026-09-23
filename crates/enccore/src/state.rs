@@ -5,10 +5,14 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 use crate::crypto::sha256_hex;
+
+/// A temp file untouched for this long belongs to no running helper.
+const STALE_TEMP: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct State {
     dir: PathBuf,
@@ -31,11 +35,20 @@ impl State {
         let dir = common_dir.join("enc").join(&key);
         fs::create_dir_all(dir.join("tmp"))
             .with_context(|| format!("creating {}", dir.display()))?;
-        // Leftovers from an interrupted run.
+        // Leftovers from an interrupted run. A helper running concurrently on
+        // the same remote (a push racing a fetch) owns the recent ones.
         if let Ok(entries) = fs::read_dir(dir.join("tmp")) {
             for e in entries.flatten() {
-                // Best effort: a stale temp file is harmless.
-                let _ = fs::remove_file(e.path());
+                let stale = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > STALE_TEMP);
+                if stale {
+                    // Best effort: a stale temp file is harmless.
+                    let _ = fs::remove_file(e.path());
+                }
             }
         }
         Ok(Self {
@@ -101,5 +114,37 @@ impl State {
         fs::write(&tmp, text).context("writing trust file")?;
         fs::rename(&tmp, self.dir.join("trust")).context("replacing trust file")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    #[test]
+    fn open_removes_only_stale_temp_files() {
+        let root = std::env::temp_dir().join(format!("enc-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let s = State::open(&root, "url", "refs/heads/enc").unwrap();
+        let fresh = s.temp_path("fresh");
+        let old = s.temp_path("old");
+        fs::write(&fresh, "x").unwrap();
+        fs::write(&old, "x").unwrap();
+        let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+
+        State::open(&root, "url", "refs/heads/enc").unwrap();
+        assert!(
+            fresh.exists(),
+            "a concurrent helper's temp file was removed"
+        );
+        assert!(!old.exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

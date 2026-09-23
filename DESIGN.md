@@ -365,7 +365,8 @@ credential helpers all work.
   re-indexed from the blob (its objects are already local, `index-pack` is
   idempotent).
 - **Push interrupted before step 7:** nothing on the host changed; the temp
-  file is removed on the next run.
+  file is removed by a later run once it is a day old (a younger one may
+  belong to a helper still running on the same remote).
 - **Repo id changed:** the remote was recreated. The helper refuses until the
   local state directory for that remote is deleted, since silently accepting
   would defeat the anti-rollback and trust chain.
