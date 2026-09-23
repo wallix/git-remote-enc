@@ -55,7 +55,7 @@ The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 |---|---|
 | `remote.<name>.enc-identity` / `enc.identity` (repeatable) | private key files: OpenSSH (`~/.ssh/id_ed25519`) or age identity files. Default: `user.signingkey` if `gpg.format = ssh`, else `~/.ssh/id_ed25519` |
 | `remote.<name>.enc-signingkey` / `enc.signingkey` | SSH private key used to sign pushes. Default: the first SSH identity |
-| `remote.<name>.enc-participants` / `enc.participants` (repeatable) | one public key per value, or `@<file>` in `authorized_keys` format. Required to create a remote; on first contact with an existing one, its signer must be listed; if set on an existing remote, the next push replaces the list |
+| `remote.<name>.enc-participants` / `enc.participants` (repeatable) | one public key per value, or `@<file>` in `authorized_keys` format. Required to create a remote; on first contact with an existing one, its signer must be listed; on an existing remote a push never changes the list: `git-remote-enc participants --apply <remote>` does, after showing the difference |
 | `remote.<name>.enc-trustOnFirstUse` / `enc.trustOnFirstUse` | `true` accepts whoever signed an unknown remote when no participant list is set. Default `false` |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
@@ -81,6 +81,15 @@ git-remote-enc manifest --show-keys secret  # also print the pack keys
 Pack keys are replaced by `<redacted>` unless `--show-keys` is given: together
 they decrypt the whole history, so keep them out of terminals, logs and bug
 reports.
+
+Change who can read and push by editing `remote.<name>.enc-participants`, then:
+
+```bash
+git-remote-enc participants secret          # the remote's list and the pending change
+git-remote-enc participants --apply secret  # push the configured list
+```
+
+A plain `git push` never changes the list.
 
 `git-remote-enc forget <remote>` drops the local trust state of a remote, which
 the helper otherwise refuses to discard when the remote was recreated,

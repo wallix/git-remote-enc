@@ -45,6 +45,14 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        [cmd, rest @ ..] if cmd == "participants" && matches!(rest.len(), 1 | 2) => {
+            let (apply, target) = match rest {
+                [flag, target] if flag == "--apply" => (true, target),
+                [target] => (false, target),
+                _ => usage(),
+            };
+            participants(&mut open_by_name_or_url(target)?, target, apply)
+        }
         [cmd, target] if cmd == "forget" => {
             let dir = open_by_name_or_url(target)?.forget()?;
             eprintln!(
@@ -61,9 +69,42 @@ fn run() -> Result<()> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc forget <remote|url>\n       git-remote-enc --version"
+        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc participants [--apply] <remote|url>\n       git-remote-enc forget <remote|url>\n       git-remote-enc --version"
     );
     std::process::exit(2);
+}
+
+/// Print the remote's participants and how the configured list differs;
+/// with `apply`, make the remote's list the configured one.
+fn participants(remote: &mut Remote, target: &str, apply: bool) -> Result<()> {
+    let (current, diff) = remote.participants()?;
+    for p in &current {
+        println!("  {p}");
+    }
+    let Some(diff) = diff else {
+        if apply {
+            bail!("no participant list configured for {target} (remote.<name>.enc-participants)");
+        }
+        return Ok(());
+    };
+    if diff.is_empty() {
+        println!("the configured participant list matches");
+        return Ok(());
+    }
+    println!("the configured participant list would change it:");
+    for p in &diff.added {
+        println!("+ {p}");
+    }
+    for p in &diff.removed {
+        println!("- {p}");
+    }
+    if apply {
+        remote.apply_participants()?;
+        println!("applied");
+    } else {
+        println!("run `git-remote-enc participants --apply {target}` to apply it");
+    }
+    Ok(())
 }
 
 /// A configured remote name resolves to its URL and its config.

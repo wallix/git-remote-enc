@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Breaking: a push no longer replaces the remote's participant list with the
+  configured one, so a stale local list cannot drop someone by accident.
+  `git-remote-enc participants <remote>` shows the difference and `--apply`
+  applies it; a push warns when they differ.
 - The local trust state is authenticated with a key derived from your identity;
   a modified or missing trust file is refused instead of silently restarting
   from first contact. `git-remote-enc forget <remote>` replaces the advice to

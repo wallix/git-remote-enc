@@ -305,6 +305,18 @@ impl Participant {
         }
     }
 
+    /// The key alone, without the comment: what identifies a participant.
+    pub fn key(&self) -> String {
+        match self {
+            Participant::Ssh { text, .. } => text
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" "),
+            Participant::Age { text, .. } => text.clone(),
+        }
+    }
+
     pub fn can_sign(&self) -> bool {
         matches!(self, Participant::Ssh { .. })
     }
