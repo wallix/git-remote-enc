@@ -261,7 +261,13 @@ every linked worktree, so trust accepted in one worktree holds in all):
   run.
 - `<common>/enc/<key>/have` — pack names already indexed.
 - `<common>/enc/<key>/trust` — the last accepted manifest's `generation`,
-  `repo` id, participant list and the SHA-256 of its text (section 6).
+  `repo` id, participant list and the SHA-256 of its text (section 6), ending
+  in `mac <key id> <tag>`: HMAC-SHA256 of the lines above, keyed by
+  HMAC-SHA256(identity secret, "git-remote-enc local trust state v1") for the
+  first configured identity (`key id` is its public fingerprint or age
+  recipient). A file whose tag does not verify is refused. The tag stops a
+  rewrite by anything that lacks the private key; it does not stop someone who
+  can write `.git` and simply runs code through a hook instead.
 - `<common>/enc/<key>/tmp/` — temporary files for the pack pipeline.
 
 The encrypted blobs live in the local object store (reachable from the
@@ -379,9 +385,17 @@ credential helpers all work.
 - **Push interrupted before step 7:** nothing on the host changed; the temp
   file is removed by a later run once it is a day old (a younger one may
   belong to a helper still running on the same remote).
-- **Repo id changed:** the remote was recreated. The helper refuses until the
-  local state directory for that remote is deleted, since silently accepting
-  would defeat the anti-rollback and trust chain.
+- **Repo id changed, or the backend branch vanished:** the remote was
+  recreated or deleted, or the host is replacing it. The helper refuses: silently
+  accepting would defeat the anti-rollback and trust chain. Recovery is a
+  decision for the participants, taken out of band: once they confirm the
+  change, `git-remote-enc forget <remote>` removes the local state and the
+  tracking ref, and the next contact is a first contact, which needs a pinned
+  participant list (section 6.1).
+- **Local trust state missing or altered:** the trust file is gone while the
+  tracking ref shows a manifest was accepted, or its tag does not verify. The
+  helper refuses rather than falling back to a first contact; recovery is the
+  same `forget`.
 - **Not a participant:** age reports no matching key; the helper says so and
   names the identities it tried.
 - **Stale lease three times:** give up with a clear message; the user retries.

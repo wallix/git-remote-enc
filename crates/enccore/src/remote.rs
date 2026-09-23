@@ -10,7 +10,7 @@ use ssh_key::PrivateKey;
 
 use crate::backend::{Backend, DEFAULT_BRANCH, PushOutcome};
 use crate::config::Config;
-use crate::crypto::{self, HashReader, HashWriter, Identity, Participant};
+use crate::crypto::{self, HashReader, HashWriter, Identity, Participant, TrustKey};
 use crate::git::{self, Oid, Streaming, TreeEntry};
 use crate::info;
 use crate::manifest::{Manifest, Pack, join_envelope, split_envelope};
@@ -56,6 +56,8 @@ pub enum PushStatus {
 }
 
 pub struct Remote {
+    /// How the user names this remote: its git remote name, else the URL.
+    label: String,
     cfg: Config,
     backend: Backend,
     state: State,
@@ -64,6 +66,7 @@ pub struct Remote {
     tree: Vec<TreeEntry>,
     manifest: Option<Manifest>,
     identities: Option<Vec<Identity>>,
+    trust_keys: Option<Vec<TrustKey>>,
 }
 
 impl Remote {
@@ -96,6 +99,7 @@ impl Remote {
         };
         let name = name.filter(|n| *n != url && !n.starts_with("enc::"));
         Ok(Self {
+            label: name.map_or_else(|| format!("enc::{url}"), str::to_owned),
             cfg: Config::load(name)?,
             backend,
             state,
@@ -104,6 +108,7 @@ impl Remote {
             tree: vec![],
             manifest: None,
             identities: None,
+            trust_keys: None,
         })
     }
 
@@ -123,26 +128,80 @@ impl Remote {
         Ok(self.identities.as_deref().unwrap_or(&[]))
     }
 
+    /// Keys authenticating the local trust state: one per identity, or the
+    /// signing key when that is the only key configured. The first one
+    /// writes; any of them reads.
+    fn trust_keys(&mut self) -> Result<Vec<TrustKey>> {
+        if self.trust_keys.is_none() {
+            let keys = if self.cfg.identity_paths.is_empty() && self.cfg.signing_key.is_some() {
+                vec![TrustKey::from_ssh(&self.signing_key()?)?]
+            } else {
+                self.identities()?
+                    .iter()
+                    .map(Identity::trust_key)
+                    .collect::<Result<_>>()?
+            };
+            self.trust_keys = Some(keys);
+        }
+        Ok(self.trust_keys.clone().unwrap_or_default())
+    }
+
+    fn save_trust(&mut self, t: &Trust) -> Result<()> {
+        let keys = self.trust_keys()?;
+        let key = keys
+            .first()
+            .ok_or_else(|| anyhow!("no private key to authenticate the local trust state with"))?;
+        self.state.save_trust(t, key)
+    }
+
+    /// Drop the local state kept for this remote: accepted trust, indexed
+    /// packs and the tracking ref. Returns the directory removed.
+    pub fn forget(&mut self) -> Result<PathBuf> {
+        self.state.forget()?;
+        if git::rev_parse(&self.backend.tracking_ref)?.is_some() {
+            git::delete_ref(&self.backend.tracking_ref)?;
+        }
+        Ok(self.state.dir().to_owned())
+    }
+
     // ---- connect ----------------------------------------------------------
 
     pub fn connect(&mut self) -> Result<()> {
         if self.connected {
             return Ok(());
         }
+        // The tracking ref is set once a manifest has been accepted; with it
+        // present, missing trust state was lost, not never written.
+        let known = git::rev_parse(&self.backend.tracking_ref)?.is_some();
         self.tip = self.backend.fetch_tip()?;
         match self.tip.clone() {
             Some(tip) => {
                 self.tree = Backend::tree_entries(&tip)?;
-                self.manifest = Some(self.load_manifest()?);
+                match self.load_manifest(known) {
+                    Ok(m) => self.manifest = Some(m),
+                    Err(e) => {
+                        // A refused first contact leaves nothing that would
+                        // later read as accepted state.
+                        if !known {
+                            // Best effort: the refusal is the error to report.
+                            let _ = git::delete_ref(&self.backend.tracking_ref);
+                        }
+                        return Err(e);
+                    }
+                }
             }
             None => {
-                if let Some(t) = self.state.trust()? {
+                if known || self.state.has_trust() {
+                    let keys = self.trust_keys()?;
+                    let generation = self.state.trust(&keys)?.map_or(0, |t| t.generation);
                     bail!(
-                        "branch {} no longer exists on {} but this repository has accepted its manifests up to generation {}; \
-                         if the remote was intentionally deleted, remove the local state directory for it under .git/enc/",
+                        "branch {} no longer exists on {}, but this repository accepted its manifests up to \
+                         generation {generation}: the host deleted it, or the URL is wrong. Refusing to treat it \
+                         as a new remote. If every participant confirms it was deleted on purpose, \
+                         `git-remote-enc forget {}` drops the local state (DESIGN.md §9)",
                         self.backend.branch,
                         self.backend.url,
-                        t.generation
+                        self.label
                     );
                 }
                 self.tree = vec![];
@@ -158,7 +217,9 @@ impl Remote {
         self.connect()
     }
 
-    fn load_manifest(&mut self) -> Result<Manifest> {
+    /// `known`: a manifest from this remote was accepted before, so its
+    /// trust state must exist.
+    fn load_manifest(&mut self, known: bool) -> Result<Manifest> {
         let oid = Backend::blob_oid(&self.tree, MANIFEST_BLOB)
             .ok_or_else(|| {
                 anyhow!(
@@ -178,7 +239,18 @@ impl Remote {
         // or on first contact the configured one. Either way the signature is
         // checked before the manifest text is parsed. Only trust on first use
         // takes the signer list from the unauthenticated manifest itself.
-        let own = self.state.trust()?;
+        let keys = self.trust_keys()?;
+        let own = self.state.trust(&keys)?;
+        if own.is_none() && known {
+            bail!(
+                "the local trust state for {} ({}) is missing although manifests were accepted from it; \
+                 refusing to start over from first contact. `git-remote-enc forget {}` drops what is left \
+                 (DESIGN.md §9)",
+                self.label,
+                self.state.dir().display(),
+                self.label
+            );
+        }
         let (allowed_texts, parsed) = match (&own, &self.cfg.participants) {
             (Some(t), _) => (t.participants.clone(), None),
             (None, Some(p)) => (p.clone(), None),
@@ -198,7 +270,7 @@ impl Remote {
         // Its trust state then applies, signer and anti-rollback included.
         let trust = match own {
             Some(t) => Some(t),
-            None => match self.state.trust_for_repo(&m.repo_id)? {
+            None => match self.state.trust_for_repo(&m.repo_id, &keys)? {
                 Some((t, dir)) => {
                     verified_signer(&t.participants, text, sig)?;
                     info(&format!(
@@ -218,9 +290,13 @@ impl Remote {
             Some(t) => {
                 if t.repo_id != m.repo_id {
                     bail!(
-                        "the remote was recreated (repo id {} → {}); if this is expected, remove the local state directory for it under .git/enc/",
+                        "{} now serves a different repository (repo id {} → {}): it was recreated, or the host \
+                         replaced it. Refusing it. Confirm with the participants out of band before \
+                         `git-remote-enc forget {}`; the next first contact then needs a pinned participant list",
+                        self.backend.url,
                         t.repo_id,
-                        m.repo_id
+                        m.repo_id,
+                        self.label
                     );
                 }
                 if m.generation < t.generation {
@@ -264,7 +340,7 @@ impl Remote {
         }
         // Validate the new list now so a later push gets a clear error.
         Participant::parse_all(&m.participants).context("manifest participant list")?;
-        self.state.save_trust(&trust_in(&m, text))?;
+        self.save_trust(&trust_in(&m, text))?;
         Ok(m)
     }
 
@@ -397,6 +473,9 @@ impl Remote {
         // Our signing key must be allowed to write: a participant of the
         // current manifest, or of the initial list when creating.
         let signer = self.signing_key()?;
+        // Fail before anything is written if the accepted state cannot be
+        // recorded afterwards.
+        self.trust_keys()?;
         let previous = if is_new {
             None
         } else {
@@ -506,7 +585,7 @@ impl Remote {
                 if let Some(p) = &pack {
                     self.state.add_have(&p.id)?;
                 }
-                self.state.save_trust(&trust_in(&m, &text))?;
+                self.save_trust(&trust_in(&m, &text))?;
                 self.tip = Some(commit.clone());
                 self.tree = Backend::tree_entries(&commit)?;
                 self.manifest = Some(m);

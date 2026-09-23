@@ -274,6 +274,11 @@ pub fn update_ref(name: &str, oid: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn delete_ref(name: &str) -> Result<()> {
+    run(["update-ref", "-d", name])?;
+    Ok(())
+}
+
 pub fn hash_object_file(path: &Path) -> Result<Oid> {
     let mut c = command(["hash-object", "-w", "--no-filters"]);
     c.arg(path);

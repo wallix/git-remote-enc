@@ -599,6 +599,70 @@ fn first_contact_needs_a_known_signer() {
 }
 
 #[test]
+fn local_trust_state_is_authenticated() {
+    let sb = Sandbox::new("truststate");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+
+    let state: Vec<PathBuf> = fs::read_dir(b.join(".git/enc"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(state.len(), 1, "{state:?}");
+    let trust = state[0].join("trust");
+    let original = fs::read_to_string(&trust).unwrap();
+    assert!(original.lines().last().unwrap().starts_with("mac SHA256:"));
+
+    // Rewritten by hand: refused, not re-trusted.
+    fs::write(&trust, original.replace("generation 1", "generation 0")).unwrap();
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(err.contains("modified outside git-remote-enc"), "{err}");
+
+    // Deleted: refused as well, instead of falling back to first contact.
+    fs::remove_file(&trust).unwrap();
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(err.contains("trust state for origin"), "{err}");
+    assert!(err.contains("git-remote-enc forget origin"), "{err}");
+
+    // `forget` resets it; the next contact is a first contact again.
+    let out = sb
+        .cmd(&b, "git-remote-enc")
+        .args(["forget", "origin"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!state[0].exists());
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(err.contains("no participant list"), "{err}");
+    sb.git_ok(
+        &b,
+        &[
+            "-c",
+            &format!("enc.participants={alice_pub}"),
+            "fetch",
+            "origin",
+        ],
+    );
+
+    // The host deletes the branch: not mistaken for a new remote.
+    sb.git_ok(&host, &["update-ref", "-d", "refs/heads/enc"]);
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(err.contains("no longer exists"), "{err}");
+    let err = sb.git_fails(&a, &["push", "enc", "main"]);
+    assert!(err.contains("no longer exists"), "{err}");
+}
+
+#[test]
 fn forked_generation_is_reported() {
     let sb = Sandbox::new("fork");
     let host = sb.host();
