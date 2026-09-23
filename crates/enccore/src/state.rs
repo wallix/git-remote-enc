@@ -28,6 +28,7 @@ pub struct Trust {
     pub generation: u64,
     pub repo_id: String,
     pub participants: Vec<String>,
+    pub admins: Vec<String>,
     /// SHA-256 of the accepted manifest text; absent in state written by
     /// older versions.
     pub digest: Option<String>,
@@ -137,6 +138,9 @@ impl State {
         for p in &t.participants {
             text.push_str(&format!("participant {p}\n"));
         }
+        for a in &t.admins {
+            text.push_str(&format!("admin {a}\n"));
+        }
         let tag = key.tag(text.as_bytes());
         text.push_str(&format!("{MAC_ITEM} {} {tag}\n", key.id));
         let tmp = self.temp_path("trust");
@@ -204,6 +208,7 @@ fn read_trust(path: &Path, keys: &[TrustKey]) -> Result<Option<Trust>> {
             "repo" => t.repo_id = rest.trim().to_owned(),
             "digest" => t.digest = Some(rest.trim().to_owned()),
             "participant" => t.participants.push(rest.trim().to_owned()),
+            "admin" => t.admins.push(rest.trim().to_owned()),
             "" => {}
             other => bail!("{}: unknown item `{other}`", path.display()),
         }
@@ -264,6 +269,7 @@ mod tests {
             generation: 7,
             repo_id: "r".into(),
             participants: vec!["age1x".into()],
+            admins: vec![],
             digest: Some("d".into()),
         };
 

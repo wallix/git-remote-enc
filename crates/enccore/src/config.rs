@@ -10,8 +10,12 @@ use crate::git;
 pub struct Config {
     pub identity_paths: Vec<PathBuf>,
     pub signing_key: Option<PathBuf>,
-    /// `None` when unset; `Some` replaces the manifest's list on push.
+    /// `None` when unset. Creates a remote, pins its signer on first
+    /// contact, and replaces its list on `participants --apply`.
     pub participants: Option<Vec<String>>,
+    /// `None` when unset; like `participants`, for the admin list. Defaults
+    /// to the creator when a remote is created.
+    pub admins: Option<Vec<String>>,
     /// Accept whoever signed the manifest on first contact when no
     /// participant list is configured. Off unless set.
     pub trust_on_first_use: bool,
@@ -42,33 +46,14 @@ impl Config {
             None => false,
         };
 
-        let raw = all("participants")?;
-        let participants = if raw.is_empty() {
-            None
-        } else {
-            let mut list = Vec::new();
-            for item in raw {
-                if let Some(file) = item.strip_prefix('@') {
-                    let path = expand_home(file);
-                    let text = std::fs::read_to_string(&path)
-                        .with_context(|| format!("reading participants file {}", path.display()))?;
-                    list.extend(
-                        text.lines()
-                            .map(str::trim)
-                            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                            .map(str::to_owned),
-                    );
-                } else {
-                    list.push(item.trim().to_owned());
-                }
-            }
-            Some(list)
-        };
+        let participants = key_list(all("participants")?)?;
+        let admins = key_list(all("admins")?)?;
 
         Ok(Self {
             identity_paths,
             signing_key,
             participants,
+            admins,
             trust_on_first_use,
         })
     }
@@ -90,6 +75,31 @@ fn default_identities() -> Result<Vec<PathBuf>> {
         return Ok(vec![p]);
     }
     Ok(vec![])
+}
+
+/// Public keys, one per value or `@<file>` (authorized_keys-style: one per
+/// line, `#` comments); `None` when there are no values.
+fn key_list(raw: Vec<String>) -> Result<Option<Vec<String>>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut list = Vec::new();
+    for item in raw {
+        if let Some(file) = item.strip_prefix('@') {
+            let path = expand_home(file);
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading key list {}", path.display()))?;
+            list.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(str::to_owned),
+            );
+        } else {
+            list.push(item.trim().to_owned());
+        }
+    }
+    Ok(Some(list))
 }
 
 /// git's boolean spellings.

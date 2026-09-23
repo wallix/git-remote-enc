@@ -56,6 +56,7 @@ The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 | `remote.<name>.enc-identity` / `enc.identity` (repeatable) | private key files: OpenSSH (`~/.ssh/id_ed25519`) or age identity files. Default: `user.signingkey` if `gpg.format = ssh`, else `~/.ssh/id_ed25519` |
 | `remote.<name>.enc-signingkey` / `enc.signingkey` | SSH private key used to sign pushes. Default: the first SSH identity |
 | `remote.<name>.enc-participants` / `enc.participants` (repeatable) | one public key per value, or `@<file>` in `authorized_keys` format. Required to create a remote; on first contact with an existing one, its signer must be listed; on an existing remote a push never changes the list: `git-remote-enc participants --apply <remote>` does, after showing the difference |
+| `remote.<name>.enc-admins` / `enc.admins` (repeatable) | the participants allowed to change the participant and admin lists, same syntax. Default for a new remote: its creator; applied to an existing one by `git-remote-enc participants --apply` |
 | `remote.<name>.enc-trustOnFirstUse` / `enc.trustOnFirstUse` | `true` accepts whoever signed an unknown remote when no participant list is set. Default `false` |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
@@ -89,7 +90,8 @@ git-remote-enc participants secret          # the remote's list and the pending 
 git-remote-enc participants --apply secret  # push the configured list
 ```
 
-A plain `git push` never changes the list.
+A plain `git push` never changes the list, and only an admin (`enc-admins`;
+by default whoever created the remote) can apply a change.
 
 `git-remote-enc forget <remote>` drops the local trust state of a remote, which
 the helper otherwise refuses to discard when the remote was recreated,

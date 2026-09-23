@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- On-remote format 2 (breaking): remotes gain admins, the only participants
+  who may change the participant list. A new remote's admin is its creator
+  unless `enc.admins` says otherwise. The first push with this version
+  upgrades an existing remote to format 2, which older versions cannot read,
+  so every participant must upgrade; `git-remote-enc participants --apply`
+  with `enc.admins` set appoints its admins.
 - Breaking: a push no longer replaces the remote's participant list with the
   configured one, so a stale local list cannot drop someone by accident.
   `git-remote-enc participants <remote>` shows the difference and `--apply`

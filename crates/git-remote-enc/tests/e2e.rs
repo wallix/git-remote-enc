@@ -183,6 +183,99 @@ impl Sandbox {
         d
     }
 
+    /// Replace the host's manifest with `edit` of the current one, signed
+    /// with `key` and encrypted to `recipients`, as a participant running
+    /// some other client could.
+    fn forge_manifest(
+        &self,
+        host: &Path,
+        key: &Path,
+        recipients: &[&str],
+        edit: impl Fn(&str) -> String,
+    ) {
+        use std::io::Read;
+        let run = |args: &[&str], stdin: Option<&Path>| {
+            let mut c = self.cmd(host, "git");
+            c.args(args);
+            if let Some(f) = stdin {
+                c.stdin(fs::File::open(f).unwrap());
+            }
+            let out = c.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        let blob = run(&["cat-file", "blob", "refs/heads/enc:manifest"], None);
+        let pem = fs::read_to_string(key).unwrap();
+        let id = age::ssh::Identity::from_buffer(pem.as_bytes(), None).unwrap();
+        let mut plain = String::new();
+        age::Decryptor::new(&blob[..])
+            .unwrap()
+            .decrypt(std::iter::once(&id as &dyn age::Identity))
+            .unwrap()
+            .read_to_string(&mut plain)
+            .unwrap();
+        let (text, _) = plain.split_at(plain.find("-----BEGIN SSH SIGNATURE-----").unwrap());
+        let text = edit(text);
+        let sig = PrivateKey::from_openssh(&pem)
+            .unwrap()
+            .sign("git-remote-enc", ssh_key::HashAlg::Sha512, text.as_bytes())
+            .unwrap()
+            .to_pem(LineEnding::LF)
+            .unwrap();
+        let recipients: Vec<age::ssh::Recipient> = recipients
+            .iter()
+            .map(|r| {
+                let bare = r.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                bare.parse().unwrap()
+            })
+            .collect();
+        let enc =
+            age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
+                .unwrap();
+        let mut out = Vec::new();
+        let mut w = enc.wrap_output(&mut out).unwrap();
+        w.write_all(format!("{text}{sig}").as_bytes()).unwrap();
+        w.finish().unwrap();
+
+        let tmp = self.dir("forge");
+        fs::write(tmp.join("manifest"), &out).unwrap();
+        let oid = String::from_utf8(run(
+            &["hash-object", "-w", tmp.join("manifest").to_str().unwrap()],
+            None,
+        ))
+        .unwrap();
+        let tree = String::from_utf8(run(&["ls-tree", "refs/heads/enc"], None)).unwrap();
+        let tree: String = tree
+            .lines()
+            .map(|l| {
+                if l.ends_with("\tmanifest") {
+                    format!("100644 blob {}\tmanifest\n", oid.trim())
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        fs::write(tmp.join("tree"), tree).unwrap();
+        let tree = String::from_utf8(run(&["mktree"], Some(&tmp.join("tree")))).unwrap();
+        let commit = String::from_utf8(run(
+            &[
+                "commit-tree",
+                tree.trim(),
+                "-p",
+                "refs/heads/enc",
+                "-m",
+                "enc",
+            ],
+            None,
+        ))
+        .unwrap();
+        run(&["update-ref", "refs/heads/enc", commit.trim()], None);
+    }
+
     fn host_pack_sizes(&self, host: &Path) -> Vec<u64> {
         let mut v: Vec<u64> = fs::read_dir(host.join("objects/pack"))
             .unwrap()
@@ -298,7 +391,7 @@ fn push_clone_fetch_roundtrip() {
         String::from_utf8(out.stdout).unwrap()
     };
     let m = manifest(&["manifest", "enc"]);
-    assert!(m.starts_with("enc-manifest 1\n"), "{m}");
+    assert!(m.starts_with("enc-manifest 2\n"), "{m}");
     assert!(m.contains("participant ssh-ed25519"));
     // Three pushes carried objects; the tag, branch and deletion pushes
     // only moved refs and stored no pack.
@@ -556,12 +649,153 @@ fn access_control() {
         sb.git_ok(&a, &["config", "--add", "remote.enc.enc-participants", p]);
     }
     sb.git_ok(&a, &["pull", "-q", "enc", "main"]);
+    // Not while she is the only admin: someone must keep that role.
+    let out = sb
+        .cmd(&a, "git-remote-enc")
+        .args(["participants", "--apply", "enc"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("must also leave the admin list"), "{err}");
+    sb.git_ok(&a, &["config", "remote.enc.enc-admins", &bob_pub]);
     let shown = enc(&a, &["participants", "--apply", "enc"]);
     assert!(shown.contains(&format!("- {alice_pub}")), "{shown}");
     assert!(shown.contains(&format!("- {reader_pub}")), "{shown}");
     sb.commit_text(&a, "again", "a\n");
     let err = sb.git_fails(&a, &["push", "enc", "main"]);
     assert!(err.contains("not a participant"), "{err}");
+}
+
+#[test]
+fn only_admins_change_the_participant_list() {
+    let sb = Sandbox::new("admins");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let (bob, bob_pub) = sb.keypair("bob");
+    let (_, carol_pub) = sb.keypair("carol");
+    let enc = |dir: &Path, args: &[&str]| {
+        let out = sb.cmd(dir, "git-remote-enc").args(args).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    };
+
+    // The creator is the admin by default.
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub, &bob_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let (ok, m) = enc(&a, &["manifest", "enc"]);
+    assert!(ok && m.starts_with("enc-manifest 2\n"), "{m}");
+    assert!(m.contains(&format!("admin {alice_pub}\n")), "{m}");
+
+    // Bob pushes, but may not add Carol.
+    let b = sb.clone("bob", &url, &bob);
+    sb.commit_text(&b, "two", "2\n");
+    sb.git_ok(&b, &["push", "-q", "origin", "main"]);
+    sb.git_ok(
+        &b,
+        &[
+            "config",
+            "--add",
+            "remote.origin.enc-participants",
+            &alice_pub,
+        ],
+    );
+    sb.git_ok(
+        &b,
+        &[
+            "config",
+            "--add",
+            "remote.origin.enc-participants",
+            &bob_pub,
+        ],
+    );
+    sb.git_ok(
+        &b,
+        &[
+            "config",
+            "--add",
+            "remote.origin.enc-participants",
+            &carol_pub,
+        ],
+    );
+    let (ok, out) = enc(&b, &["participants", "--apply", "origin"]);
+    assert!(!ok && out.contains("only an admin"), "{out}");
+
+    // A client that skips that check does not get past the readers either.
+    sb.forge_manifest(&host, &bob, &[&alice_pub, &bob_pub, &carol_pub], |text| {
+        let generation: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("generation "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        text.replace(
+            &format!("generation {generation}\n"),
+            &format!("generation {}\n", generation + 1),
+        )
+        .replace(
+            &format!("participant {bob_pub}\n"),
+            &format!("participant {bob_pub}\nparticipant {carol_pub}\n"),
+        )
+    });
+    let err = sb.git_fails(&a, &["fetch", "enc"]);
+    assert!(err.contains("not signed by an admin"), "{err}");
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", "refs/heads/enc~1"]);
+
+    // Nor can an admin drop the role for everyone, e.g. by writing the
+    // pre-admin format.
+    sb.forge_manifest(&host, &alice, &[&alice_pub, &bob_pub], |text| {
+        let generation: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("generation "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        text.replace("enc-manifest 2\n", "enc-manifest 1\n")
+            .replace(&format!("admin {alice_pub}\n"), "")
+            .replace(
+                &format!("generation {generation}\n"),
+                &format!("generation {}\n", generation + 1),
+            )
+    });
+    let err = sb.git_fails(&a, &["fetch", "enc"]);
+    assert!(err.contains("removes every admin"), "{err}");
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", "refs/heads/enc~1"]);
+
+    // Alice, the admin, adds Carol and makes Bob an admin; then Bob may
+    // change the list himself.
+    sb.git_ok(
+        &a,
+        &["config", "--add", "remote.enc.enc-participants", &carol_pub],
+    );
+    for p in [&alice_pub, &bob_pub] {
+        sb.git_ok(&a, &["config", "--add", "remote.enc.enc-admins", p]);
+    }
+    let (ok, out) = enc(&a, &["participants", "--apply", "enc"]);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(&format!("+ {carol_pub}")) && out.contains(&format!("+ {bob_pub}")),
+        "{out}"
+    );
+    sb.git_ok(
+        &b,
+        &["config", "--unset-all", "remote.origin.enc-participants"],
+    );
+    for p in [&alice_pub, &bob_pub] {
+        sb.git_ok(
+            &b,
+            &["config", "--add", "remote.origin.enc-participants", p],
+        );
+    }
+    let (ok, out) = enc(&b, &["participants", "--apply", "origin"]);
+    assert!(ok && out.contains(&format!("- {carol_pub}")), "{out}");
 }
 
 #[test]
