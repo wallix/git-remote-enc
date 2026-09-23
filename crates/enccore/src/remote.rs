@@ -86,6 +86,43 @@ impl ParticipantDiff {
     }
 }
 
+/// One manifest of the backend history.
+pub enum HistoryEntry {
+    Readable {
+        commit: Oid,
+        generation: u64,
+        time: Option<u64>,
+        /// The signer's participant line, or its fingerprint if the manifest
+        /// does not list it.
+        signer: String,
+        /// `+`, `-` or `~` and the ref name, relative to the manifest before.
+        refs: Vec<String>,
+        participants: ParticipantDiff,
+        admins: ParticipantDiff,
+    },
+    /// Not decryptable with the local identities (a manifest from before
+    /// they were added, for instance) or malformed.
+    Unreadable { commit: Oid, reason: String },
+}
+
+/// Ref changes from `before` to `after`, as `+ name`, `- name`, `~ name`.
+fn ref_changes(before: Option<&Manifest>, after: &Manifest) -> Vec<String> {
+    let mut out = Vec::new();
+    for (oid, name) in &after.refs {
+        match before.and_then(|b| b.ref_oid(name)) {
+            None => out.push(format!("+ {name}")),
+            Some(old) if old != oid => out.push(format!("~ {name}")),
+            Some(_) => {}
+        }
+    }
+    for (_, name) in before.map_or(&[][..], |b| &b.refs) {
+        if after.ref_oid(name).is_none() {
+            out.push(format!("- {name}"));
+        }
+    }
+    out
+}
+
 /// Who may read, push and administer a remote, and the pending changes the
 /// configuration would apply.
 pub struct Access {
@@ -447,6 +484,71 @@ impl Remote {
         }))
     }
 
+    /// Every manifest in the backend history, newest first, as far as the
+    /// local identities can decrypt them: the audit trail the anonymous
+    /// backend commits do not give.
+    pub fn history(&mut self) -> Result<Vec<HistoryEntry>> {
+        self.connect()?;
+        if self.tip.is_none() {
+            bail!("no encrypted remote at {}", self.backend.url);
+        }
+        let out = git::run(["rev-list", "--reverse", self.backend.tracking_ref.as_str()])?;
+        let commits = String::from_utf8(out).context("rev-list output is not UTF-8")?;
+        let mut entries = Vec::new();
+        let mut previous: Option<Manifest> = None;
+        for commit in commits.lines() {
+            let entry = match self.read_historical(commit) {
+                Ok((m, signer)) => {
+                    let e = HistoryEntry::Readable {
+                        commit: commit.to_owned(),
+                        generation: m.generation,
+                        time: m.time,
+                        signer: m
+                            .participants
+                            .iter()
+                            .find(|p| {
+                                Participant::parse(p).is_ok_and(|p| p.fingerprint() == signer)
+                            })
+                            .cloned()
+                            .unwrap_or(signer),
+                        refs: ref_changes(previous.as_ref(), &m),
+                        participants: ParticipantDiff::between(
+                            previous.as_ref().map_or(&[][..], |p| &p.participants),
+                            &m.participants,
+                        )?,
+                        admins: ParticipantDiff::between(
+                            previous.as_ref().map_or(&[][..], |p| &p.admins),
+                            &m.admins,
+                        )?,
+                    };
+                    previous = Some(m);
+                    e
+                }
+                Err(e) => HistoryEntry::Unreadable {
+                    commit: commit.to_owned(),
+                    reason: format!("{e:#}"),
+                },
+            };
+            entries.push(entry);
+        }
+        entries.reverse();
+        Ok(entries)
+    }
+
+    /// The manifest at backend `commit` and the fingerprint of its signer.
+    fn read_historical(&mut self, commit: &str) -> Result<(Manifest, String)> {
+        let tree = Backend::tree_entries(commit)?;
+        let oid = Backend::blob_oid(&tree, MANIFEST_BLOB)
+            .ok_or_else(|| anyhow!("no manifest"))?
+            .to_owned();
+        let blob = git::cat_blob(&oid)?;
+        let envelope = crypto::decrypt_to_vec(self.identities()?, &blob)?;
+        let (text, sig) =
+            split_envelope(&envelope).ok_or_else(|| anyhow!("manifest is not signed"))?;
+        let signer = crypto::signature_key(text.as_bytes(), sig)?;
+        Ok((Manifest::parse(text)?, signer))
+    }
+
     // ---- fetch ------------------------------------------------------------
 
     /// Index every pack not yet indexed locally, in manifest order.
@@ -724,6 +826,12 @@ impl Remote {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow!("generation overflow"))?;
+        m.time = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("the clock is before 1970")?
+                .as_secs(),
+        );
         for (spec, new) in &accepted {
             match new {
                 Some(oid) => m.set_ref(&spec.dst, oid),

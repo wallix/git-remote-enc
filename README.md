@@ -93,6 +93,10 @@ git-remote-enc participants --apply secret  # push the configured list
 A plain `git push` never changes the list, and only an admin (`enc-admins`;
 by default whoever created the remote) can apply a change.
 
+`git-remote-enc log <remote>` prints the audit trail: for every generation of
+the manifest, who signed it, when (Unix time, by the pusher's clock) and which
+refs, participants and admins it changed.
+
 `git-remote-enc forget <remote>` drops the local trust state of a remote, which
 the helper otherwise refuses to discard when the remote was recreated,
 deleted, or its local state was lost. Do it only after the participants confirm

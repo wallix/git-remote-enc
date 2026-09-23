@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `git-remote-enc log <remote>` prints who pushed each generation of a remote,
+  when, and what it changed. Pushes record their time inside the encrypted
+  manifest for it.
 - On-remote format 2 (breaking): remotes gain admins, the only participants
   who may change the participant list. A new remote's admin is its creator
   unless `enc.admins` says otherwise. The first push with this version

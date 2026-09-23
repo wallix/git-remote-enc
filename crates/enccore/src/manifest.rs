@@ -36,6 +36,9 @@ impl Drop for Pack {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Manifest {
     pub generation: u64,
+    /// When the pusher wrote it, in Unix seconds by the pusher's clock. For
+    /// the audit trail (`git-remote-enc log`); never used to decide trust.
+    pub time: Option<u64>,
     pub repo_id: String,
     pub head: Option<String>,
     /// Public keys as written by the user (`ssh-ed25519 AAAA… comment`,
@@ -103,6 +106,7 @@ impl Manifest {
                     m.generation = rest.trim().parse().map_err(|_| malformed())?;
                     have_generation = true;
                 }
+                "time" => m.time = Some(rest.trim().parse().map_err(|_| malformed())?),
                 "repo" => m.repo_id = nonempty(rest).ok_or_else(malformed)?.to_owned(),
                 "head" => m.head = Some(nonempty(rest).ok_or_else(malformed)?.to_owned()),
                 "participant" => m
@@ -156,6 +160,9 @@ impl Manifest {
             "{HEADER} {FORMAT_VERSION}\ngeneration {}\nrepo {}\n",
             self.generation, self.repo_id
         );
+        if let Some(t) = self.time {
+            out.push_str(&format!("time {t}\n"));
+        }
         if let Some(h) = &self.head {
             out.push_str(&format!("head {h}\n"));
         }
@@ -241,13 +248,14 @@ pub fn join_envelope(manifest: &str, signature_pem: &str) -> Zeroizing<Vec<u8>> 
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "enc-manifest 2\ngeneration 3\nrepo abcdef0123\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nadmin ssh-ed25519 AAAAC3 alice\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nextn future stuff\n";
+    const SAMPLE: &str = "enc-manifest 2\ngeneration 3\nrepo abcdef0123\ntime 1790000000\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nadmin ssh-ed25519 AAAAC3 alice\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nextn future stuff\n";
 
     #[test]
     fn roundtrip() {
         let m = Manifest::parse(SAMPLE).unwrap();
         assert_eq!(m.generation, 3);
         assert_eq!(m.repo_id, "abcdef0123");
+        assert_eq!(m.time, Some(1_790_000_000));
         assert_eq!(m.head.as_deref(), Some("refs/heads/main"));
         assert_eq!(m.participants.len(), 2);
         assert_eq!(m.participants[0], "ssh-ed25519 AAAAC3 alice");

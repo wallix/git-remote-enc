@@ -16,7 +16,7 @@
 use std::io::{self, BufRead, Write};
 
 use anyhow::{Result, bail};
-use enccore::remote::{ParticipantDiff, PushStatus, RefSpec, Remote};
+use enccore::remote::{HistoryEntry, ParticipantDiff, PushStatus, RefSpec, Remote};
 
 fn main() {
     if let Err(e) = run() {
@@ -53,6 +53,7 @@ fn run() -> Result<()> {
             };
             participants(&mut open_by_name_or_url(target)?, target, apply)
         }
+        [cmd, target] if cmd == "log" => log(&mut open_by_name_or_url(target)?),
         [cmd, target] if cmd == "forget" => {
             let dir = open_by_name_or_url(target)?.forget()?;
             eprintln!(
@@ -69,7 +70,7 @@ fn run() -> Result<()> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc participants [--apply] <remote|url>\n       git-remote-enc forget <remote|url>\n       git-remote-enc --version"
+        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc participants [--apply] <remote|url>\n       git-remote-enc log <remote|url>\n       git-remote-enc forget <remote|url>\n       git-remote-enc --version"
     );
     std::process::exit(2);
 }
@@ -114,6 +115,44 @@ fn participants(remote: &mut Remote, target: &str, apply: bool) -> Result<()> {
         println!(
             "+/- lines are the configured changes; `git-remote-enc participants --apply {target}` applies them"
         );
+    }
+    Ok(())
+}
+
+/// Print the backend history as an audit trail, newest first.
+fn log(remote: &mut Remote) -> Result<()> {
+    for entry in remote.history()? {
+        match entry {
+            HistoryEntry::Readable {
+                commit,
+                generation,
+                time,
+                signer,
+                refs,
+                participants,
+                admins,
+            } => {
+                let time = time.map_or_else(|| "time unknown".to_owned(), |t| format!("time {t}"));
+                println!("generation {generation} ({time}, backend commit {commit})");
+                println!("  signed by {signer}");
+                for r in refs {
+                    println!("  ref {r}");
+                }
+                for (sign, list) in [("+", &participants.added), ("-", &participants.removed)] {
+                    for p in list {
+                        println!("  participant {sign} {p}");
+                    }
+                }
+                for (sign, list) in [("+", &admins.added), ("-", &admins.removed)] {
+                    for a in list {
+                        println!("  admin {sign} {a}");
+                    }
+                }
+            }
+            HistoryEntry::Unreadable { commit, reason } => {
+                println!("backend commit {commit}: not readable ({reason})");
+            }
+        }
     }
     Ok(())
 }
