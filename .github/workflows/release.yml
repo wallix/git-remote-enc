@@ -15,8 +15,9 @@ name: Release
 # released, has no CHANGELOG section, or does not contain main — in seconds, before
 # anything compiles. quality (fmt, clippy, test, audit) and build (the full platform
 # matrix, with the Linux binaries rebuilt from a clean copy and required to reproduce
-# byte-for-byte) run in parallel. e2e then unpacks the very archives publish uploads and
-# drives the shipped binary through git. publish runs once all of them have passed.
+# byte-for-byte) run in parallel, with sbom (sbom.sh). e2e then unpacks the very archives
+# publish uploads and drives the shipped binary through git. publish runs once all of them
+# have passed, and attests the provenance and SBOM of every archive before its first write.
 
 on:
   push:
@@ -102,6 +103,28 @@ jobs:
       retention-days: 3
       verify-reproducible: true
 
+  # The CycloneDX SBOM of every platform's binary, from the same Cargo.lock the build used.
+  sbom:
+    needs: [prepare]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Generate the SBOMs
+        run: ./sbom.sh --docker
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-sbom-${{ github.sha }}
+          path: dist/git-remote-enc-*.cdx.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 3
+
   # Test the built archives that publish uploads, without rebuilding. The script checks
   # sha256 sidecars and the binary version against the tag before running the tests.
   e2e:
@@ -131,12 +154,16 @@ jobs:
   # release. A failure after the first write leaves main advanced with no release yet;
   # every step is idempotent, so re-running this job from the Actions UI finishes it.
   publish:
-    needs: [prepare, quality, build, e2e]
+    needs: [prepare, quality, build, sbom, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    # git push and gh release create need write access to the repo's refs and releases.
+    # git push and gh release create need write access to the repo's refs and releases;
+    # id-token mints the OIDC token Sigstore's keyless signing certificate is issued
+    # against, and attestations stores the signed attestations on the repository.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
       MAIN_SHA: ${{ needs.prepare.outputs.main-sha }}
@@ -171,6 +198,10 @@ jobs:
             dist/git-remote-enc-macos-aarch64.sha256
             dist/git-remote-enc-linux-x86_64.build-info.txt
             dist/git-remote-enc-linux-aarch64.build-info.txt
+            dist/git-remote-enc-linux-x86_64.cdx.json
+            dist/git-remote-enc-linux-aarch64.cdx.json
+            dist/git-remote-enc-macos-x86_64.cdx.json
+            dist/git-remote-enc-macos-aarch64.cdx.json
           )
           for a in "${assets[@]}"; do
             [ -f "$a" ] || { echo "missing release asset: $a" >&2; exit 1; }
@@ -183,6 +214,51 @@ jobs:
           set -euo pipefail
           cd dist
           for sidecar in git-remote-enc-*.sha256; do sha256sum -c "$sidecar"; done
+
+      # Sigstore-signed SLSA build provenance for every archive and build manifest, and an
+      # SBOM attestation binding each platform's SBOM to its archive, recorded in the public
+      # transparency log. `gh attestation verify <archive> --repo <owner>/<repo>` checks them;
+      # the provenance bundle is also published for offline verification (`--bundle`).
+      # Attesting is not a write to main, a tag or a release, so it precedes them.
+      - name: Attest build provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/git-remote-enc-*.tar.gz
+            dist/git-remote-enc-*.build-info.txt
+
+      - name: Attest the SBOM (linux-x86_64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/git-remote-enc-linux-x86_64.tar.gz
+          sbom-path: dist/git-remote-enc-linux-x86_64.cdx.json
+
+      - name: Attest the SBOM (linux-aarch64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/git-remote-enc-linux-aarch64.tar.gz
+          sbom-path: dist/git-remote-enc-linux-aarch64.cdx.json
+
+      - name: Attest the SBOM (macos-x86_64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/git-remote-enc-macos-x86_64.tar.gz
+          sbom-path: dist/git-remote-enc-macos-x86_64.cdx.json
+
+      - name: Attest the SBOM (macos-aarch64)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/git-remote-enc-macos-aarch64.tar.gz
+          sbom-path: dist/git-remote-enc-macos-aarch64.cdx.json
+
+      - name: Publish the provenance bundle as a release asset
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          cp "$BUNDLE" dist/git-remote-enc.provenance.sigstore.jsonl
+          echo dist/git-remote-enc.provenance.sigstore.jsonl >> "$RUNNER_TEMP/assets.txt"
 
       - name: Release notes from CHANGELOG
         run: ./release-notes.sh "$TAG" > "$RUNNER_TEMP/release-notes.md"

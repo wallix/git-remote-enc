@@ -83,7 +83,7 @@ nix build ./.devcontainer/nix#buildEnv
 
 ### Build / container scripts
 
-`build.sh`, `lint.sh`, `fmt.sh` and `audit.sh` run inside the pinned
+`build.sh`, `lint.sh`, `fmt.sh`, `audit.sh` and `sbom.sh` run inside the pinned
 devcontainer image (one stage, `enc-build`). They use `vk` when available and
 fall back to Docker; `--docker` forces Docker. `package.sh`,
 `release-notes.sh`, `update.sh` and `tests/release-e2e.sh` run on the host;
@@ -101,6 +101,7 @@ refreshes the flake lock inside a container, so the host needs no Nix.
 ./lint.sh  [--docker]     # cargo clippy --workspace --all-targets --locked -- -D warnings
 ./fmt.sh   [--docker]     # cargo fmt (--check to verify)
 ./audit.sh [--docker]     # cargo-audit against the committed Cargo.lock
+./sbom.sh  [--docker]     # CycloneDX SBOM per released platform -> dist/git-remote-enc-<platform>.cdx.json
 ./update.sh               # bump the pinned toolchain + re-pin the base image and flake lock
 RELEASE_TAG=v<X.Y.Z> tests/release-e2e.sh   # the release gate, against dist/
 ```
@@ -172,8 +173,11 @@ candidate contains `main`) → `quality` (fmt, clippy, `cargo test --workspace
 from a clean copy and required to reproduce byte-for-byte; macOS x86_64/aarch64
 native) → `e2e` ([`tests/release-e2e.sh`](tests/release-e2e.sh), which unpacks
 the very archives that will be published and drives the shipped binary through
-git) → `publish`. Nothing is written to `main` or to a tag until all of them
-are green, so running the checks locally first is a convenience, not a
+git), with `sbom` (`sbom.sh`) alongside → `publish`, which attests
+Sigstore-signed build provenance for every archive and build manifest and an
+SBOM per archive before any write. Nothing is written to `main` or to a tag
+until all of them are green, so running the checks locally first is a
+convenience, not a
 safeguard.
 
 `publish` can repeat each step: fast-forward `main`, push the tag, create the

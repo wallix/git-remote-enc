@@ -62,6 +62,11 @@ tasks:
     cmds:
       - ./build.sh --verify
 
+  release:sbom:
+    desc: Write the CycloneDX SBOM of every released platform to dist/ via sbom.sh
+    cmds:
+      - ./sbom.sh {{ CLI_ARGS }}
+
   release:e2e:
     desc: Run the release end-to-end gate over the archives in dist/
     cmds:

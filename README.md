@@ -35,6 +35,17 @@ copy and checks the two are byte-identical. `dist/git-remote-enc.sha256` records
 the commit and every pinned input so a release can be re-derived and compared
 years later.
 
+Every release archive carries Sigstore-signed SLSA build provenance and a
+CycloneDX SBOM (`git-remote-enc-<platform>.cdx.json`), both attested by the
+release workflow. Verify an archive before installing it:
+
+```bash
+gh attestation verify git-remote-enc-linux-x86_64.tar.gz --repo wallix/git-remote-enc
+# offline, with the bundle published next to the archives:
+gh attestation verify git-remote-enc-linux-x86_64.tar.gz --repo wallix/git-remote-enc \
+  --bundle git-remote-enc.provenance.sigstore.jsonl
+```
+
 The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 `enc::` URL.
 
