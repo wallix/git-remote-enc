@@ -1,0 +1,19 @@
+# Weekly update PRs for Cargo dependencies and SHA-pinned actions follow the
+# same quality gate as any PR; ./update.sh refreshes the Nix toolchain pins.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
