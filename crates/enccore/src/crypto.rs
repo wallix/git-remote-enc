@@ -15,9 +15,6 @@ use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
 /// manifest signature can never be replayed as a commit signature.
 pub const SIG_NAMESPACE: &str = "git-remote-enc";
 
-/// Environment variable read instead of prompting for a key passphrase.
-pub const PASSPHRASE_ENV: &str = "GIT_ENC_PASSPHRASE";
-
 // ---- identities -----------------------------------------------------------
 
 /// A private key we can decrypt with (and, for SSH keys, sign with).
@@ -59,7 +56,7 @@ impl Identity {
 
 /// Load every identity in `paths`. Each file is either an OpenSSH private
 /// key (`ssh-ed25519` or `ssh-rsa`; passphrase-protected keys are decrypted
-/// with `GIT_ENC_PASSPHRASE` or a tty prompt) or an age identity file.
+/// with a prompt on the tty) or an age identity file.
 pub fn load_identities(paths: &[PathBuf]) -> Result<Vec<Identity>> {
     let mut out = Vec::new();
     for path in paths {
@@ -78,13 +75,11 @@ fn load_ssh_identity(path: &Path, pem: &str) -> Result<Identity> {
     let mut key = PrivateKey::from_openssh(pem)
         .with_context(|| format!("parsing SSH key {}", path.display()))?;
     if key.is_encrypted() {
-        let passphrase = match std::env::var(PASSPHRASE_ENV) {
-            Ok(p) => p,
-            Err(_) => {
-                rpassword::prompt_password(format!("enc: passphrase for {}: ", path.display()))
-                    .context("reading passphrase from the terminal")?
-            }
-        };
+        // Only from the terminal: an environment variable would leak into
+        // child processes, /proc/<pid>/environ and CI logs.
+        let passphrase =
+            rpassword::prompt_password(format!("enc: passphrase for {}: ", path.display()))
+                .context("reading passphrase from the terminal")?;
         key = key
             .decrypt(passphrase.as_bytes())
             .with_context(|| format!("decrypting SSH key {}", path.display()))?;
