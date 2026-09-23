@@ -16,7 +16,8 @@ Goals
 
 - **Confidentiality and integrity** of the repository against the host and
   anyone with read access to the hosting repository: refs, objects, ref names,
-  commit metadata and the participant list are never visible in clear.
+  commit metadata and the participant list are never visible in clear. What
+  does show is listed in section 6.4, the backend branch name first.
 - **Access control decided by the owner:** a participant list of public keys,
   carried in the manifest and signed. Adding a reader is a manifest rewrite;
   no out-of-band shared config.
@@ -173,8 +174,9 @@ Sign-then-encrypt: the signer's identity is inside the ciphertext, so the host
 cannot tell which participant pushed. The recipient stanzas in the age header
 do reveal the *number* of participants and, for `ssh-*` recipients, a short
 tag derived from the public key (this is inherent to age's ssh recipient
-types; it identifies a key only to someone who already knows it). An
-`age1…` recipient tag is random per file.
+types). Public keys are routinely published, so that tag can name the
+participants; section 6.4 has the consequence and the mitigation. An
+`age1…` recipient stanza carries no key tag.
 
 ### 4.4 Pack blobs
 
@@ -355,20 +357,24 @@ revocation means a fresh remote and a re-push (`git push --mirror`).
 
 ### 6.4 What the host learns
 
+- **The backend branch name**, in clear: it is a ref on the host, and anyone
+  who can read the hosting repository (`git ls-remote`) sees it, with the
+  times its commits appeared. The name comes from the URL fragment (`#<name>`,
+  default `enc`); a descriptive one (`embargo-CVE-2026-31337`) tells every
+  reader of the host what is being worked on and since when. Use a neutral
+  name, or one opaque remote per audience with the default name.
 - Number and size of packs, timing, pushing account (transport layer).
 - Number of participants (age recipient stanzas), and for `ssh-*` recipients a
-  tag that identifies the key to someone who already holds the public key.
+  4-byte tag derived from the public key. That tag identifies the key to
+  anyone who holds the public key, and public keys are not secret: forges
+  publish every user's SSH keys without authentication
+  (`https://<forge>/<user>.keys`). Whoever collects the published keys of an
+  organisation can therefore tell which of those keys each manifest is
+  encrypted to, i.e. who participates. Where membership itself is sensitive,
+  use participant keys that are not published anywhere (a dedicated
+  `ssh-ed25519` key per remote, not the key registered with the forge) or
+  `age1…` recipients, whose stanzas carry no key tag.
 - Nothing about refs, object ids, commit metadata, file names, or who signed.
-
-### 6.4.1 Audit trail
-
-The backend commits are anonymous and undated by design (section 4.1), so the
-audit trail lives inside the encrypted history instead: every manifest names
-its signer through its signature and carries its `time`, and the backend
-branch keeps every past manifest. `git-remote-enc log <remote>` walks the
-branch and prints, per generation, the signer, the time, and the ref,
-participant and admin changes. Manifests from before one's own key was added
-are not readable and are listed as such. `time` is self-asserted by the pusher.
 
 ### 6.5 Key material on the client
 
@@ -383,6 +389,70 @@ key derived for the local trust state are wiped when dropped (`zeroize`); the
 private keys themselves are wiped by age and ssh-key. Pages are not locked
 (`mlock`), so a secret can still reach swap or a core dump while it is live:
 run with encrypted swap and core dumps disabled where that matters.
+
+### 6.6 Audit trail
+
+The backend commits are anonymous and undated by design (section 4.1), so the
+audit trail lives inside the encrypted history instead: every manifest names
+its signer through its signature and carries its `time`, and the backend
+branch keeps every past manifest. `git-remote-enc log <remote>` walks the
+branch and prints, per generation, the signer, the time, and the ref,
+participant and admin changes. Manifests from before one's own key was added
+are not readable and are listed as such. `time` is self-asserted by the pusher.
+
+### 6.7 Threat model
+
+**Assets.** The repository's contents and history; its ref names and commit
+metadata; the participant and admin lists; the pack keys (which decrypt the
+whole history); the participants' private keys; and the integrity of the refs
+participants fetch and build on.
+
+**Actors.** Participants: admins, signing participants and `age1…` readers. A
+participant removed from the list. The host operator, and anyone with write
+access to the hosting repository. Anyone with read access to it. A network
+attacker between client and host. A local attacker on a participant's
+machine.
+
+**Trust boundaries and data flows.**
+
+```
+  participant's machine (trusted)                  │  host (trusted for availability only)
+                                                   │
+  private keys ───┐                                │
+  .git/config ────┼──▶ git-remote-enc ── push ─────┼──▶ backend branch: the signed,
+  (participants,  │      │       ▲                 │    encrypted manifest and the
+   admins)        │      ▼       └──── fetch ◀─────┼─── encrypted packs (its name and
+                  │   $GIT_DIR: decrypted objects, │    the blob sizes are visible)
+                  │   trust state (authenticated)  │
+                                                   │
+  out of band: the other participants' public keys and fingerprints (first contact)
+```
+
+The host is trusted for availability only: not to read, not to change what
+it stores, not to serve the same view to everyone. The participant's machine
+is trusted with everything: private keys, plaintext objects and the local
+trust state. The first contact relies on a channel outside both, through
+which a participant learns another's public key.
+
+| Threat | Mitigation | Residual risk |
+|---|---|---|
+| The host or a host reader reads the repository | age encryption of manifest and packs (4.3, 4.4) | the metadata of section 6.4: branch name, sizes, timing, participant count, key tags |
+| The host forges refs or a manifest | a manifest is accepted only when signed by a previously accepted participant (6.1) | none once a manifest has been accepted |
+| The host rolls the branch back | strictly increasing `generation`, checked against local state (6.2) | a host can withhold new pushes from a client that never saw them (freeze) |
+| The host serves different views to different clients | a changed manifest for an accepted generation is reported (6.2) | detected only by a client that sees both views |
+| The host substitutes its own remote on first contact | first contact needs a pinned participant list; repo id lookup across URL spellings (6.1) | `enc.trustOnFirstUse = true` reopens it, by choice |
+| The host deletes or recreates the branch | refused; `forget` needs a human decision (section 9) | availability: protect the branch on the host and keep a mirror; deletion stops work until restored |
+| A participant changes who participates | only admins change the lists; a push never does it implicitly (6.1, 6.3) | a remote from before format 2 has no admins until appointed; admins are fully trusted |
+| A participant rewrites or deletes refs | every change is signed and kept in the backend history (`log`, 6.6) | no per-ref permission: one remote per audience (section 1) |
+| A removed participant reads the past | future pack keys are unknown to them (6.3) | they keep the past history; full revocation is a new remote |
+| A participant's private key is compromised | passphrase on the key; admins remove the key | the whole readable history is exposed, permanently; no hardware or agent-held keys (6.5) |
+| A local attacker rewrites the trust state | HMAC keyed from the user's identity; missing state is refused (5.4, section 9) | whoever can write `.git` can run code through hooks anyway |
+| A crafted `enc::` URL runs a command | the URL goes to git after `--`, and a leading `-` is refused | none known |
+| Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
+| Plaintext leaks through the developer's workflow | none in the tool: the decrypted objects live in the local `$GIT_DIR` next to any other remote's (5.4) | pushing an encrypted branch to a plain remote by mistake publishes it; use a dedicated clone, disk encryption, and delete the clone when done |
+| A malicious or compromised build | reproducible builds from pinned inputs, SHA-pinned actions, Sigstore-signed provenance and an SBOM per release, `cargo audit` and `cargo deny` in CI | the build image runs Nix with `sandbox = false`; dependencies include a pre-release crate (`kem`) and an unfixed but unreachable one (`rsa`, RUSTSEC-2023-0071) |
+| A parser bug on untrusted input | Rust with panics denied by lint; the signature is checked before parsing when a signer list is known; mutation tests of every parser (section 10) | no coverage-guided fuzzing; trust on first use parses unauthenticated text |
+| Traffic analysis | none (non-goal, section 1) | the host sees who pushes and fetches, when, and how much |
 
 ## 7. Performance and growth
 
