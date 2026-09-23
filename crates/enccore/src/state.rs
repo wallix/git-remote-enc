@@ -26,6 +26,9 @@ pub struct Trust {
     pub generation: u64,
     pub repo_id: String,
     pub participants: Vec<String>,
+    /// SHA-256 of the accepted manifest text; absent in state written by
+    /// older versions.
+    pub digest: Option<String>,
 }
 
 impl State {
@@ -97,6 +100,7 @@ impl State {
             match item {
                 "generation" => t.generation = rest.trim().parse().context("trust: generation")?,
                 "repo" => t.repo_id = rest.trim().to_owned(),
+                "digest" => t.digest = Some(rest.trim().to_owned()),
                 "participant" => t.participants.push(rest.trim().to_owned()),
                 "" => {}
                 other => bail!("trust file: unknown item `{other}`"),
@@ -107,6 +111,9 @@ impl State {
 
     pub fn save_trust(&self, t: &Trust) -> Result<()> {
         let mut text = format!("generation {}\nrepo {}\n", t.generation, t.repo_id);
+        if let Some(d) = &t.digest {
+            text.push_str(&format!("digest {d}\n"));
+        }
         for p in &t.participants {
             text.push_str(&format!("participant {p}\n"));
         }

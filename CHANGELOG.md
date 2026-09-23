@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A fetch warns when the remote serves a different manifest for the generation
+  it already accepted, i.e. the remote's history forked.
 - Linked worktrees share the repository's trust state for a remote instead of
   starting from first contact.
 - Breaking: `ssh-rsa` keys are no longer accepted as participants or
