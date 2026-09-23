@@ -82,6 +82,11 @@ Pack keys are replaced by `<redacted>` unless `--show-keys` is given: together
 they decrypt the whole history, so keep them out of terminals, logs and bug
 reports.
 
+`git-remote-enc forget <remote>` drops the local trust state of a remote, which
+the helper otherwise refuses to discard when the remote was recreated,
+deleted, or its local state was lost. Do it only after the participants confirm
+the change out of band: the next contact is a first contact.
+
 ## License
 
 Apache-2.0.

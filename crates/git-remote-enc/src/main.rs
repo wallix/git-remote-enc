@@ -45,6 +45,14 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
+        [cmd, target] if cmd == "forget" => {
+            let dir = open_by_name_or_url(target)?.forget()?;
+            eprintln!(
+                "enc: removed {}; the next contact with {target} is a first contact and needs a pinned participant list",
+                dir.display()
+            );
+            Ok(())
+        }
         [name, url] => helper(Remote::open(Some(name), url)?),
         [url] => helper(Remote::open(None, url)?),
         _ => usage(),
@@ -53,7 +61,7 @@ fn run() -> Result<()> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc --version"
+        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc forget <remote|url>\n       git-remote-enc --version"
     );
     std::process::exit(2);
 }
