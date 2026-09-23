@@ -1,0 +1,38 @@
+# cargo-deny policy (CI: `cargo deny check licenses bans sources`). Advisories
+# are cargo-audit's job, against .cargo/audit.toml.
+
+[graph]
+# Every platform a release is built for.
+targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+
+[licenses]
+# Permissive licences compatible with shipping the binary under Apache-2.0.
+# A new one needs a reviewed addition here, not a blanket exception.
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicates are reported, not fatal: age and ssh-key are still on the
+# RustCrypto 0.10 generation (sha2, digest, …) next to the workspace's 0.11.
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's own path dependency (enccore) has no version; both crates
+# are `publish = false`, which is what this exemption requires.
+allow-wildcard-paths = true
+
+[sources]
+# crates.io only: no git dependencies, no other registry.
+unknown-registry = "deny"
+unknown-git = "deny"

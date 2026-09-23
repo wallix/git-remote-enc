@@ -10,7 +10,7 @@
   #     with rustc's self-contained crt objects and its bundled `rust-lld`.
   #   - GNU coreutils, bash, sed, grep, find and diff for the scripts and the black-box
   #     tests; git for the tests and the helper itself; ca-certificates and cargo-audit for
-  #     audit.sh.
+  #     audit.sh; cargo-deny for the dependency policy.
   #
   # Linux releases are native on x86_64-linux and aarch64-linux; the system determines
   # the musl target.
@@ -75,6 +75,7 @@
             git
             cacert
             cargo-audit # audit.sh (RUSTSEC scan)
+            cargo-deny # licence, source and duplicate-crate policy (deny.toml)
             # The scripts and the black-box tests use GNU tools; bash also provides
             # `sh` for build.sh's `sh -c "$BUILD_CMD"`.
             coreutils

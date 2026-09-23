@@ -38,6 +38,11 @@ jobs:
           - name: audit
             cmd: cargo audit --deny warnings
             timeout: 20
+          # deny.toml: permissive licences only, crates.io only, no wildcard versions.
+          # Advisories stay with cargo-audit above.
+          - name: deny
+            cmd: cargo deny --locked check licenses bans sources
+            timeout: 20
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.timeout }}

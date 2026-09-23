@@ -195,14 +195,17 @@ do not tag by hand.
   gates.
 - **Dependency audit:** `cargo audit --deny warnings` in CI. An ignore goes in
   `.cargo/audit.toml` with the rationale and residual risk written out.
+- **Dependency policy:** `cargo deny --locked check licenses bans sources` in
+  CI against [`deny.toml`](deny.toml): permissive licences only, crates.io
+  only, no wildcard versions. A new licence is a reviewed addition there.
 
 ## CI
 
 `.github/workflows/`: `ci.yml` (push to `main` + PRs) and `release.yml` (push
 to `release`) both call the reusable `quality.yml`, which runs fmt, clippy,
-`cargo test --workspace --locked`, and `cargo audit --deny warnings` — one
-matrix entry each, all four inside the pinned `enc-build` image, so CI uses
-exactly the toolchain the release build uses. Generated code **must** pass
+`cargo test --workspace --locked`, `cargo audit --deny warnings` and
+`cargo deny` — one matrix entry each, all five inside the pinned `enc-build`
+image, so CI uses exactly the toolchain the release build uses. Generated code **must** pass
 those checks. Commit dependency changes with their `Cargo.lock` updates.
 `build.sh` and `lint.sh` also pass `--locked`, so local runs reject a stale
 lockfile too.
