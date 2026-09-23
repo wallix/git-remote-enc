@@ -20,6 +20,9 @@ pub mod remote;
 pub mod state;
 pub mod version;
 
+#[cfg(test)]
+mod mutate;
+
 /// Diagnostics go to stderr: stdout is git's protocol channel.
 pub fn info(msg: &str) {
     eprintln!("enc: {msg}");

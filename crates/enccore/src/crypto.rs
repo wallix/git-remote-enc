@@ -583,6 +583,37 @@ mod tests {
     }
 
     #[test]
+    fn key_and_signature_parsers_survive_corrupted_input() {
+        let (key, p) = keypair();
+        let text = p.text().to_owned();
+        for input in crate::mutate::variants(text.as_bytes(), 5_000) {
+            if let Ok(s) = std::str::from_utf8(&input) {
+                let _ = Participant::parse(s);
+            }
+        }
+        let sig = sign(&key, b"manifest").unwrap();
+        let signers = [p];
+        for input in crate::mutate::variants(sig.as_bytes(), 5_000) {
+            if let Ok(s) = std::str::from_utf8(&input) {
+                // A corrupted signature that still verifies must be the same
+                // key's signature over the same data: ssh-key tolerates some
+                // encoding slack (a wrong inner length prefix on the embedded
+                // key), which changes nothing that is signed.
+                if let Ok(Some(_)) = verify(&signers, b"manifest", s) {
+                    let (got, want) = (
+                        SshSig::from_pem(s).unwrap(),
+                        SshSig::from_pem(&sig).unwrap(),
+                    );
+                    assert_eq!(got.public_key(), want.public_key(), "{s}");
+                    assert_eq!(got.signature_bytes(), want.signature_bytes(), "{s}");
+                    assert_eq!(got.namespace(), want.namespace(), "{s}");
+                }
+                let _ = signature_key(b"manifest", s);
+            }
+        }
+    }
+
+    #[test]
     fn hmac_matches_rfc4231() {
         // Test cases 1 and 6 (a key longer than the block size).
         assert_eq!(
