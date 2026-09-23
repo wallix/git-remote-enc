@@ -34,9 +34,12 @@ impl Sandbox {
         let _ = fs::remove_dir_all(&root);
         let home = root.join("home");
         fs::create_dir_all(&home).unwrap();
+        // No automatic gc or maintenance: the incremental-transfer test counts
+        // the packs each repository received, which a repack would merge.
         fs::write(
             home.join(".gitconfig"),
-            "[user]\n\tname = t\n\temail = t@example.com\n[init]\n\tdefaultBranch = main\n[advice]\n\tdetachedHead = false\n",
+            "[user]\n\tname = t\n\temail = t@example.com\n[init]\n\tdefaultBranch = main\n[advice]\n\tdetachedHead = false\n\
+             [gc]\n\tauto = 0\n[receive]\n\tautogc = false\n[maintenance]\n\tauto = false\n",
         )
         .unwrap();
         let bin = Path::new(env!("CARGO_BIN_EXE_git-remote-enc"))
