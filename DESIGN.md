@@ -121,16 +121,17 @@ twice in either direction.
 ### 4.2 Manifest
 
 The manifest plaintext is UTF-8 text, one item per line, `\n`-terminated. Its
-first line is the format tag. Version 1:
+first line is the format tag. Version 2:
 
 ```
-enc-manifest 1
+enc-manifest 2
 generation 42
 repo 3f9c6e4d0b1a2c7e8d9f0a1b2c3d4e5f
 head refs/heads/main
 participant ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop
 participant ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... bob@ci
 participant age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+admin ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop
 ref 7f3a...c1 refs/heads/main
 ref 91b2...4e refs/tags/v1.0
 pack 5b0e...d7 AGE-SECRET-KEY-1QG5...
@@ -139,17 +140,22 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 
 | item | meaning |
 |---|---|
-| `enc-manifest <n>` | format version; a reader refuses an unknown `n` |
+| `enc-manifest <n>` | format version; a reader refuses an unknown `n`. Readers accept 1 and 2 and write 2 |
 | `generation <n>` | strictly increasing per push; anti-rollback (section 6.2) |
 | `repo <hex>` | random id chosen at creation; detects a recreated remote |
 | `head <ref>` | what `HEAD` points to on clone (first pushed branch by default) |
 | `participant <key>` | an `ssh-ed25519` public key (may read, may push) or an `age1…` recipient (read-only, cannot sign) |
+| `admin <key>` | a participant (`ssh-ed25519`) who may change the `participant` and `admin` lists (section 6.1). New in version 2; a version 1 manifest has none |
 | `ref <oid> <name>` | a git ref and its object id, as in `git ls-remote` |
 | `pack <sha256> <age-secret-key>` | a pack blob and the X25519 identity that decrypts it, in append order |
 | `extn <name> …` | reserved: unknown items are preserved verbatim by writers that do not understand them |
 
 Pack lines are ordered: a pack may be *thin* relative to every pack before it,
 so a reader indexes them in manifest order (section 5.2).
+
+Version 1 had no `admin` item. The first push by a version 2 writer rewrites a
+version 1 manifest as version 2 with an empty admin list, which older binaries
+then refuse to read: every participant must upgrade.
 
 ### 4.3 Manifest envelope
 
@@ -305,11 +311,19 @@ After acceptance the participant list is stored locally, so:
 - consequently a compromised host can at most **withhold** or **roll back**
   (6.2), never forge.
 
-There is deliberately no separate "owner" key in v1: any pushing participant
-is an admin. Read-only participants (`age1…` keys) cannot sign and therefore
-cannot push. A future version may add an `admin` item restricting who may
-change the participant list; readers ignoring unknown items make that a
-compatible extension.
+Any participant that can sign may push refs; only an **admin** may change who
+participates. A manifest is accepted over the previous one only if either it
+leaves the `participant` and `admin` lists unchanged (compared by key), or its
+signer is an admin of the previous manifest; and once a remote has admins, a
+manifest with none is refused. Every admin must be an `ssh-ed25519`
+participant. A new remote's admins are `enc-admins` if configured, else its
+creator. Writers enforce the same rules before pushing, so a refused change
+never reaches the host.
+
+A remote created before version 2 has no admins, and then any signing
+participant may change the lists, as in version 1, with a warning;
+`git-remote-enc participants --apply` with `enc-admins` set appoints them.
+Read-only participants (`age1…` keys) cannot sign and therefore cannot push.
 
 ### 6.2 Rollback
 
@@ -323,12 +337,12 @@ guarantees "previous" is the real tip.
 
 ### 6.3 Adding and removing participants
 
-The participant list changes only on request: `git-remote-enc participants
-<remote>` shows the remote's list and how the configured one
-(`enc-participants`) differs, and `--apply` pushes a manifest carrying the
-configured list and no ref change. An ordinary push keeps the remote's list,
-so a clone with a stale or partial configuration cannot drop someone as a side
-effect of an unrelated push.
+The participant and admin lists change only on request, by an admin
+(section 6.1): `git-remote-enc participants <remote>` shows the remote's lists
+and how the configured ones (`enc-participants`, `enc-admins`) differ, and
+`--apply` pushes a manifest carrying the configured lists and no ref change.
+An ordinary push keeps the remote's lists, so a clone with a stale or partial
+configuration cannot drop someone as a side effect of an unrelated push.
 
 Adding a reader is cheap: re-encrypt the manifest to the new set (the pack keys
 are inside it, so all history becomes readable). Removing a participant
@@ -384,6 +398,7 @@ run with encrypted swap and core dumps disabled where that matters.
 | `remote.<name>.enc-identity`, `enc.identity` (multi) | identity files. Default: `user.signingkey` when `gpg.format = ssh` and it is a path, else `~/.ssh/id_ed25519` |
 | `remote.<name>.enc-signingkey`, `enc.signingkey` | SSH private key used to sign. Default: the first SSH identity |
 | `remote.<name>.enc-participants`, `enc.participants` (multi) | public keys, one per value, or `@<file>` (authorized_keys-style). Required to create a remote; on first contact with an existing remote, the signer must be one of them; on an existing remote a push never applies it (it warns when it differs); `git-remote-enc participants --apply` does (section 6.3) |
+| `remote.<name>.enc-admins`, `enc.admins` (multi) | like `enc-participants`, for the admin list: the admins of a new remote (default: its creator), or the list `participants --apply` sets (section 6.1) |
 | `remote.<name>.enc-trustOnFirstUse`, `enc.trustOnFirstUse` | boolean, default false. Accept the signer of an unknown remote without a pinned participant list (section 6.1) |
 
 URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to

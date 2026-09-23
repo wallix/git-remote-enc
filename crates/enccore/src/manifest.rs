@@ -5,7 +5,9 @@ use std::fmt;
 
 use zeroize::{Zeroize, Zeroizing};
 
-pub const FORMAT_VERSION: u32 = 1;
+/// The version written. Version 1 (no `admin` item) is still read.
+pub const FORMAT_VERSION: u32 = 2;
+const OLDEST_VERSION: u32 = 1;
 const HEADER: &str = "enc-manifest";
 /// Stands in for a pack key in a displayed manifest.
 pub const REDACTED_KEY: &str = "<redacted>";
@@ -39,6 +41,9 @@ pub struct Manifest {
     /// Public keys as written by the user (`ssh-ed25519 AAAA… comment`,
     /// `age1…`). Parsed lazily by `crypto::Participant`.
     pub participants: Vec<String>,
+    /// The participants who may change `participants` and `admins`. Empty in
+    /// a remote created before version 2: any signer may then change them.
+    pub admins: Vec<String>,
     /// `(oid, refname)` in manifest order.
     pub refs: Vec<(String, String)>,
     /// In append order; a pack may be thin relative to earlier ones.
@@ -60,7 +65,7 @@ impl fmt::Display for ParseError {
         match self {
             Self::NotAManifest => write!(f, "not an enc manifest"),
             Self::UnsupportedVersion(v) => {
-                write!(f, "manifest format {v} is newer than this binary supports")
+                write!(f, "manifest format {v} is not supported by this binary")
             }
             Self::Malformed(line, item) => write!(f, "malformed manifest line {line}: {item}"),
             Self::Missing(what) => write!(f, "manifest lacks a `{what}` item"),
@@ -79,7 +84,7 @@ impl Manifest {
             .and_then(|r| r.strip_prefix(' '))
             .and_then(|v| v.trim().parse::<u32>().ok())
             .ok_or(ParseError::NotAManifest)?;
-        if version != FORMAT_VERSION {
+        if !(OLDEST_VERSION..=FORMAT_VERSION).contains(&version) {
             return Err(ParseError::UnsupportedVersion(version));
         }
 
@@ -102,6 +107,9 @@ impl Manifest {
                 "head" => m.head = Some(nonempty(rest).ok_or_else(malformed)?.to_owned()),
                 "participant" => m
                     .participants
+                    .push(nonempty(rest).ok_or_else(malformed)?.to_owned()),
+                "admin" => m
+                    .admins
                     .push(nonempty(rest).ok_or_else(malformed)?.to_owned()),
                 "ref" => {
                     let (oid, name) = rest.split_once(' ').ok_or_else(malformed)?;
@@ -153,6 +161,9 @@ impl Manifest {
         }
         for p in &self.participants {
             out.push_str(&format!("participant {p}\n"));
+        }
+        for a in &self.admins {
+            out.push_str(&format!("admin {a}\n"));
         }
         for (oid, name) in &self.refs {
             out.push_str(&format!("ref {oid} {name}\n"));
@@ -230,7 +241,7 @@ pub fn join_envelope(manifest: &str, signature_pem: &str) -> Zeroizing<Vec<u8>> 
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "enc-manifest 1\ngeneration 3\nrepo abcdef0123\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nextn future stuff\n";
+    const SAMPLE: &str = "enc-manifest 2\ngeneration 3\nrepo abcdef0123\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nadmin ssh-ed25519 AAAAC3 alice\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nextn future stuff\n";
 
     #[test]
     fn roundtrip() {
@@ -240,6 +251,7 @@ mod tests {
         assert_eq!(m.head.as_deref(), Some("refs/heads/main"));
         assert_eq!(m.participants.len(), 2);
         assert_eq!(m.participants[0], "ssh-ed25519 AAAAC3 alice");
+        assert_eq!(m.admins, vec!["ssh-ed25519 AAAAC3 alice"]);
         assert_eq!(m.refs.len(), 1);
         assert_eq!(m.packs.len(), 1);
         assert_eq!(m.extensions, vec!["extn future stuff"]);
@@ -253,9 +265,17 @@ mod tests {
     fn rejects_garbage_and_future_versions() {
         assert_eq!(Manifest::parse("hello"), Err(ParseError::NotAManifest));
         assert_eq!(
-            Manifest::parse("enc-manifest 2\ngeneration 1\nrepo x\n"),
-            Err(ParseError::UnsupportedVersion(2))
+            Manifest::parse("enc-manifest 3\ngeneration 1\nrepo x\n"),
+            Err(ParseError::UnsupportedVersion(3))
         );
+        assert_eq!(
+            Manifest::parse("enc-manifest 0\ngeneration 1\nrepo x\n"),
+            Err(ParseError::UnsupportedVersion(0))
+        );
+        // Version 1 is read, and written back as the current version.
+        let v1 = Manifest::parse("enc-manifest 1\ngeneration 1\nrepo x\n").unwrap();
+        assert!(v1.admins.is_empty());
+        assert!(v1.serialize().starts_with("enc-manifest 2\n"));
         assert_eq!(
             Manifest::parse("enc-manifest 1\nrepo x\n"),
             Err(ParseError::Missing("generation"))

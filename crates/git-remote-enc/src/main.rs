@@ -16,7 +16,7 @@
 use std::io::{self, BufRead, Write};
 
 use anyhow::{Result, bail};
-use enccore::remote::{PushStatus, RefSpec, Remote};
+use enccore::remote::{ParticipantDiff, PushStatus, RefSpec, Remote};
 
 fn main() {
     if let Err(e) = run() {
@@ -74,35 +74,46 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-/// Print the remote's participants and how the configured list differs;
-/// with `apply`, make the remote's list the configured one.
+/// Print the remote's participants and admins and how the configured lists
+/// differ; with `apply`, make the remote's lists the configured ones.
 fn participants(remote: &mut Remote, target: &str, apply: bool) -> Result<()> {
-    let (current, diff) = remote.participants()?;
-    for p in &current {
-        println!("  {p}");
-    }
-    let Some(diff) = diff else {
-        if apply {
-            bail!("no participant list configured for {target} (remote.<name>.enc-participants)");
+    let access = remote.access()?;
+    let show = |title: &str, list: &[String], diff: &Option<ParticipantDiff>| {
+        println!("{title}:");
+        for p in list {
+            println!("  {p}");
         }
-        return Ok(());
+        for p in diff.iter().flat_map(|d| &d.added) {
+            println!("+ {p}");
+        }
+        for p in diff.iter().flat_map(|d| &d.removed) {
+            println!("- {p}");
+        }
     };
-    if diff.is_empty() {
-        println!("the configured participant list matches");
-        return Ok(());
-    }
-    println!("the configured participant list would change it:");
-    for p in &diff.added {
-        println!("+ {p}");
-    }
-    for p in &diff.removed {
-        println!("- {p}");
-    }
-    if apply {
+    show(
+        "participants",
+        &access.participants,
+        &access.participants_diff,
+    );
+    show("admins", &access.admins, &access.admins_diff);
+    let pending = [&access.participants_diff, &access.admins_diff]
+        .iter()
+        .any(|d| d.as_ref().is_some_and(|d| !d.is_empty()));
+    if access.participants_diff.is_none() && access.admins_diff.is_none() {
+        if apply {
+            bail!(
+                "nothing configured to apply for {target} (remote.<name>.enc-participants, enc-admins)"
+            );
+        }
+    } else if !pending {
+        println!("the configuration matches");
+    } else if apply {
         remote.apply_participants()?;
-        println!("applied");
+        println!("applied (+ added, - removed)");
     } else {
-        println!("run `git-remote-enc participants --apply {target}` to apply it");
+        println!(
+            "+/- lines are the configured changes; `git-remote-enc participants --apply {target}` applies them"
+        );
     }
     Ok(())
 }

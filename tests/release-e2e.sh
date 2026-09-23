@@ -172,7 +172,7 @@ check "non-fast-forward push rejected" non_ff_rejected
 manifest_subcommand() {
   local m
   m=$(cd "$WORK/alice-repo" && "$BIN" manifest enc)
-  grep -q '^enc-manifest 1$' <<<"$m" && ! grep -q 'AGE-SECRET-KEY-' <<<"$m"
+  grep -q '^enc-manifest 2$' <<<"$m" && ! grep -q 'AGE-SECRET-KEY-' <<<"$m"
 }
 check "manifest subcommand" manifest_subcommand
 

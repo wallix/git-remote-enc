@@ -86,6 +86,15 @@ impl ParticipantDiff {
     }
 }
 
+/// Who may read, push and administer a remote, and the pending changes the
+/// configuration would apply.
+pub struct Access {
+    pub participants: Vec<String>,
+    pub admins: Vec<String>,
+    pub participants_diff: Option<ParticipantDiff>,
+    pub admins_diff: Option<ParticipantDiff>,
+}
+
 pub enum PushStatus {
     Ok(String),
     Error(String, String),
@@ -374,8 +383,33 @@ impl Remote {
                 self.backend.url
             ),
         }
-        // Validate the new list now so a later push gets a clear error.
+        // Only an admin of the accepted manifest may change who reads or
+        // who administers. A remote created before admins existed has none,
+        // and then any trusted signer may, as before.
+        if let Some(t) = &trust
+            && !t.admins.is_empty()
+            && !(same_keys(&t.participants, &m.participants)? && same_keys(&t.admins, &m.admins)?)
+        {
+            verified_signer(&t.admins, text, sig).map_err(|_| {
+                anyhow!(
+                    "manifest generation {} changes the participant or admin list but is not signed by an \
+                     admin; refusing it",
+                    m.generation
+                )
+            })?;
+            // Once a remote has admins it keeps some: an empty list (or a
+            // version 1 manifest, which has none) would hand the role to
+            // every participant.
+            if m.admins.is_empty() {
+                bail!(
+                    "manifest generation {} removes every admin; refusing it",
+                    m.generation
+                );
+            }
+        }
+        // Validate the new lists now so a later push gets a clear error.
         Participant::parse_all(&m.participants).context("manifest participant list")?;
+        check_admins(&m.participants, &m.admins).context("manifest admin list")?;
         self.save_trust(&trust_in(&m, text))?;
         Ok(m)
     }
@@ -470,20 +504,26 @@ impl Remote {
         self.push_with(specs, false)
     }
 
-    /// The remote's participant list, and how the configured one differs
-    /// from it (`None` when the configuration sets none).
-    pub fn participants(&mut self) -> Result<(Vec<String>, Option<ParticipantDiff>)> {
+    /// The remote's participant and admin lists, and how the configured
+    /// ones differ from them (`None` where the configuration sets none).
+    pub fn access(&mut self) -> Result<Access> {
         self.connect()?;
-        let current = self
+        let m = self
             .manifest
             .as_ref()
-            .map(|m| m.participants.clone())
             .ok_or_else(|| anyhow!("no encrypted remote at {}", self.backend.url))?;
-        let diff = match &self.cfg.participants {
-            Some(p) => Some(ParticipantDiff::between(&current, p)?),
-            None => None,
+        let diff = |current: &[String], configured: &Option<Vec<String>>| {
+            configured
+                .as_ref()
+                .map(|c| ParticipantDiff::between(current, c))
+                .transpose()
         };
-        Ok((current, diff))
+        Ok(Access {
+            participants_diff: diff(&m.participants, &self.cfg.participants)?,
+            admins_diff: diff(&m.admins, &self.cfg.admins)?,
+            participants: m.participants.clone(),
+            admins: m.admins.clone(),
+        })
     }
 
     /// Replace the remote's participant list with the configured one, as a
@@ -536,6 +576,7 @@ impl Remote {
                 "creating an encrypted remote needs its participants: \
                  git config --add remote.<name>.enc-participants \"$(cat ~/.ssh/id_ed25519.pub)\""
             ),
+            (None, true) if self.cfg.admins.is_some() => m.participants.clone(),
             (None, true) => bail!(
                 "no participant list to apply: set remote.<name>.enc-participants (or enc.participants)"
             ),
@@ -551,11 +592,14 @@ impl Remote {
             }
             (None, false) => m.participants.clone(),
         };
-        if set_participants
-            && !is_new
-            && ParticipantDiff::between(&m.participants, &participant_texts)?.is_empty()
-        {
-            return Ok(Some(vec![]));
+        if set_participants && !is_new {
+            let admins_unchanged = match &self.cfg.admins {
+                Some(a) => same_keys(&m.admins, a)?,
+                None => true,
+            };
+            if admins_unchanged && same_keys(&m.participants, &participant_texts)? {
+                return Ok(Some(vec![]));
+            }
         }
         let participants = Participant::parse_all(&participant_texts)?;
         if !participants.iter().any(Participant::can_sign) {
@@ -584,6 +628,52 @@ impl Remote {
             info(
                 "warning: your own key is not in the new participant list; you will lose read access",
             );
+        }
+
+        // Admins: the configured list or the creator for a new remote; the
+        // configured list, if any, for `participants --apply`; else unchanged.
+        let admin_texts = if is_new {
+            match &self.cfg.admins {
+                Some(a) => a.clone(),
+                None => participants
+                    .iter()
+                    .filter(|p| p.matches(&signer))
+                    .map(|p| p.text().to_owned())
+                    .collect(),
+            }
+        } else if set_participants {
+            self.cfg.admins.clone().unwrap_or_else(|| m.admins.clone())
+        } else {
+            m.admins.clone()
+        };
+        check_admins(&participant_texts, &admin_texts)?;
+        let changes_access = !is_new
+            && !(same_keys(&m.participants, &participant_texts)?
+                && same_keys(&m.admins, &admin_texts)?);
+        if changes_access {
+            if !m.admins.is_empty() {
+                let admins = Participant::parse_all(&m.admins)?;
+                if !admins.iter().any(|a| a.matches(&signer)) {
+                    bail!(
+                        "only an admin of {} may change its participant or admin list; its admins are {}",
+                        self.label,
+                        admins
+                            .iter()
+                            .map(Participant::fingerprint)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                if admin_texts.is_empty() {
+                    bail!("refusing to remove every admin of {}", self.label);
+                }
+            } else if admin_texts.is_empty() {
+                info(&format!(
+                    "warning: {} has no admin, so any participant may change its participant list; \
+                     set remote.<name>.enc-admins and apply it with `git-remote-enc participants --apply`",
+                    self.label
+                ));
+            }
         }
 
         // Fast-forward checks (git does not do them reliably for helpers).
@@ -648,6 +738,7 @@ impl Remote {
                 .find(|d| d.starts_with("refs/heads/"));
         }
         m.participants = participant_texts;
+        m.admins = admin_texts;
         if let Some(p) = &pack {
             m.packs.push(Pack {
                 id: p.id.clone(),
@@ -771,6 +862,26 @@ impl Remote {
     }
 }
 
+/// Do two key lists name the same keys, comments and order aside?
+fn same_keys(a: &[String], b: &[String]) -> Result<bool> {
+    Ok(ParticipantDiff::between(a, b)?.is_empty())
+}
+
+/// Every admin must be a participant that can sign.
+fn check_admins(participants: &[String], admins: &[String]) -> Result<()> {
+    let participants = Participant::parse_all(participants)?;
+    for a in Participant::parse_all(admins)? {
+        if !a.can_sign() || !participants.iter().any(|p| p.key() == a.key()) {
+            bail!(
+                "admin {} is not an SSH participant; an admin leaving the participants must also \
+                 leave the admin list (enc-admins)",
+                a.fingerprint()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The fingerprint of the participant in `allowed` whose key signed `text`.
 fn verified_signer(allowed: &[String], text: &str, sig: &str) -> Result<String> {
     let allowed = Participant::parse_all(allowed)?;
@@ -786,6 +897,7 @@ fn trust_in(m: &Manifest, text: &str) -> Trust {
         generation: m.generation,
         repo_id: m.repo_id.clone(),
         participants: m.participants.clone(),
+        admins: m.admins.clone(),
         digest: Some(crypto::sha256_hex(text.as_bytes())),
     }
 }
