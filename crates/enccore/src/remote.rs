@@ -51,6 +51,41 @@ impl RefSpec {
 /// `(oid, refname)` as printed for `list`.
 pub type RefList = Vec<(Oid, String)>;
 
+/// How a participant list differs from another, by key (comments ignored).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ParticipantDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl ParticipantDiff {
+    pub fn between(old: &[String], new: &[String]) -> Result<Self> {
+        let keys = |texts: &[String]| -> Result<Vec<String>> {
+            Ok(Participant::parse_all(texts)?
+                .iter()
+                .map(Participant::key)
+                .collect())
+        };
+        let (old_keys, new_keys) = (keys(old)?, keys(new)?);
+        let pick = |texts: &[String], keys: &[String], other: &[String]| {
+            texts
+                .iter()
+                .zip(keys)
+                .filter(|(_, k)| !other.contains(k))
+                .map(|(t, _)| t.clone())
+                .collect()
+        };
+        Ok(Self {
+            added: pick(new, &new_keys, &old_keys),
+            removed: pick(old, &old_keys, &new_keys),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
 pub enum PushStatus {
     Ok(String),
     Error(String, String),
@@ -432,9 +467,39 @@ impl Remote {
     // ---- push -------------------------------------------------------------
 
     pub fn push(&mut self, specs: &[RefSpec]) -> Result<Vec<PushStatus>> {
+        self.push_with(specs, false)
+    }
+
+    /// The remote's participant list, and how the configured one differs
+    /// from it (`None` when the configuration sets none).
+    pub fn participants(&mut self) -> Result<(Vec<String>, Option<ParticipantDiff>)> {
+        self.connect()?;
+        let current = self
+            .manifest
+            .as_ref()
+            .map(|m| m.participants.clone())
+            .ok_or_else(|| anyhow!("no encrypted remote at {}", self.backend.url))?;
+        let diff = match &self.cfg.participants {
+            Some(p) => Some(ParticipantDiff::between(&current, p)?),
+            None => None,
+        };
+        Ok((current, diff))
+    }
+
+    /// Replace the remote's participant list with the configured one, as a
+    /// push that changes no ref.
+    pub fn apply_participants(&mut self) -> Result<()> {
+        self.connect()?;
+        if self.manifest.is_none() {
+            bail!("no encrypted remote at {}", self.backend.url);
+        }
+        self.push_with(&[], true).map(drop)
+    }
+
+    fn push_with(&mut self, specs: &[RefSpec], set_participants: bool) -> Result<Vec<PushStatus>> {
         self.connect()?;
         for attempt in 1..=PUSH_ATTEMPTS {
-            if let Some(statuses) = self.try_push(specs)? {
+            if let Some(statuses) = self.try_push(specs, set_participants)? {
                 return Ok(statuses);
             }
             info(&format!(
@@ -446,8 +511,13 @@ impl Remote {
     }
 
     /// One attempt. `None` means the compare-and-swap lost; the caller
-    /// reconnects and calls again.
-    fn try_push(&mut self, specs: &[RefSpec]) -> Result<Option<Vec<PushStatus>>> {
+    /// reconnects and calls again. `set_participants` replaces the list with
+    /// the configured one; otherwise an existing remote keeps its own.
+    fn try_push(
+        &mut self,
+        specs: &[RefSpec],
+        set_participants: bool,
+    ) -> Result<Option<Vec<PushStatus>>> {
         let is_new = self.manifest.is_none();
         let mut m = match &self.manifest {
             Some(m) => m.clone(),
@@ -457,15 +527,36 @@ impl Remote {
             },
         };
 
-        // Participants: config overrides; a new remote needs them.
-        let participant_texts = match (&self.cfg.participants, is_new) {
-            (Some(p), _) => p.clone(),
-            (None, false) => m.participants.clone(),
-            (None, true) => bail!(
+        // Participants: a new remote takes the configured list. An existing
+        // one keeps its own unless the change is asked for explicitly, so a
+        // stale or partial local list never rewrites it as a side effect.
+        let participant_texts = match (&self.cfg.participants, is_new || set_participants) {
+            (Some(p), true) => p.clone(),
+            (None, true) if is_new => bail!(
                 "creating an encrypted remote needs its participants: \
                  git config --add remote.<name>.enc-participants \"$(cat ~/.ssh/id_ed25519.pub)\""
             ),
+            (None, true) => bail!(
+                "no participant list to apply: set remote.<name>.enc-participants (or enc.participants)"
+            ),
+            (Some(p), false) => {
+                if !ParticipantDiff::between(&m.participants, p)?.is_empty() {
+                    info(&format!(
+                        "warning: the configured participants differ from {}'s; a push does not change them. \
+                         `git-remote-enc participants {}` shows the difference, `--apply` applies it",
+                        self.label, self.label
+                    ));
+                }
+                m.participants.clone()
+            }
+            (None, false) => m.participants.clone(),
         };
+        if set_participants
+            && !is_new
+            && ParticipantDiff::between(&m.participants, &participant_texts)?.is_empty()
+        {
+            return Ok(Some(vec![]));
+        }
         let participants = Participant::parse_all(&participant_texts)?;
         if !participants.iter().any(Participant::can_sign) {
             bail!("at least one participant must be an SSH key (age recipients cannot sign)");
@@ -525,7 +616,7 @@ impl Remote {
             }
             accepted.push((spec, Some(new)));
         }
-        if accepted.is_empty() {
+        if accepted.is_empty() && !set_participants {
             return Ok(Some(statuses));
         }
 
@@ -533,7 +624,11 @@ impl Remote {
         let wants: Vec<Oid> = accepted.iter().filter_map(|(_, o)| o.clone()).collect();
         let known: Vec<Oid> = m.refs.iter().map(|(oid, _)| oid.clone()).collect();
         let excludes = git::have_objects(&known)?;
-        let pack = self.build_pack(&wants, &excludes)?;
+        let pack = if wants.is_empty() {
+            None
+        } else {
+            self.build_pack(&wants, &excludes)?
+        };
 
         m.generation = m
             .generation

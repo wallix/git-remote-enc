@@ -464,7 +464,7 @@ fn access_control() {
     let url = sb.url(&host, None);
     let (alice, alice_pub) = sb.keypair("alice");
     let (_bob, bob_pub) = sb.keypair("bob");
-    let (carol, _carol_pub) = sb.keypair("carol");
+    let (carol, carol_pub) = sb.keypair("carol");
 
     // A read-only age participant.
     let reader = age::x25519::Identity::generate();
@@ -506,20 +506,45 @@ fn access_control() {
     let err = sb.git_fails(&r, &["push", "origin", "main"]);
     assert!(err.contains("no SSH private key to sign with"), "{err}");
 
-    // Carol gets added by Alice; now she can clone.
+    // Carol gets added by Alice, explicitly; now she can clone. A plain
+    // push with the longer configured list does not add her.
+    let enc = |dir: &Path, args: &[&str]| {
+        let out = sb.cmd(dir, "git-remote-enc").args(args).output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{text}");
+        text
+    };
     sb.git_ok(
         &a,
-        &[
-            "config",
-            "--add",
-            "remote.enc.enc-participants",
-            &_carol_pub,
-        ],
+        &["config", "--add", "remote.enc.enc-participants", &carol_pub],
     );
     sb.commit_text(&a, "more", "m\n");
-    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let out = sb.git(&a, &["push", "enc", "main"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("a push does not change them"), "{err}");
+    let shown = enc(&a, &["participants", "enc"]);
+    assert!(shown.contains(&format!("+ {carol_pub}")), "{shown}");
+    enc(&a, &["participants", "--apply", "enc"]);
     let c = sb.clone("carol", &url, &carol);
     assert_eq!(fs::read_to_string(c.join("more")).unwrap(), "m\n");
+
+    // Carol's own config names only Alice (a stale list): her pushes keep
+    // Bob and the reader in, and the next push by Alice still reaches Bob.
+    sb.git_ok(
+        &c,
+        &["config", "remote.origin.enc-participants", &alice_pub],
+    );
+    sb.commit_text(&c, "typo", "t\n");
+    sb.git_ok(&c, &["push", "-q", "origin", "main"]);
+    let m = enc(&a, &["manifest", "enc"]);
+    for p in [&alice_pub, &bob_pub, &reader_pub, &carol_pub] {
+        assert!(m.contains(&format!("participant {p}\n")), "{p} lost: {m}");
+    }
 
     // A signer not in the participant list cannot push even if they can
     // read: Alice removes herself... then is rejected on the next push.
@@ -527,11 +552,13 @@ fn access_control() {
         &a,
         &["config", "--unset-all", "remote.enc.enc-participants"],
     );
-    for p in [&bob_pub, &_carol_pub] {
+    for p in [&bob_pub, &carol_pub] {
         sb.git_ok(&a, &["config", "--add", "remote.enc.enc-participants", p]);
     }
-    sb.commit_text(&a, "bye", "b\n");
-    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.git_ok(&a, &["pull", "-q", "enc", "main"]);
+    let shown = enc(&a, &["participants", "--apply", "enc"]);
+    assert!(shown.contains(&format!("- {alice_pub}")), "{shown}");
+    assert!(shown.contains(&format!("- {reader_pub}")), "{shown}");
     sb.commit_text(&a, "again", "a\n");
     let err = sb.git_fails(&a, &["push", "enc", "main"]);
     assert!(err.contains("not a participant"), "{err}");

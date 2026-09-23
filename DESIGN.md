@@ -212,7 +212,8 @@ for-push`.
 4. **Encrypt + hash** the pack stream into a temporary file under
    `<common>/enc/`, then `git hash-object -w` it.
 5. **New manifest:** refs updated, pack line appended, `generation + 1`,
-   participants from config if set else unchanged, `head` set if absent.
+   participants unchanged (from config only when creating the remote, or for
+   `git-remote-enc participants --apply`, section 6.3), `head` set if absent.
    Sign with the local signing key, encrypt to the participants.
 6. **Commit:** tree = previous tree + pack blob + new `manifest`; `commit-tree
    -p <old tip>`.
@@ -322,6 +323,13 @@ guarantees "previous" is the real tip.
 
 ### 6.3 Adding and removing participants
 
+The participant list changes only on request: `git-remote-enc participants
+<remote>` shows the remote's list and how the configured one
+(`enc-participants`) differs, and `--apply` pushes a manifest carrying the
+configured list and no ref change. An ordinary push keeps the remote's list,
+so a clone with a stale or partial configuration cannot drop someone as a side
+effect of an unrelated push.
+
 Adding a reader is cheap: re-encrypt the manifest to the new set (the pack keys
 are inside it, so all history becomes readable). Removing a participant
 re-encrypts the manifest without them; every *future* pack key is then unknown
@@ -375,7 +383,7 @@ run with encrypted swap and core dumps disabled where that matters.
 |---|---|
 | `remote.<name>.enc-identity`, `enc.identity` (multi) | identity files. Default: `user.signingkey` when `gpg.format = ssh` and it is a path, else `~/.ssh/id_ed25519` |
 | `remote.<name>.enc-signingkey`, `enc.signingkey` | SSH private key used to sign. Default: the first SSH identity |
-| `remote.<name>.enc-participants`, `enc.participants` (multi) | public keys, one per value, or `@<file>` (authorized_keys-style). Required to create a remote; on first contact with an existing remote, the signer must be one of them; when set on an existing remote, the next push replaces the participant list |
+| `remote.<name>.enc-participants`, `enc.participants` (multi) | public keys, one per value, or `@<file>` (authorized_keys-style). Required to create a remote; on first contact with an existing remote, the signer must be one of them; on an existing remote a push never applies it (it warns when it differs); `git-remote-enc participants --apply` does (section 6.3) |
 | `remote.<name>.enc-trustOnFirstUse`, `enc.trustOnFirstUse` | boolean, default false. Accept the signer of an unknown remote without a pinned participant list (section 6.1) |
 
 URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to
