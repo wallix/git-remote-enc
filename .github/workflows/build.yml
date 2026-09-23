@@ -45,13 +45,13 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Build and package (linux-${{ matrix.arch }})
         run: ./build.sh --docker --target=${{ matrix.arch }} --package ${{ inputs.verify-reproducible && '--verify' || '' }}
 
       - name: Upload archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact-prefix }}-archive-linux-${{ matrix.arch }}-${{ github.sha }}
           path: |
@@ -66,7 +66,7 @@ jobs:
         run: cp dist/git-remote-enc.sha256 dist/git-remote-enc-linux-${{ matrix.arch }}.build-info.txt
 
       - name: Upload build manifest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact-prefix }}-manifest-linux-${{ matrix.arch }}-${{ github.sha }}
           path: dist/git-remote-enc-linux-${{ matrix.arch }}.build-info.txt
@@ -90,7 +90,7 @@ jobs:
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install pinned toolchain and target
         run: rustup target add ${{ matrix.target }}
@@ -107,7 +107,7 @@ jobs:
           cargo build --release -p git-remote-enc --target ${{ matrix.target }} --locked
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact-prefix }}-binary-${{ matrix.platform }}-${{ github.sha }}
           path: target/${{ matrix.target }}/release/git-remote-enc
@@ -122,11 +122,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Keep artifacts separate because their binary names overlap.
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: ${{ inputs.artifact-prefix }}-binary-*-${{ github.sha }}
           path: ${{ runner.temp }}/binaries
@@ -140,7 +140,7 @@ jobs:
           done
 
       - name: Upload archives
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ inputs.artifact-prefix }}-archive-native-${{ github.sha }}
           path: |
