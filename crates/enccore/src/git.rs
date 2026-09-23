@@ -196,11 +196,10 @@ fn ascii_line(out: &[u8]) -> Result<String> {
 
 // ---- higher-level helpers -------------------------------------------------
 
-pub fn git_dir() -> Result<PathBuf> {
-    if let Some(d) = std::env::var_os("GIT_DIR") {
-        return Ok(PathBuf::from(d));
-    }
-    Ok(run_line(["rev-parse", "--absolute-git-dir"])?.into())
+/// The repository's common directory: the main `.git` even from a linked
+/// worktree, whose own `$GIT_DIR` is `.git/worktrees/<name>`.
+pub fn common_dir() -> Result<PathBuf> {
+    Ok(run_line(["rev-parse", "--path-format=absolute", "--git-common-dir"])?.into())
 }
 
 pub fn config(key: &str) -> Result<Option<String>> {

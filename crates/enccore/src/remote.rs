@@ -86,7 +86,9 @@ impl Remote {
         } else {
             format!("refs/heads/{branch}")
         };
-        let state = State::open(&git::git_dir()?, url, &branch)?;
+        // Per repository, not per worktree: trust accepted in one worktree
+        // must hold in all of them.
+        let state = State::open(&git::common_dir()?, url, &branch)?;
         let backend = Backend {
             url: url.to_owned(),
             branch,

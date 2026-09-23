@@ -1,4 +1,5 @@
-//! Per-remote local state under `$GIT_DIR/enc/<key>/`. DESIGN.md §5.4, §6.
+//! Per-remote local state under `<common dir>/enc/<key>/`, shared by every
+//! worktree. DESIGN.md §5.4, §6.
 
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
@@ -24,10 +25,10 @@ pub struct Trust {
 }
 
 impl State {
-    pub fn open(git_dir: &Path, url: &str, branch: &str) -> Result<Self> {
+    pub fn open(common_dir: &Path, url: &str, branch: &str) -> Result<Self> {
         let key = sha256_hex(format!("{url}\0{branch}").as_bytes());
         let key = key.get(..16).unwrap_or(&key).to_owned();
-        let dir = git_dir.join("enc").join(&key);
+        let dir = common_dir.join("enc").join(&key);
         fs::create_dir_all(dir.join("tmp"))
             .with_context(|| format!("creating {}", dir.display()))?;
         // Leftovers from an interrupted run.
