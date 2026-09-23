@@ -244,9 +244,17 @@ impl Remote {
         }
     }
 
-    pub fn manifest_text(&mut self) -> Result<Option<String>> {
+    /// The decrypted manifest for display. Pack keys decrypt the whole
+    /// history, so they are shown only when `with_keys` is set.
+    pub fn manifest_text(&mut self, with_keys: bool) -> Result<Option<String>> {
         self.connect()?;
-        Ok(self.manifest.as_ref().map(Manifest::serialize))
+        Ok(self.manifest.as_ref().map(|m| {
+            if with_keys {
+                m.serialize()
+            } else {
+                m.serialize_redacted()
+            }
+        }))
     }
 
     // ---- fetch ------------------------------------------------------------

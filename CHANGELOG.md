@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Security: `git-remote-enc manifest` no longer prints the pack keys, which
+  decrypt the whole history; `--show-keys` prints them.
 - Security: an `enc::` URL starting with `-` could make git run an arbitrary
   command (`enc::--upload-pack=…`). Such URLs are now refused, and the backend
   URL can no longer be read as a git option.
