@@ -6,6 +6,8 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description.workspace = true
+# Distributed as release binaries and `cargo install --path`, not on crates.io.
+publish = false
 
 # The encrypted-remote library: manifest format, crypto (age + SSH
 # signatures), the git-hosted backend, local trust state and the push/fetch

@@ -47,6 +47,11 @@ tasks:
     cmds:
       - cargo audit --deny warnings
 
+  deny:
+    desc: Check the dependency licence, source and duplicate policy (deny.toml)
+    cmds:
+      - cargo deny --locked check licenses bans sources
+
   release:build:
     desc: Build the reproducible static-musl release binary (dist/git-remote-enc) via build.sh
     cmds:
