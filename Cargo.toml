@@ -38,15 +38,16 @@ anyhow = "1"
 # The age file format (X25519 recipients, ChaCha20-Poly1305 STREAM payload)
 # for every ciphertext the helper stores: the manifest, encrypted to the
 # participants, and each pack, encrypted to a fresh per-pack key. The `ssh`
-# feature accepts ssh-ed25519 / ssh-rsa public keys as recipients and OpenSSH
-# private keys as identities, so a participant is identified by the SSH key
+# feature accepts ssh-ed25519 public keys as recipients and OpenSSH private
+# keys as identities (it also pulls in `rsa`; ssh-rsa keys are refused before
+# they reach it), so a participant is identified by the SSH key
 # they already use with the hosting service. Reimplementing the format is
 # correctness-critical; the crate is the reference implementation.
 age = { version = "0.12", default-features = false, features = ["ssh"] }
 # OpenSSH key parsing (including passphrase-encrypted private keys) and SSH
 # signatures (`ssh-keygen -Y sign` format) for manifest authentication, so the
 # same SSH key both decrypts and signs. Pure Rust, musl-static friendly.
-ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "rsa", "ecdsa", "encryption", "std"] }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "ecdsa", "encryption", "std"] }
 # SHA-256 names the encrypted packs in the manifest and keys the per-remote
 # local state directory. No stdlib hash.
 sha2 = "0.11"

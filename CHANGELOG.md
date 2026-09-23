@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Breaking: `ssh-rsa` keys are no longer accepted as participants or
+  identities (the RSA implementation has an unfixed timing side channel,
+  RUSTSEC-2023-0071). A remote whose participant list names an `ssh-rsa` key
+  must have it replaced by an `ssh-ed25519` or `age1…` key.
 - The undocumented `GIT_ENC_PASSPHRASE` environment variable is no longer
   read: a passphrase-protected key is unlocked only from the terminal.
 - Security: `git-remote-enc manifest` no longer prints the pack keys, which

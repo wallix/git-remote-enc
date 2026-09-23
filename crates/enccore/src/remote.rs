@@ -492,7 +492,7 @@ impl Remote {
             .find_map(Identity::ssh_key)
             .cloned()
             .ok_or_else(|| {
-                anyhow!("no SSH private key to sign with; pushing needs an ssh-ed25519 or ssh-rsa identity")
+                anyhow!("no SSH private key to sign with; pushing needs an ssh-ed25519 identity")
             })
     }
 
