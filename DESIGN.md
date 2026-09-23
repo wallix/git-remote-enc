@@ -126,6 +126,7 @@ first line is the format tag. Version 2:
 ```
 enc-manifest 2
 generation 42
+time 1790000000
 repo 3f9c6e4d0b1a2c7e8d9f0a1b2c3d4e5f
 head refs/heads/main
 participant ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop
@@ -142,6 +143,7 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 |---|---|
 | `enc-manifest <n>` | format version; a reader refuses an unknown `n`. Readers accept 1 and 2 and write 2 |
 | `generation <n>` | strictly increasing per push; anti-rollback (section 6.2) |
+| `time <unix seconds>` | when the pusher wrote it, by the pusher's clock; for the audit trail only, never for trust decisions. New in version 2 |
 | `repo <hex>` | random id chosen at creation; detects a recreated remote |
 | `head <ref>` | what `HEAD` points to on clone (first pushed branch by default) |
 | `participant <key>` | an `ssh-ed25519` public key (may read, may push) or an `age1…` recipient (read-only, cannot sign) |
@@ -357,6 +359,16 @@ revocation means a fresh remote and a re-push (`git push --mirror`).
 - Number of participants (age recipient stanzas), and for `ssh-*` recipients a
   tag that identifies the key to someone who already holds the public key.
 - Nothing about refs, object ids, commit metadata, file names, or who signed.
+
+### 6.4.1 Audit trail
+
+The backend commits are anonymous and undated by design (section 4.1), so the
+audit trail lives inside the encrypted history instead: every manifest names
+its signer through its signature and carries its `time`, and the backend
+branch keeps every past manifest. `git-remote-enc log <remote>` walks the
+branch and prints, per generation, the signer, the time, and the ref,
+participant and admin changes. Manifests from before one's own key was added
+are not readable and are listed as such. `time` is self-asserted by the pusher.
 
 ### 6.5 Key material on the client
 

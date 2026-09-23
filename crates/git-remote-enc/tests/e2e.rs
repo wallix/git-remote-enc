@@ -399,6 +399,19 @@ fn push_clone_fetch_roundtrip() {
     assert!(!m.contains("AGE-SECRET-KEY-"), "{m}");
     let m = manifest(&["manifest", "--show-keys", "enc"]);
     assert_eq!(m.matches(" AGE-SECRET-KEY-").count(), 3, "{m}");
+
+    // The audit trail: who signed each generation and what it changed.
+    let log = manifest(&["log", "enc"]);
+    assert!(log.starts_with("generation 6 ("), "{log}");
+    assert!(log.contains("  ref - refs/heads/tmp\n"), "{log}");
+    assert!(log.contains("  ref + refs/tags/v1\n"), "{log}");
+    assert!(log.contains(&format!("  signed by {bob_pub}\n")), "{log}");
+    assert!(
+        log.contains(&format!("  participant + {bob_pub}\n")),
+        "{log}"
+    );
+    assert!(log.contains(&format!("  admin + {alice_pub}\n")), "{log}");
+    assert_eq!(log.matches("\ngeneration ").count() + 1, 6, "{log}");
 }
 
 #[test]

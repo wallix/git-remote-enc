@@ -431,6 +431,16 @@ pub fn verify(participants: &[Participant], data: &[u8], sig_pem: &str) -> Resul
     Ok(None)
 }
 
+/// The fingerprint of the key that made `sig_pem` over `data`, if the
+/// signature verifies; whether that key was allowed to sign is not checked.
+pub fn signature_key(data: &[u8], sig_pem: &str) -> Result<String> {
+    let sig = SshSig::from_pem(sig_pem).context("parsing manifest signature")?;
+    let key = PublicKey::new(sig.public_key().clone(), "");
+    key.verify(SIG_NAMESPACE, data, &sig)
+        .context("manifest signature does not verify")?;
+    Ok(key.fingerprint(HashAlg::Sha256).to_string())
+}
+
 // ---- hashing adapters -----------------------------------------------------
 
 pub fn hex(bytes: &[u8]) -> String {
