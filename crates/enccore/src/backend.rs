@@ -35,6 +35,7 @@ impl Backend {
             "--no-tags",
             "--no-write-fetch-head",
             "--no-recurse-submodules",
+            "--",
             &self.url,
             &refspec,
         ])?;
@@ -96,6 +97,7 @@ impl Backend {
             "--no-verify",
             "--no-recurse-submodules",
             &lease,
+            "--",
             &self.url,
             &refspec,
         ])?;

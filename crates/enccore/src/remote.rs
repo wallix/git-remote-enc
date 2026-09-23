@@ -75,6 +75,11 @@ impl Remote {
             Some((u, f)) if !f.is_empty() => (u, Some(f)),
             _ => (url, None),
         };
+        // git would parse a leading dash as an option (`--upload-pack=…`)
+        // wherever the URL is not behind `--`.
+        if url.is_empty() || url.starts_with('-') {
+            bail!("refusing the backend URL `{url}`: it is empty or starts with `-`");
+        }
         let branch = fragment.unwrap_or(DEFAULT_BRANCH);
         let branch = if branch.starts_with("refs/") {
             branch.to_owned()
