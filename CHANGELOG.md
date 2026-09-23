@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Breaking: first contact with an existing remote (a clone, or a new URL) is
+  refused unless `enc.participants` names its signer, or
+  `enc.trustOnFirstUse` is set to accept it unverified. The same remote reached
+  through another spelling of its URL keeps the trust already accepted.
 - A fetch warns when the remote serves a different manifest for the generation
   it already accepted, i.e. the remote's history forked.
 - Linked worktrees share the repository's trust state for a remote instead of

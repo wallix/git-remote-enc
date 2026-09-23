@@ -276,10 +276,18 @@ and is accepted (section 7 lists a mitigation).
 A manifest is accepted iff it is signed by a participant of the **previously
 accepted** manifest. On first contact there is no previous manifest:
 
-- if the local config names participants (`enc-participants`), the signer must
-  be one of them;
-- otherwise the signer is trusted on first use, and its fingerprint is printed
-  to stderr.
+- if another remote of the same local repository has already accepted a
+  manifest with this `repo` id (the same remote reached through a different
+  URL spelling), that state applies, signer check and rollback check included;
+- else if the local config names participants (`enc-participants`), the signer
+  must be one of them;
+- else the manifest is refused, and the error names the signer's fingerprint
+  to confirm out of band. `enc.trustOnFirstUse = true` accepts it unverified
+  (trust on first use) instead.
+
+Without a pinned list, whoever controls the host on first contact chooses what
+the new clone trusts: they cannot read an existing remote, but they can serve
+a fabricated one, and anything pushed to it lands in a history they control.
 
 After acceptance the participant list is stored locally, so:
 
@@ -355,7 +363,8 @@ file, not the agent. Hardware-backed keys are not supported in v1.
 |---|---|
 | `remote.<name>.enc-identity`, `enc.identity` (multi) | identity files. Default: `user.signingkey` when `gpg.format = ssh` and it is a path, else `~/.ssh/id_ed25519` |
 | `remote.<name>.enc-signingkey`, `enc.signingkey` | SSH private key used to sign. Default: the first SSH identity |
-| `remote.<name>.enc-participants`, `enc.participants` (multi) | public keys, one per value, or `@<file>` (authorized_keys-style). Required to create a remote; when set on an existing remote, the next push replaces the participant list |
+| `remote.<name>.enc-participants`, `enc.participants` (multi) | public keys, one per value, or `@<file>` (authorized_keys-style). Required to create a remote; on first contact with an existing remote, the signer must be one of them; when set on an existing remote, the next push replaces the participant list |
+| `remote.<name>.enc-trustOnFirstUse`, `enc.trustOnFirstUse` | boolean, default false. Accept the signer of an unknown remote without a pinned participant list (section 6.1) |
 
 URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to
 git verbatim, so ssh aliases, `https://token@…`, insteadOf rewrites and

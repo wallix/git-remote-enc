@@ -161,6 +161,8 @@ impl Sandbox {
         }
     }
 
+    /// Clone accepting the manifest's signer on first contact; see
+    /// `first_contact_needs_a_known_signer` for the pinned alternatives.
     fn clone(&self, name: &str, url: &str, identity: &Path) -> PathBuf {
         let d = self.root.join(name);
         let id = identity.to_str().unwrap();
@@ -169,6 +171,8 @@ impl Sandbox {
             &[
                 "-c",
                 &format!("enc.identity={id}"),
+                "-c",
+                "enc.trustOnFirstUse=true",
                 "clone",
                 "-q",
                 url,
@@ -531,6 +535,67 @@ fn access_control() {
     sb.commit_text(&a, "again", "a\n");
     let err = sb.git_fails(&a, &["push", "enc", "main"]);
     assert!(err.contains("not a participant"), "{err}");
+}
+
+#[test]
+fn first_contact_needs_a_known_signer() {
+    let sb = Sandbox::new("firstcontact");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let (_, mallory_pub) = sb.keypair("mallory");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    let id = format!("enc.identity={}", alice.display());
+    let clone = |name: &str, extra: &str| {
+        sb.git(
+            &sb.root,
+            &["-c", &id, "-c", extra, "clone", "-q", &url, name],
+        )
+    };
+    // No list and no opt-in: refused, naming the fingerprint to check.
+    let out = clone("unpinned", "enc.unrelated=1");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("no participant list") && err.contains("SHA256:"),
+        "{err}"
+    );
+    // A pinned list that does not name the signer: refused.
+    let out = clone("wrongpin", &format!("enc.participants={mallory_pub}"));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("not signed by a trusted participant"), "{err}");
+    // A pinned list naming the signer: accepted.
+    let out = clone("pinned", &format!("enc.participants={alice_pub}"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Another spelling of the same URL keeps the accepted state instead of
+    // starting over: the rollback check still applies to it.
+    let gen1 = sb.git_ok(&host, &["rev-parse", "refs/heads/enc"]);
+    sb.commit_text(&a, "two", "2\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", gen1.trim()]);
+    let respelled = format!("enc::file://{}", host.display());
+    sb.git_ok(&a, &["remote", "add", "again", &respelled]);
+    sb.git_ok(
+        &a,
+        &[
+            "config",
+            "remote.again.enc-identity",
+            alice.to_str().unwrap(),
+        ],
+    );
+    let err = sb.git_fails(&a, &["fetch", "again"]);
+    assert!(err.contains("already known locally"), "{err}");
+    assert!(err.contains("rollback detected"), "{err}");
 }
 
 #[test]

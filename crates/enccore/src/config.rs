@@ -12,6 +12,9 @@ pub struct Config {
     pub signing_key: Option<PathBuf>,
     /// `None` when unset; `Some` replaces the manifest's list on push.
     pub participants: Option<Vec<String>>,
+    /// Accept whoever signed the manifest on first contact when no
+    /// participant list is configured. Off unless set.
+    pub trust_on_first_use: bool,
 }
 
 impl Config {
@@ -33,6 +36,11 @@ impl Config {
             identity_paths = default_identities()?;
         }
         let signing_key = one("signingkey")?.map(|s| expand_home(&s));
+        let trust_on_first_use = match one("trustOnFirstUse")? {
+            Some(v) => parse_bool(&v)
+                .with_context(|| format!("enc trustOnFirstUse: `{v}` is not a boolean"))?,
+            None => false,
+        };
 
         let raw = all("participants")?;
         let participants = if raw.is_empty() {
@@ -61,6 +69,7 @@ impl Config {
             identity_paths,
             signing_key,
             participants,
+            trust_on_first_use,
         })
     }
 }
@@ -81,6 +90,15 @@ fn default_identities() -> Result<Vec<PathBuf>> {
         return Ok(vec![p]);
     }
     Ok(vec![])
+}
+
+/// git's boolean spellings.
+fn parse_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" | "" => Some(false),
+        _ => None,
+    }
 }
 
 fn expand_home(s: &str) -> PathBuf {

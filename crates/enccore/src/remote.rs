@@ -178,8 +178,8 @@ impl Remote {
         // or on first contact the configured one. Either way the signature is
         // checked before the manifest text is parsed. Only trust on first use
         // takes the signer list from the unauthenticated manifest itself.
-        let trust = self.state.trust()?;
-        let (allowed_texts, parsed) = match (&trust, &self.cfg.participants) {
+        let own = self.state.trust()?;
+        let (allowed_texts, parsed) = match (&own, &self.cfg.participants) {
             (Some(t), _) => (t.participants.clone(), None),
             (None, Some(p)) => (p.clone(), None),
             (None, None) => {
@@ -187,15 +187,31 @@ impl Remote {
                 (m.participants.clone(), Some(m))
             }
         };
-        let allowed = Participant::parse_all(&allowed_texts)?;
-        let signer = crypto::verify(&allowed, text.as_bytes(), sig)?
-            .and_then(|i| allowed.get(i))
-            .ok_or_else(|| {
-                anyhow!("manifest is not signed by a trusted participant; refusing it")
-            })?;
+        let signer = verified_signer(&allowed_texts, text, sig)?;
         let m = match parsed {
             Some(m) => m,
             None => Manifest::parse(text).context("parsing manifest")?,
+        };
+
+        // Nothing accepted under this URL: the same repository may be known
+        // under another spelling of it (scp-style vs ssh://, an insteadOf).
+        // Its trust state then applies, signer and anti-rollback included.
+        let trust = match own {
+            Some(t) => Some(t),
+            None => match self.state.trust_for_repo(&m.repo_id)? {
+                Some((t, dir)) => {
+                    verified_signer(&t.participants, text, sig)?;
+                    info(&format!(
+                        "{} is repository {} already known locally (state {}); continuing from generation {}",
+                        self.backend.url,
+                        m.repo_id,
+                        dir.display(),
+                        t.generation
+                    ));
+                    Some(t)
+                }
+                None => None,
+            },
         };
 
         match &trust {
@@ -229,11 +245,22 @@ impl Remote {
                     ));
                 }
             }
-            None => info(&format!(
-                "first contact with {}: trusting manifest signed by {}",
-                self.backend.url,
-                signer.fingerprint()
+            None if self.cfg.participants.is_some() => info(&format!(
+                "first contact with {}: manifest signed by configured participant {signer}",
+                self.backend.url
             )),
+            None if self.cfg.trust_on_first_use => info(&format!(
+                "first contact with {}: trusting manifest signed by {signer} (enc.trustOnFirstUse)",
+                self.backend.url
+            )),
+            None => bail!(
+                "first contact with {}: no participant list to check its signer against. The manifest is \
+                 signed by {signer}; confirm that fingerprint with the remote's owner, then either pin the \
+                 participants (git config --add remote.<name>.enc-participants \"<public key>\", or \
+                 git -c enc.participants=\"<public key>\" clone …) or accept it unverified with \
+                 enc.trustOnFirstUse=true",
+                self.backend.url
+            ),
         }
         // Validate the new list now so a later push gets a clear error.
         Participant::parse_all(&m.participants).context("manifest participant list")?;
@@ -567,6 +594,15 @@ impl Remote {
             key: key.to_string().expose_secret().to_owned(),
         }))
     }
+}
+
+/// The fingerprint of the participant in `allowed` whose key signed `text`.
+fn verified_signer(allowed: &[String], text: &str, sig: &str) -> Result<String> {
+    let allowed = Participant::parse_all(allowed)?;
+    crypto::verify(&allowed, text.as_bytes(), sig)?
+        .and_then(|i| allowed.get(i))
+        .map(Participant::fingerprint)
+        .ok_or_else(|| anyhow!("manifest is not signed by a trusted participant; refusing it"))
 }
 
 /// The trust state recording `m`, whose signed text is `text`, as accepted.

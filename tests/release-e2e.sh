@@ -133,10 +133,17 @@ roundtrip() {
     git config --add remote.enc.enc-participants "$(cat "$WORK/bob.pub")"
     git push -q enc main
   )
-  git -c "enc.identity=$WORK/bob" clone -q "$URL" "$WORK/bob-repo"
+  # First contact pins the signer, as a user would with a key obtained out of band.
+  git -c "enc.identity=$WORK/bob" -c "enc.participants=$(cat "$WORK/alice.pub")" \
+    clone -q "$URL" "$WORK/bob-repo"
   [ "$(cat "$WORK/bob-repo/README")" = hello ]
 }
 check "push and clone round trip" roundtrip
+
+unpinned_first_contact_refused() {
+  ! git -c "enc.identity=$WORK/bob" clone -q "$URL" "$WORK/bob-unpinned" 2>/dev/null
+}
+check "unpinned first contact refused" unpinned_first_contact_refused
 
 host_sees_only_ciphertext() {
   [ "$(git -C "$WORK/host.git" for-each-ref --format='%(refname)')" = refs/heads/enc ] &&
@@ -146,7 +153,8 @@ check "host sees only ciphertext" host_sees_only_ciphertext
 
 outsider_cannot_read() {
   ssh-keygen -q -t ed25519 -N '' -f "$WORK/carol" >/dev/null
-  ! git -c "enc.identity=$WORK/carol" clone -q "$URL" "$WORK/carol-repo" 2>/dev/null
+  ! git -c "enc.identity=$WORK/carol" -c "enc.participants=$(cat "$WORK/alice.pub")" \
+    clone -q "$URL" "$WORK/carol-repo" 2>/dev/null
 }
 check "non-participant cannot clone" outsider_cannot_read
 
