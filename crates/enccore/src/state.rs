@@ -15,6 +15,8 @@ use crate::crypto::sha256_hex;
 const STALE_TEMP: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub struct State {
+    /// `<common>/enc`, holding one directory per remote.
+    root: PathBuf,
     dir: PathBuf,
     /// Local ref tracking the backend branch; keeps transfers incremental.
     pub tracking_ref: String,
@@ -35,7 +37,8 @@ impl State {
     pub fn open(common_dir: &Path, url: &str, branch: &str) -> Result<Self> {
         let key = sha256_hex(format!("{url}\0{branch}").as_bytes());
         let key = key.get(..16).unwrap_or(&key).to_owned();
-        let dir = common_dir.join("enc").join(&key);
+        let root = common_dir.join("enc");
+        let dir = root.join(&key);
         fs::create_dir_all(dir.join("tmp"))
             .with_context(|| format!("creating {}", dir.display()))?;
         // Leftovers from an interrupted run. A helper running concurrently on
@@ -55,6 +58,7 @@ impl State {
             }
         }
         Ok(Self {
+            root,
             dir,
             tracking_ref: format!("refs/enc/{key}"),
         })
@@ -89,24 +93,31 @@ impl State {
     }
 
     pub fn trust(&self) -> Result<Option<Trust>> {
-        let text = match fs::read_to_string(self.dir.join("trust")) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).context("reading trust file"),
-        };
-        let mut t = Trust::default();
-        for line in text.lines() {
-            let (item, rest) = line.split_once(' ').unwrap_or((line, ""));
-            match item {
-                "generation" => t.generation = rest.trim().parse().context("trust: generation")?,
-                "repo" => t.repo_id = rest.trim().to_owned(),
-                "digest" => t.digest = Some(rest.trim().to_owned()),
-                "participant" => t.participants.push(rest.trim().to_owned()),
-                "" => {}
-                other => bail!("trust file: unknown item `{other}`"),
+        read_trust(&self.dir.join("trust"))
+    }
+
+    /// The most advanced trust state any other remote of this repository
+    /// holds for repository id `repo_id`, with that remote's directory: the
+    /// same encrypted remote reached through another URL spelling.
+    pub fn trust_for_repo(&self, repo_id: &str) -> Result<Option<(Trust, PathBuf)>> {
+        let mut best: Option<(Trust, PathBuf)> = None;
+        for e in fs::read_dir(&self.root).context("listing local enc state")? {
+            let dir = e?.path();
+            if dir == self.dir {
+                continue;
+            }
+            let Some(t) = read_trust(&dir.join("trust"))? else {
+                continue;
+            };
+            if t.repo_id == repo_id
+                && best
+                    .as_ref()
+                    .is_none_or(|(b, _)| t.generation > b.generation)
+            {
+                best = Some((t, dir));
             }
         }
-        Ok(Some(t))
+        Ok(best)
     }
 
     pub fn save_trust(&self, t: &Trust) -> Result<()> {
@@ -122,6 +133,27 @@ impl State {
         fs::rename(&tmp, self.dir.join("trust")).context("replacing trust file")?;
         Ok(())
     }
+}
+
+fn read_trust(path: &Path) -> Result<Option<Trust>> {
+    let text = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut t = Trust::default();
+    for line in text.lines() {
+        let (item, rest) = line.split_once(' ').unwrap_or((line, ""));
+        match item {
+            "generation" => t.generation = rest.trim().parse().context("trust: generation")?,
+            "repo" => t.repo_id = rest.trim().to_owned(),
+            "digest" => t.digest = Some(rest.trim().to_owned()),
+            "participant" => t.participants.push(rest.trim().to_owned()),
+            "" => {}
+            other => bail!("{}: unknown item `{other}`", path.display()),
+        }
+    }
+    Ok(Some(t))
 }
 
 #[cfg(test)]

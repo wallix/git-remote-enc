@@ -55,9 +55,21 @@ The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 |---|---|
 | `remote.<name>.enc-identity` / `enc.identity` (repeatable) | private key files: OpenSSH (`~/.ssh/id_ed25519`) or age identity files. Default: `user.signingkey` if `gpg.format = ssh`, else `~/.ssh/id_ed25519` |
 | `remote.<name>.enc-signingkey` / `enc.signingkey` | SSH private key used to sign pushes. Default: the first SSH identity |
-| `remote.<name>.enc-participants` / `enc.participants` (repeatable) | one public key per value, or `@<file>` in `authorized_keys` format. Required to create a remote; if set on an existing remote, the next push replaces the list |
+| `remote.<name>.enc-participants` / `enc.participants` (repeatable) | one public key per value, or `@<file>` in `authorized_keys` format. Required to create a remote; on first contact with an existing one, its signer must be listed; if set on an existing remote, the next push replaces the list |
+| `remote.<name>.enc-trustOnFirstUse` / `enc.trustOnFirstUse` | `true` accepts whoever signed an unknown remote when no participant list is set. Default `false` |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
+
+Cloning an existing remote needs the public key of someone who pushes to it,
+obtained from them out of band, so a host cannot substitute a remote of its
+own:
+
+```bash
+git -c enc.participants="ssh-ed25519 AAAA… alice" clone enc::git@gitlab.example.com:team/vault.git
+```
+
+Without it the clone is refused and the error prints the signer's fingerprint
+to confirm; `-c enc.trustOnFirstUse=true` accepts it unverified.
 
 Inspect the decrypted manifest of a remote from inside a repository:
 
