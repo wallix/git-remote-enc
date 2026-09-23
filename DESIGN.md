@@ -261,7 +261,7 @@ every linked worktree, so trust accepted in one worktree holds in all):
   run.
 - `<common>/enc/<key>/have` — pack names already indexed.
 - `<common>/enc/<key>/trust` — the last accepted manifest's `generation`,
-  `repo` id and participant list (section 6).
+  `repo` id, participant list and the SHA-256 of its text (section 6).
 - `<common>/enc/<key>/tmp/` — temporary files for the pack pipeline.
 
 The encrypted blobs live in the local object store (reachable from the
@@ -300,7 +300,10 @@ compatible extension.
 
 `generation` is strictly increasing. A reader refuses a manifest whose
 generation is lower than the last one it accepted, and warns when it is equal
-but the content differs. A pusher always writes `previous + 1`; the lease
+but the content differs (compared by the SHA-256 of the manifest text kept in
+the local state): two validly signed manifests with one generation mean the
+history forked, because the host served different views or rewound the branch
+under a pusher. A pusher always writes `previous + 1`; the lease
 guarantees "previous" is the real tip.
 
 ### 6.3 Adding and removing participants

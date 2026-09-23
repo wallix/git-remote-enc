@@ -214,6 +214,20 @@ impl Remote {
                         t.generation
                     );
                 }
+                // Two different manifests with one generation: the history
+                // forked (the host served another view, or rewound the branch
+                // under a pusher). Both are signed, so accept but say so.
+                if m.generation == t.generation
+                    && t.digest
+                        .as_ref()
+                        .is_some_and(|d| *d != crypto::sha256_hex(text.as_bytes()))
+                {
+                    info(&format!(
+                        "warning: {} now serves a different manifest for generation {} than the one \
+                         accepted earlier; the remote's history forked, check with the other participants",
+                        self.backend.url, m.generation
+                    ));
+                }
             }
             None => info(&format!(
                 "first contact with {}: trusting manifest signed by {}",
@@ -223,11 +237,7 @@ impl Remote {
         }
         // Validate the new list now so a later push gets a clear error.
         Participant::parse_all(&m.participants).context("manifest participant list")?;
-        self.state.save_trust(&Trust {
-            generation: m.generation,
-            repo_id: m.repo_id.clone(),
-            participants: m.participants.clone(),
-        })?;
+        self.state.save_trust(&trust_in(&m, text))?;
         Ok(m)
     }
 
@@ -469,11 +479,7 @@ impl Remote {
                 if let Some(p) = &pack {
                     self.state.add_have(&p.id)?;
                 }
-                self.state.save_trust(&Trust {
-                    generation: m.generation,
-                    repo_id: m.repo_id.clone(),
-                    participants: m.participants.clone(),
-                })?;
+                self.state.save_trust(&trust_in(&m, &text))?;
                 self.tip = Some(commit.clone());
                 self.tree = Backend::tree_entries(&commit)?;
                 self.manifest = Some(m);
@@ -560,6 +566,16 @@ impl Remote {
             id,
             key: key.to_string().expose_secret().to_owned(),
         }))
+    }
+}
+
+/// The trust state recording `m`, whose signed text is `text`, as accepted.
+fn trust_in(m: &Manifest, text: &str) -> Trust {
+    Trust {
+        generation: m.generation,
+        repo_id: m.repo_id.clone(),
+        participants: m.participants.clone(),
+        digest: Some(crypto::sha256_hex(text.as_bytes())),
     }
 }
 

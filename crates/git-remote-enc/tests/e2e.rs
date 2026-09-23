@@ -534,6 +534,35 @@ fn access_control() {
 }
 
 #[test]
+fn forked_generation_is_reported() {
+    let sb = Sandbox::new("fork");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let gen1 = sb.git_ok(&host, &["rev-parse", "refs/heads/enc"]);
+    // A second clone of Alice's, still at generation 1.
+    let a2 = sb.clone("alice2", &url, &alice);
+
+    sb.commit_text(&a, "two", "2\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+
+    // The host rewinds; the stale clone pushes its own generation 2.
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", gen1.trim()]);
+    sb.commit_text(&a2, "other", "2'\n");
+    sb.git_ok(&a2, &["push", "-q", "origin", "main"]);
+
+    let out = sb.git(&b, &["fetch", "origin"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("different manifest for generation 2"), "{err}");
+}
+
+#[test]
 fn worktrees_share_the_trust_state() {
     let sb = Sandbox::new("worktree");
     let host = sb.host();
