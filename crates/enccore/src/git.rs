@@ -274,6 +274,10 @@ pub fn rev_parse(rev: &str) -> Result<Option<Oid>> {
     }
 }
 
+pub fn object_type(oid: &str) -> Result<String> {
+    run_line(["cat-file", "-t", oid])
+}
+
 pub fn has_object(oid: &str) -> Result<bool> {
     Ok(run_status(["cat-file", "-e", oid])?.0)
 }
