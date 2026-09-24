@@ -15,6 +15,7 @@ pub mod backend;
 pub mod config;
 pub mod crypto;
 pub mod git;
+pub mod guard;
 pub mod manifest;
 pub mod remote;
 pub mod state;

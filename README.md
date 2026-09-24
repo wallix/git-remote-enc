@@ -121,6 +121,11 @@ refs, participants and admins it changed. The host can drop past
 generations by rewriting the backend branch; `log` flags the missing ones, and
 a fetch warns once when it sees the rewrite.
 
+`git-remote-enc install-hook` adds a pre-push hook to the repository that
+refuses to push commits of an encrypted remote to any other remote, so an
+embargoed fix is not published by a slip of `git push origin`. Push with
+`--no-verify` when publishing it is the intent.
+
 `git-remote-enc forget <remote>` drops the local trust state of a remote, which
 the helper otherwise refuses to discard when the remote was recreated,
 deleted, or its local state was lost. Do it only after the participants confirm

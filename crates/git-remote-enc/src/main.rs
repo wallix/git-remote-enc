@@ -53,6 +53,15 @@ fn run() -> Result<()> {
             };
             participants(&mut open_by_name_or_url(target)?, target, apply)
         }
+        [cmd, remote, url] if cmd == "pre-push" => pre_push(remote, url),
+        [cmd] if cmd == "install-hook" => {
+            let path = enccore::guard::install_hook()?;
+            eprintln!(
+                "enc: installed {}: pushing commits of an encrypted remote anywhere else is refused",
+                path.display()
+            );
+            Ok(())
+        }
         [cmd, target] if cmd == "log" => log(&mut open_by_name_or_url(target)?),
         [cmd, target] if cmd == "forget" => {
             let dir = open_by_name_or_url(target)?.forget()?;
@@ -70,7 +79,7 @@ fn run() -> Result<()> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc participants [--apply] <remote|url>\n       git-remote-enc log <remote|url>\n       git-remote-enc forget <remote|url>\n       git-remote-enc --version"
+        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc participants [--apply] <remote|url>\n       git-remote-enc log <remote|url>\n       git-remote-enc forget <remote|url>\n       git-remote-enc install-hook\n       git-remote-enc pre-push <remote> <url>   (as a pre-push hook)\n       git-remote-enc --version"
     );
     std::process::exit(2);
 }
@@ -174,6 +183,27 @@ fn log(remote: &mut Remote) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The pre-push hook: refuse a push that would publish commits of an
+/// encrypted remote on another one.
+fn pre_push(remote: &str, url: &str) -> Result<()> {
+    let mut updates = String::new();
+    io::Read::read_to_string(&mut io::stdin(), &mut updates)?;
+    let leaks = enccore::guard::check_pre_push(remote, url, &updates)?;
+    if leaks.is_empty() {
+        return Ok(());
+    }
+    for l in &leaks {
+        eprintln!(
+            "enc: {} contains commit {} of {}, which {remote} does not have",
+            l.local_ref, l.commit, l.source
+        );
+    }
+    bail!(
+        "refusing to push to {remote}: it would publish commits of an encrypted remote. If that is \
+         the disclosure, push with --no-verify"
+    )
 }
 
 /// A configured remote name resolves to its URL and its config.
