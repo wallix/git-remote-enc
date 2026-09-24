@@ -1304,7 +1304,8 @@ fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
     let public = sb.dir("public.git");
     sb.git_ok(&public, &["init", "-q", "--bare"]);
     let seed = sb.repo("seed");
-    sb.commit_text(&seed, "product", "p\n");
+    let lines: Vec<String> = (1..=20).map(|i| format!("line {i}\n")).collect();
+    sb.commit_text(&seed, "product", &lines.concat());
     sb.git_ok(&seed, &["push", "-q", public.to_str().unwrap(), "main"]);
     sb.git_ok(&sb.root, &["clone", "-q", public.to_str().unwrap(), "dev"]);
     let dev = sb.root.join("dev");
@@ -1322,6 +1323,9 @@ fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
 
     sb.git_ok(&dev, &["checkout", "-q", "-b", "fix-main"]);
     sb.commit_text(&dev, "fix", "f\n");
+    let mut patched = lines.clone();
+    patched[1] = "line 2, patched\n".into();
+    sb.commit_text(&dev, "product", &patched.concat());
     sb.git_ok(&dev, &["push", "-q", "-u", "enc", "fix-main"]);
     let fix = sb.git_ok(&dev, &["rev-parse", "fix-main"]);
 
@@ -1346,6 +1350,27 @@ fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
     // A local commit on top of the fix, not pushed anywhere yet, counts too.
     sb.commit_text(&dev, "fix2", "f2\n");
     sb.git_fails(&dev, &["push", "origin", "HEAD:refs/heads/other"]);
+
+    // A backport shares no commit with the fix, only its content: a
+    // cherry-pick or a squash carries the fixed files...
+    sb.git_ok(&dev, &["checkout", "-q", "-b", "maint", "origin/main"]);
+    sb.git_ok(&dev, &["cherry-pick", "-x", "fix-main~2"]);
+    let err = sb.git_fails(&dev, &["push", "origin", "maint"]);
+    assert!(err.contains("contains object"), "{err}");
+    sb.git_ok(&dev, &["reset", "-q", "--hard", "origin/main"]);
+    sb.git_ok(&dev, &["merge", "-q", "--squash", "fix-main"]);
+    sb.git_ok(&dev, &["commit", "-qm", "squashed"]);
+    let err = sb.git_fails(&dev, &["push", "origin", "maint"]);
+    assert!(err.contains("contains object"), "{err}");
+    // ...and on a base that diverged, the same change under another blob.
+    sb.git_ok(&dev, &["reset", "-q", "--hard", "origin/main"]);
+    let mut diverged = lines.clone();
+    diverged[19] = "line 20, maint only\n".into();
+    sb.commit_text(&dev, "product", &diverged.concat());
+    sb.git_ok(&dev, &["cherry-pick", "fix-main~1"]);
+    let err = sb.git_fails(&dev, &["push", "origin", "maint"]);
+    assert!(err.contains("contains the change of"), "{err}");
+    sb.git_ok(&dev, &["reset", "-q", "--hard", "origin/main"]);
 
     // Ordinary public work passes, and so does the disclosure, deliberately.
     sb.git_ok(&dev, &["checkout", "-q", "main"]);

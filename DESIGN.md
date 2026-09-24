@@ -446,13 +446,21 @@ Encryption ends at `$GIT_DIR`: a clone that knows both an encrypted remote
 and a plain one holds the decrypted commits of the first and can push them to
 the second with one command. `git-remote-enc install-hook` writes a pre-push
 hook running `git-remote-enc pre-push <remote> <url>`, which refuses a push
-when a pushed commit shares history with an encrypted remote that the
-destination does not already have. "The encrypted remote" is every other
-remote with an `enc::` URL: its remote-tracking refs, and the local branches
-whose upstream it is (they hold fix commits not pushed yet). "Already has" is
-the destination's remote-tracking refs and the old values of the pushed refs.
-The test is on merge bases: if the destination has every merge base of the
-pushed commit and an encrypted ref, it has everything the two share.
+that carries content of an encrypted remote the destination does not already
+have. "The encrypted remote" is every other remote with an `enc::` URL: its
+remote-tracking refs, and the local branches whose upstream it is (they hold
+fix commits not pushed yet). "Already has" is the destination's
+remote-tracking refs and the old values of the pushed refs.
+
+The test is on content, not history, since backporting a fix by cherry-pick
+or squash creates commits the encrypted remote never had. A push is refused
+when the objects it would send (commits, trees, blobs; the empty blob and
+tree aside) share one with the objects only the encrypted remote has, which
+catches a fixed file carried over unchanged; or when one of its commits has
+the patch id (`git patch-id --stable`) of an encrypted-only commit, which
+catches the same change applied to a diverged file. Any git failure while
+checking refuses the push. A change rewritten by hand, or squashed together
+with other edits to the same files onto a diverged base, matches neither.
 
 git chooses the transport from the push URL, so `remote.<name>.pushurl`, or
 a `url.<base>.pushInsteadOf` (or `insteadOf`) rule, can send pushes to an
@@ -465,9 +473,9 @@ its push URL resolves to a plain one.
 Pushing to another encrypted remote is checked the same way, since its
 audience differs. The disclosure itself is a deliberate `git push
 --no-verify`; once the fix is public and fetched, the guard no longer
-matches it. The hook only covers clones where it is installed, and commits
-that reach no encrypted ref (a fix written but never pushed to or branched
-from the encrypted remote) are invisible to it.
+matches it. The hook only covers clones where it is installed, and content
+that reaches no encrypted ref (a fix written but never pushed to or branched
+from the encrypted remote) is invisible to it.
 
 ### 6.8 Threat model
 
@@ -525,7 +533,7 @@ through the helper at all (5.1).
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
 | git config reroutes pushes to an encrypted remote to a plain URL (`pushurl`, `pushInsteadOf`) | the pre-push guard refuses it; the helper refuses to fetch from such a remote (6.7) | a clone without the guard pushes in clear; an `insteadOf` that rewrites the fetch URL too never runs the helper at all |
 | Git LFS uploads tracked files in clear alongside a push | a push is refused while a pre-push hook runs Git LFS (5.1) | `enc-allowLfs` with LFS still pointed at the forge; an LFS invocation the check does not recognise (a hook manager that calls it indirectly) |
-| Plaintext leaks through the developer's workflow | `install-hook`: a pre-push hook refuses to push commits of an encrypted remote to any other remote (6.7) | clones without the hook, `--no-verify`, commits not yet tied to an encrypted ref; the decrypted objects live in the local `$GIT_DIR` (5.4): use a dedicated clone, disk encryption, and delete the clone when done |
+| Plaintext leaks through the developer's workflow | `install-hook`: a pre-push hook refuses to push content of an encrypted remote (shared objects, or a cherry-picked change by patch id) to any other remote (6.7) | clones without the hook, `--no-verify`, content not yet tied to an encrypted ref, a fix rewritten by hand or squashed with other edits onto a diverged base; the decrypted objects live in the local `$GIT_DIR` (5.4): use a dedicated clone, disk encryption, and delete the clone when done |
 | A malicious or compromised build | reproducible builds from pinned inputs, SHA-pinned actions, Sigstore-signed provenance and an SBOM per release, `cargo audit` and `cargo deny` in CI | the build image runs Nix with `sandbox = false`; dependencies include a pre-release crate (`kem`) and an unfixed but unreachable one (`rsa`, RUSTSEC-2023-0071) |
 | A parser bug on untrusted input | Rust with panics denied by lint; the signature is checked before parsing when a signer list is known; mutation tests of every parser (section 10) | no coverage-guided fuzzing; trust on first use parses unauthenticated text |
 | Traffic analysis | none (non-goal, section 1) | the host sees who pushes and fetches, when, and how much |

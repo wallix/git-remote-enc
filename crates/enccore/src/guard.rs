@@ -1,17 +1,19 @@
 //! A pre-push guard: refuse to send what came from an encrypted remote to
 //! any other remote. DESIGN.md §6.7.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use anyhow::{Context, Result, bail};
 
 use crate::git::{self, Oid};
 
-/// A pushed ref that would publish commits of an encrypted remote.
+/// A pushed ref that would publish content of an encrypted remote.
 pub struct Leak {
     pub local_ref: String,
-    /// A commit it shares with the encrypted remote that the destination
-    /// does not have.
-    pub commit: Oid,
-    /// The encrypted remote's ref it comes from.
+    /// What it shares with the encrypted remote that the destination does
+    /// not have: `commit <oid>`, `object <oid>` or `the change of <oid>`.
+    pub what: String,
+    /// The encrypted remote it comes from.
     pub source: String,
 }
 
@@ -54,7 +56,11 @@ pub fn check_pre_push(remote: &str, url: &str, updates: &str) -> Result<Vec<Leak
         }
     }
 
-    let mut sources = Vec::new();
+    // Per encrypted remote, the refs holding its content: its
+    // remote-tracking refs, and the local branches building on it, which
+    // hold commits not pushed there yet.
+    let mut sources: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let upstreams = git::config_regexp(r"^branch\..*\.remote$")?;
     for name in &remotes {
         // The destination itself, by name or by URL.
         if Some(name.as_str()) == dest
@@ -62,42 +68,122 @@ pub fn check_pre_push(remote: &str, url: &str, updates: &str) -> Result<Vec<Leak
         {
             continue;
         }
-        sources.extend(ref_names(&format!("refs/remotes/{name}/"))?);
-        // Local branches building on it hold commits not pushed there yet.
-        for (key, value) in git::config_regexp(r"^branch\..*\.remote$")? {
-            if value == *name
+        let refs = sources.entry(name).or_default();
+        refs.extend(ref_names(&format!("refs/remotes/{name}/"))?);
+        for (key, value) in &upstreams {
+            if value == name
                 && let Some(branch) = key
                     .strip_prefix("branch.")
                     .and_then(|k| k.strip_suffix(".remote"))
             {
-                sources.push(format!("refs/heads/{branch}"));
+                refs.push(format!("refs/heads/{branch}"));
             }
         }
     }
 
+    // Content, not topology: a cherry-pick or a squash of the fix shares no
+    // commit with the encrypted remote, but it shares its blobs (the fixed
+    // file), or its patch id when applied to a different base. Every git
+    // failure is an error, so the push is refused rather than let through.
+    let trivial = trivial_objects()?;
     let mut leaks = Vec::new();
-    for (local_ref, local) in &pushed {
-        'sources: for source in &sources {
-            // Everything both reach is below their merge bases; if the
-            // destination has every base, it has all of it.
-            let (ok, out, _) = git::run_status(["merge-base", "--all", local, source])?;
-            if !ok {
-                continue;
-            }
-            let bases = String::from_utf8(out).context("merge-base output is not UTF-8")?;
-            for base in bases.lines() {
-                if !reachable_from(base, &excludes)? {
-                    leaks.push(Leak {
-                        local_ref: local_ref.clone(),
-                        commit: base.to_owned(),
-                        source: source.clone(),
-                    });
-                    break 'sources;
-                }
+    for (name, refs) in &sources {
+        if refs.is_empty() {
+            continue;
+        }
+        let secret_objects: BTreeSet<Oid> = objects(refs, &excludes)?.into_iter().collect();
+        if secret_objects.is_empty() {
+            continue;
+        }
+        let secret_patches = patch_ids(refs, &excludes)?;
+        for (local_ref, local) in &pushed {
+            let tip = std::slice::from_ref(local);
+            let what = match objects(tip, &excludes)?
+                .into_iter()
+                .find(|o| secret_objects.contains(o) && !trivial.contains(o))
+            {
+                Some(o) if git::object_type(&o)? == "commit" => Some(format!("commit {o}")),
+                Some(o) => Some(format!("object {o}")),
+                None => patch_ids(tip, &excludes)?
+                    .into_iter()
+                    .find_map(|(id, commit)| {
+                        secret_patches
+                            .contains_key(&id)
+                            .then(|| format!("the change of {commit}"))
+                    }),
+            };
+            if let Some(what) = what {
+                leaks.push(Leak {
+                    local_ref: local_ref.clone(),
+                    what,
+                    source: (*name).to_owned(),
+                });
             }
         }
     }
     Ok(leaks)
+}
+
+/// Objects reachable from `tips` but not from `excludes`, commits first.
+fn objects(tips: &[String], excludes: &[Oid]) -> Result<Vec<Oid>> {
+    let out = git::run_input(
+        ["rev-list", "--objects", "--no-object-names", "--stdin"],
+        revs(tips, excludes).as_bytes(),
+    )?;
+    Ok(String::from_utf8(out)
+        .context("rev-list output is not UTF-8")?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// `patch id → commit` for the non-merge commits reachable from `tips` but
+/// not from `excludes`.
+fn patch_ids(tips: &[String], excludes: &[Oid]) -> Result<BTreeMap<String, Oid>> {
+    let log = git::run_input(
+        [
+            "log",
+            "--no-merges",
+            "-p",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--format=commit %H",
+            "--stdin",
+        ],
+        revs(tips, excludes).as_bytes(),
+    )?;
+    let out = git::run_input(["patch-id", "--stable"], &log)?;
+    Ok(String::from_utf8(out)
+        .context("patch-id output is not UTF-8")?
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(id, commit)| (id.to_owned(), commit.to_owned()))
+        .collect())
+}
+
+fn revs(tips: &[String], excludes: &[Oid]) -> String {
+    let mut input = String::new();
+    for t in tips {
+        input.push_str(t);
+        input.push('\n');
+    }
+    for e in excludes {
+        input.push('^');
+        input.push_str(e);
+        input.push('\n');
+    }
+    input
+}
+
+/// The empty blob and tree: shared by unrelated histories, so no evidence.
+fn trivial_objects() -> Result<BTreeSet<Oid>> {
+    let mut set = BTreeSet::new();
+    for ty in ["blob", "tree"] {
+        // stdin is empty: git runs with it closed.
+        set.insert(git::run_line(["hash-object", "-t", ty, "--stdin"])?);
+    }
+    Ok(set)
 }
 
 /// Write the pre-push hook that runs the guard. An existing hook is left
@@ -159,16 +245,6 @@ fn ref_names(prefix: &str) -> Result<Vec<String>> {
 
 fn ref_oids(prefix: &str) -> Result<Vec<Oid>> {
     for_each_ref("%(objectname)", prefix)
-}
-
-fn reachable_from(commit: &str, tips: &[Oid]) -> Result<bool> {
-    let mut input = format!("{commit}\n");
-    for t in tips {
-        input.push('^');
-        input.push_str(t);
-        input.push('\n');
-    }
-    Ok(git::run_input(["rev-list", "-1", "--stdin"], input.as_bytes())?.is_empty())
 }
 
 fn is_zero(oid: &str) -> bool {

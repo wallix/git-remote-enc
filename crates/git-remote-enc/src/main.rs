@@ -196,8 +196,8 @@ fn pre_push(remote: &str, url: &str) -> Result<()> {
     }
     for l in &leaks {
         eprintln!(
-            "enc: {} contains commit {} of {}, which {remote} does not have",
-            l.local_ref, l.commit, l.source
+            "enc: {} contains {} from encrypted remote {}, which {remote} does not have",
+            l.local_ref, l.what, l.source
         );
     }
     bail!(

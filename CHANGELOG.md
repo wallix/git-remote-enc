@@ -7,8 +7,9 @@
   the push, and fetches from it fail until the configuration is fixed.
 
 - `git-remote-enc install-hook` installs a pre-push hook that refuses to push
-  commits of an encrypted remote to any other remote, such as the public
-  repository before the disclosure date; `--no-verify` bypasses it.
+  content of an encrypted remote to any other remote, such as the public
+  repository before the disclosure date, including a backport made by
+  cherry-pick or squash; `--no-verify` bypasses it.
 
 - A push is refused while Git LFS runs on pre-push: LFS would upload the
   files it tracks, unencrypted, to its own server. `enc.allowLfs=true`
