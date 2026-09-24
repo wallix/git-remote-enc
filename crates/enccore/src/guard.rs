@@ -1,7 +1,7 @@
 //! A pre-push guard: refuse to send what came from an encrypted remote to
 //! any other remote. DESIGN.md §6.7.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::git::{self, Oid};
 
@@ -20,7 +20,18 @@ pub struct Leak {
 /// per line).
 pub fn check_pre_push(remote: &str, url: &str, updates: &str) -> Result<Vec<Leak>> {
     let remotes = encrypted_remotes()?;
-    let dest = git::config(&format!("remote.{remote}.url"))?.map(|_| remote);
+    let configured = git::config(&format!("remote.{remote}.url"))?;
+    let dest = configured.as_ref().map(|_| remote);
+    // An encrypted remote whose push git rerouted to a plain URL
+    // (`pushurl`, `pushInsteadOf`): the helper does not run, this does.
+    let intended = configured.as_deref().unwrap_or(remote);
+    if intended.starts_with("enc::") && !url.starts_with("enc::") {
+        bail!(
+            "{remote} is an encrypted remote ({intended}), but this push goes to {url} in clear: \
+             remote.{remote}.pushurl or a url.<base>.pushInsteadOf / insteadOf rule reroutes it. \
+             Refusing to push"
+        );
+    }
     // What the destination already has: its remote-tracking refs, and the
     // old values of the refs being pushed.
     let mut excludes = match dest {

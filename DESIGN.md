@@ -454,6 +454,14 @@ the destination's remote-tracking refs and the old values of the pushed refs.
 The test is on merge bases: if the destination has every merge base of the
 pushed commit and an encrypted ref, it has everything the two share.
 
+git chooses the transport from the push URL, so `remote.<name>.pushurl`, or
+a `url.<base>.pushInsteadOf` (or `insteadOf`) rule, can send pushes to an
+`enc::` remote in clear, to a plain URL, without running the helper. The
+guard refuses a push whose remote is configured with an `enc::` URL when the
+URL git actually pushes to is not one. The helper cannot see such a push,
+but it refuses every other use of that remote (fetch, the subcommands) while
+its push URL resolves to a plain one.
+
 Pushing to another encrypted remote is checked the same way, since its
 audience differs. The disclosure itself is a deliberate `git push
 --no-verify`; once the fix is public and fetched, the guard no longer
@@ -515,6 +523,7 @@ through the helper at all (5.1).
 | A participant pushes a hostile git object (a `.git` tree entry) | received objects are fsck-checked by default (5.2) | none with the default; `fetch.fsckObjects = false` disables it |
 | A crafted `enc::` URL runs a command | the URL goes to git after `--`, and a leading `-` is refused | none known |
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
+| git config reroutes pushes to an encrypted remote to a plain URL (`pushurl`, `pushInsteadOf`) | the pre-push guard refuses it; the helper refuses to fetch from such a remote (6.7) | a clone without the guard pushes in clear; an `insteadOf` that rewrites the fetch URL too never runs the helper at all |
 | Git LFS uploads tracked files in clear alongside a push | a push is refused while a pre-push hook runs Git LFS (5.1) | `enc-allowLfs` with LFS still pointed at the forge; an LFS invocation the check does not recognise (a hook manager that calls it indirectly) |
 | Plaintext leaks through the developer's workflow | `install-hook`: a pre-push hook refuses to push commits of an encrypted remote to any other remote (6.7) | clones without the hook, `--no-verify`, commits not yet tied to an encrypted ref; the decrypted objects live in the local `$GIT_DIR` (5.4): use a dedicated clone, disk encryption, and delete the clone when done |
 | A malicious or compromised build | reproducible builds from pinned inputs, SHA-pinned actions, Sigstore-signed provenance and an SBOM per release, `cargo audit` and `cargo deny` in CI | the build image runs Nix with `sandbox = false`; dependencies include a pre-release crate (`kem`) and an unfixed but unreachable one (`rsa`, RUSTSEC-2023-0071) |

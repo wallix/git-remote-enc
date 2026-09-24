@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- An encrypted remote whose pushes git would send in clear, because of a
+  `pushurl` or a `pushInsteadOf` rule, is refused: the pre-push guard stops
+  the push, and fetches from it fail until the configuration is fixed.
+
 - `git-remote-enc install-hook` installs a pre-push hook that refuses to push
   commits of an encrypted remote to any other remote, such as the public
   repository before the disclosure date; `--no-verify` bypasses it.
