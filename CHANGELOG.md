@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Each manifest names the hash of the one before it, and `git-remote-enc log`
+  marks every generation it cannot chain to the accepted one as not
+  verified, so the host cannot slip forged entries into the audit trail.
+
 - The pre-push guard is installed on the first clone of, or push to, an
   encrypted remote, unless a pre-push hook already exists or
   `enc.installHook=false`.

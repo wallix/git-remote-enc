@@ -102,6 +102,13 @@ pub enum HistoryEntry {
         /// The generation the changes are relative to: the previous readable
         /// manifest's, `None` for an empty remote.
         base: Option<u64>,
+        /// Chained by `previous` digests to the accepted manifest, hence
+        /// authentic. Otherwise anyone with write access to the host may
+        /// have written it, and `signer` is a bare fingerprint.
+        verified: bool,
+        /// Whether the manifest `base` names is verified: when it is not,
+        /// the changes are relative to what may be a forgery.
+        base_verified: bool,
     },
     /// The backend history skips from `expected` to `found`: generations
     /// are missing (or repeated), so the host rewrote it.
@@ -109,6 +116,18 @@ pub enum HistoryEntry {
     /// Not decryptable with the local identities (a manifest from before
     /// they were added, for instance) or malformed.
     Unreadable { commit: Oid, reason: String },
+}
+
+/// A readable manifest of the backend history, for checking its chain.
+struct Link {
+    /// Its index in the history entries.
+    entry: usize,
+    /// Its signer's fingerprint.
+    fingerprint: String,
+    /// SHA-256 of its text.
+    digest: String,
+    /// The digest its `previous` item names.
+    previous: Option<String>,
 }
 
 /// Ref changes from `before` to `after`, as `+ name`, `- name`, `~ name`.
@@ -153,6 +172,8 @@ pub struct Remote {
     tip: Option<Oid>,
     tree: Vec<TreeEntry>,
     manifest: Option<Manifest>,
+    /// SHA-256 of `manifest`'s text as signed: the next one's `previous`.
+    manifest_digest: Option<String>,
     identities: Option<Vec<Identity>>,
     trust_keys: Option<Vec<TrustKey>>,
 }
@@ -198,6 +219,7 @@ impl Remote {
             tip: None,
             tree: vec![],
             manifest: None,
+            manifest_digest: None,
             identities: None,
             trust_keys: None,
         })
@@ -316,6 +338,7 @@ impl Remote {
                 }
                 self.tree = vec![];
                 self.manifest = None;
+                self.manifest_digest = None;
             }
         }
         self.connected = true;
@@ -439,15 +462,28 @@ impl Remote {
                 // Two different manifests with one generation: the history
                 // forked (the host served another view, or rewound the branch
                 // under a pusher). Both are signed, so accept but say so.
-                if m.generation == t.generation
+                let forked_here = m.generation == t.generation
                     && t.digest
                         .as_ref()
-                        .is_some_and(|d| *d != crypto::sha256_hex(text.as_bytes()))
-                {
+                        .is_some_and(|d| *d != crypto::sha256_hex(text.as_bytes()));
+                // The next generation names its predecessor: not the one
+                // accepted here means the same fork, one generation later.
+                let forked_before = Some(m.generation) == t.generation.checked_add(1)
+                    && m.previous.is_some()
+                    && t.digest.is_some()
+                    && m.previous != t.digest;
+                if forked_here {
                     info(&format!(
                         "warning: {} now serves a different manifest for generation {} than the one \
                          accepted earlier; the remote's history forked, check with the other participants",
                         self.backend.url, m.generation
+                    ));
+                }
+                if forked_before {
+                    info(&format!(
+                        "warning: {} serves a generation {} that does not follow the generation {} \
+                         accepted earlier; the remote's history forked, check with the other participants",
+                        self.backend.url, m.generation, t.generation
                     ));
                 }
             }
@@ -501,6 +537,7 @@ impl Remote {
         Participant::parse_all(&m.participants).context("manifest participant list")?;
         check_admins(&m.participants, &m.admins).context("manifest admin list")?;
         self.save_trust(&trust_in(&m, text))?;
+        self.manifest_digest = Some(crypto::sha256_hex(text.as_bytes()));
         Ok(m)
     }
 
@@ -567,9 +604,10 @@ impl Remote {
         // Each push appends one commit and one generation: the commit at
         // index i carries generation i + 1 unless the host rewrote history.
         let mut expected: u64 = 1;
+        let mut links: Vec<Option<Link>> = Vec::new();
         for commit in commits.lines() {
             let entry = match self.read_historical(commit) {
-                Ok((m, signer)) => {
+                Ok((m, signer, digest)) => {
                     if m.generation != expected {
                         entries.push(HistoryEntry::Discontinuity {
                             expected,
@@ -577,6 +615,12 @@ impl Remote {
                         });
                     }
                     expected = m.generation;
+                    links.push(Some(Link {
+                        entry: entries.len(),
+                        fingerprint: signer.clone(),
+                        digest,
+                        previous: m.previous.clone(),
+                    }));
                     let e = HistoryEntry::Readable {
                         commit: commit.to_owned(),
                         generation: m.generation,
@@ -599,24 +643,66 @@ impl Remote {
                             &m.admins,
                         )?,
                         base: previous.as_ref().map(|p| p.generation),
+                        verified: false,
+                        base_verified: true,
                     };
                     previous = Some(m);
                     e
                 }
-                Err(e) => HistoryEntry::Unreadable {
-                    commit: commit.to_owned(),
-                    reason: format!("{e:#}"),
-                },
+                Err(e) => {
+                    links.push(None);
+                    HistoryEntry::Unreadable {
+                        commit: commit.to_owned(),
+                        reason: format!("{e:#}"),
+                    }
+                }
             };
             entries.push(entry);
             expected = expected.saturating_add(1);
+        }
+
+        // Signatures alone prove nothing here: the host can insert manifests
+        // signed by a key of its own that name it after a participant. What
+        // is authentic is the accepted tip, and through the `previous` chain
+        // every manifest it descends from, back to the first break.
+        let mut want = self.manifest_digest.clone();
+        for link in links.iter().rev() {
+            let Some(link) = link else {
+                break;
+            };
+            if want.as_ref() != Some(&link.digest) {
+                break;
+            }
+            if let Some(HistoryEntry::Readable { verified, .. }) = entries.get_mut(link.entry) {
+                *verified = true;
+            }
+            want = link.previous.clone();
+        }
+        // An unverified manifest's own participant list may be forged, so
+        // it does not get to name its signer.
+        let mut previous_verified = true;
+        for link in links.iter().flatten() {
+            if let Some(HistoryEntry::Readable {
+                verified,
+                signer,
+                base_verified,
+                ..
+            }) = entries.get_mut(link.entry)
+            {
+                if !*verified {
+                    signer.clone_from(&link.fingerprint);
+                }
+                *base_verified = previous_verified;
+                previous_verified = *verified;
+            }
         }
         entries.reverse();
         Ok(entries)
     }
 
-    /// The manifest at backend `commit` and the fingerprint of its signer.
-    fn read_historical(&mut self, commit: &str) -> Result<(Manifest, String)> {
+    /// The manifest at backend `commit`, the fingerprint of its signer and
+    /// the SHA-256 of its text.
+    fn read_historical(&mut self, commit: &str) -> Result<(Manifest, String, String)> {
         let tree = Backend::tree_entries(commit)?;
         let oid = Backend::blob_oid(&tree, MANIFEST_BLOB)
             .ok_or_else(|| anyhow!("no manifest"))?
@@ -626,7 +712,11 @@ impl Remote {
         let (text, sig) =
             split_envelope(&envelope).ok_or_else(|| anyhow!("manifest is not signed"))?;
         let signer = crypto::signature_key(text.as_bytes(), sig)?;
-        Ok((Manifest::parse(text)?, signer))
+        Ok((
+            Manifest::parse(text)?,
+            signer,
+            crypto::sha256_hex(text.as_bytes()),
+        ))
     }
 
     // ---- fetch ------------------------------------------------------------
@@ -908,6 +998,7 @@ impl Remote {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow!("generation overflow"))?;
+        m.previous = self.manifest_digest.clone();
         m.time = Some(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -963,6 +1054,7 @@ impl Remote {
                     self.state.add_have(&p.id)?;
                 }
                 self.save_trust(&trust_in(&m, &text))?;
+                self.manifest_digest = Some(crypto::sha256_hex(text.as_bytes()));
                 self.tip = Some(commit.clone());
                 self.tree = Backend::tree_entries(&commit)?;
                 self.manifest = Some(m);

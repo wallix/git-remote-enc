@@ -129,6 +129,7 @@ first line is the format tag. Version 2:
 enc-manifest 2
 generation 42
 time 1790000000
+previous 9a4c...e1
 repo 3f9c6e4d0b1a2c7e8d9f0a1b2c3d4e5f
 head refs/heads/main
 participant ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop
@@ -146,6 +147,7 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 | `enc-manifest <n>` | format version; a reader refuses an unknown `n`. Readers accept 1 and 2 and write 2 |
 | `generation <n>` | strictly increasing per push; anti-rollback (section 6.2) |
 | `time <unix seconds>` | when the pusher wrote it, by the pusher's clock; for the audit trail only, never for trust decisions. New in version 2 |
+| `previous <sha256>` | hex SHA-256 of the previous generation's manifest text; absent on a remote's first manifest. Chains the history so the accepted manifest authenticates every one before it (section 6.6). New in version 2 |
 | `repo <hex>` | random id chosen at creation; detects a recreated remote |
 | `head <ref>` | what `HEAD` points to on clone (first pushed branch by default) |
 | `participant <key>` | an `ssh-ed25519` public key (may read, may push) or an `age1…` recipient (read-only, cannot sign) |
@@ -441,7 +443,19 @@ connect warns when the new tip does not descend from the tip fetched before
 every place where the generations stop following the commits one for one
 (each push adds one commit and one generation), printing which generation a
 manifest's changes are relative to when that is not the one just before. Both
-detect a rewrite; neither restores what it removed. Protecting the branch on
+detect a rewrite; neither restores what it removed.
+
+A signature alone does not make a past manifest authentic: the host can
+insert manifests signed by a key of its own, encrypted to a participant, whose
+own participant list names that key after someone else. Every manifest
+therefore carries the SHA-256 of its predecessor's text (`previous`). `log`
+starts from the manifest connect accepted, which is authentic, and follows the
+chain down; a manifest reached that way is verified, and every one below the
+first break (a digest that does not match, an unreadable manifest, a manifest
+from before version 2 had `previous`) is printed as not verified, with its
+signer as a bare fingerprint, and the changes relative to it flagged. Connect
+also reports a manifest one generation past the accepted one whose
+`previous` is not the accepted one's digest: the history forked. Protecting the branch on
 the host against force pushes, and keeping the host's push log, does.
 
 ### 6.7 Publishing by mistake
@@ -532,6 +546,7 @@ through the helper at all (5.1).
 | The host deletes or recreates the branch | refused; `forget` needs a human decision (section 9) | availability: protect the branch on the host and keep a mirror; deletion stops work until restored |
 | A participant changes who participates | only admins change the lists; a push never does it implicitly (6.1, 6.3) | a remote from before format 2 has no admins until appointed; admins are fully trusted |
 | A participant rewrites or deletes refs | every change is signed and kept in the backend history (`log`, 6.6) | no per-ref permission: one remote per audience (section 1) |
+| The host inserts forged manifests into the history `log` reads | the `previous` hash chain from the accepted manifest; unchained manifests are marked not verified and do not name their signer (6.6) | manifests from before `previous` existed cannot be verified |
 | The host rewrites the backend history, erasing the audit trail | a tip that does not descend from the last one seen is reported; `log` flags missing generations (6.6) | the removed manifests are gone unless the branch is protected on the host or mirrored; a first contact after the rewrite gets no warning, only `log`'s |
 | A removed participant reads the past | future pack keys are unknown to them (6.3) | they keep the past history; full revocation is a new remote |
 | A participant's private key is compromised | passphrase on the key; admins remove the key | the whole readable history is exposed, permanently; no hardware or agent-held keys (6.5) |

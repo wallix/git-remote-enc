@@ -141,13 +141,24 @@ fn log(remote: &mut Remote) -> Result<()> {
                 participants,
                 admins,
                 base,
+                verified,
+                base_verified,
             } => {
                 let time = time.map_or_else(|| "time unknown".to_owned(), |t| format!("time {t}"));
                 println!("generation {generation} ({time}, backend commit {commit})");
                 println!("  signed by {signer}");
+                if !verified {
+                    println!(
+                        "  not verified: not chained to the accepted manifest, so anyone with write \
+                         access to the host may have written it"
+                    );
+                }
                 // Changes relative to anything but the generation just before
                 // would credit this signer with what earlier ones did.
                 match base {
+                    Some(b) if !base_verified => {
+                        println!("  changes relative to generation {b}, which is not verified");
+                    }
                     Some(b) if Some(b) != generation.checked_sub(1) => {
                         println!("  changes relative to generation {b}");
                     }
