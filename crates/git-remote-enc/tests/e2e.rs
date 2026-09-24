@@ -1661,3 +1661,28 @@ fn an_oversized_manifest_is_not_read() {
     let err = sb.git_fails(&a, &["fetch", "enc"]);
     assert!(err.contains("over the 67108864-byte limit"), "{err}");
 }
+
+#[test]
+fn backend_commits_are_anonymous_even_with_commit_signing_on() {
+    let sb = Sandbox::new("anon");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for (k, v) in [
+        ("gpg.format", "ssh"),
+        ("user.signingkey", alice.to_str().unwrap()),
+        ("commit.gpgSign", "true"),
+    ] {
+        sb.git_ok(&a, &["config", k, v]);
+    }
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let commit = sb.git_ok(&host, &["cat-file", "commit", "refs/heads/enc"]);
+    assert!(!commit.contains("gpgsig"), "{commit}");
+    assert!(
+        commit.contains("author enc <enc@localhost> 1000000000 +0000"),
+        "{commit}"
+    );
+}
