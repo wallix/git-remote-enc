@@ -1252,38 +1252,60 @@ fn git_lfs_pre_push_hook_blocks_the_push() {
     let a = sb.repo("alice");
     sb.commit_text(&a, "one", "1\n");
     sb.add_remote(&a, &url, &alice, &[&alice_pub]);
-
-    // What `git lfs install` writes, minus the need for git-lfs itself.
     let hook = a.join(".git/hooks/pre-push");
     let witness = sb.root.join("hook-ran");
-    fs::write(
-        &hook,
-        format!(
-            "#!/bin/sh\n# git lfs pre-push \"$@\"\ntouch '{}'\n",
-            witness.display()
-        ),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&hook).unwrap().permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    fs::set_permissions(&hook, perms).unwrap();
-
-    let err = sb.git_fails(&a, &["push", "enc", "main"]);
-    assert!(
-        err.contains("Git LFS is set up to run before this push"),
-        "{err}"
-    );
-    assert!(!witness.exists(), "the hook ran before the refusal");
-    assert!(
+    let write_hook = |body: &str| {
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\n{body}\ntouch '{}'\n", witness.display()),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&hook).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&hook, perms).unwrap();
+    };
+    let host_is_empty = || {
         sb.git(&host, &["rev-parse", "-q", "--verify", "refs/heads/enc"])
             .stdout
-            .is_empty(),
-        "the refused push reached the host"
-    );
+            .is_empty()
+    };
+
+    // A hook but nothing for LFS to upload: the push goes through.
+    write_hook(": git lfs pre-push");
+    let other = sb.repo("other");
+    sb.commit_text(&other, "x", "x\n");
+    sb.add_remote(&other, &sb.url(&host, Some("other")), &alice, &[&alice_pub]);
+    fs::create_dir_all(other.join(".git/hooks")).unwrap();
+    fs::copy(&hook, other.join(".git/hooks/pre-push")).unwrap();
+    sb.git_ok(&other, &["push", "-q", "enc", "main"]);
+    assert!(witness.exists());
+    fs::remove_file(&witness).unwrap();
+
+    // Files in LFS storage, and any pre-push hook, however it spells the
+    // LFS call: refused before the hook runs.
+    let objects = a.join(".git/lfs/objects/2f/65");
+    fs::create_dir_all(&objects).unwrap();
+    fs::write(objects.join("2f655113"), "binary").unwrap();
+    for body in [
+        "git lfs pre-push \"$@\"",
+        "git  lfs pre-push \"$@\"",
+        "git \"lfs\" pre-push \"$@\"",
+        "L=lfs; git $L pre-push \"$@\"",
+        ". ./.husky/pre-push",
+    ] {
+        write_hook(&format!(": {body}"));
+        let err = sb.git_fails(&a, &["push", "enc", "main"]);
+        assert!(
+            err.contains("Git LFS may run before this push"),
+            "{body}: {err}"
+        );
+        assert!(!witness.exists(), "the hook ran before the refusal");
+        assert!(host_is_empty(), "the refused push reached the host");
+    }
 
     // A config-defined hook counts too (harmless where git runs those).
     fs::remove_file(&hook).unwrap();
-    sb.git_ok(&a, &["config", "hook.lfs.command", "true git lfs pre-push"]);
+    sb.git_ok(&a, &["config", "hook.lfs.command", "true"]);
     let err = sb.git_fails(&a, &["push", "enc", "main"]);
     assert!(err.contains("hook.lfs.command"), "{err}");
 

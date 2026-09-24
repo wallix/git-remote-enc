@@ -15,8 +15,9 @@
   repository before the disclosure date, including a backport made by
   cherry-pick or squash; `--no-verify` bypasses it.
 
-- A push is refused while Git LFS runs on pre-push: LFS would upload the
-  files it tracks, unencrypted, to its own server. `enc.allowLfs=true`
+- A push is refused while Git LFS could upload files alongside it (LFS holds
+  files locally and a pre-push hook is installed): LFS would upload the files
+  it tracks, unencrypted, to its own server. `enc.allowLfs=true`
   overrides it once LFS is neutralized in the clone.
 
 - `enc.repo` and `enc.minGeneration` pin the repository id and the lowest
