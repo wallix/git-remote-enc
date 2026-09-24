@@ -1291,3 +1291,77 @@ fn git_lfs_pre_push_hook_blocks_the_push() {
     sb.git_ok(&a, &["config", "remote.enc.enc-allowLfs", "true"]);
     sb.git_ok(&a, &["push", "-q", "enc", "main"]);
 }
+
+#[test]
+fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
+    let sb = Sandbox::new("guard");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+
+    // The public product repository, and a developer clone of it that also
+    // works on an embargoed fix.
+    let public = sb.dir("public.git");
+    sb.git_ok(&public, &["init", "-q", "--bare"]);
+    let seed = sb.repo("seed");
+    sb.commit_text(&seed, "product", "p\n");
+    sb.git_ok(&seed, &["push", "-q", public.to_str().unwrap(), "main"]);
+    sb.git_ok(&sb.root, &["clone", "-q", public.to_str().unwrap(), "dev"]);
+    let dev = sb.root.join("dev");
+    sb.add_remote(&dev, &url, &alice, &[&alice_pub]);
+    let out = sb
+        .cmd(&dev, "git-remote-enc")
+        .arg("install-hook")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    sb.git_ok(&dev, &["checkout", "-q", "-b", "fix-main"]);
+    sb.commit_text(&dev, "fix", "f\n");
+    sb.git_ok(&dev, &["push", "-q", "-u", "enc", "fix-main"]);
+    let fix = sb.git_ok(&dev, &["rev-parse", "fix-main"]);
+
+    // One command away from publishing the fix before the date: refused.
+    let err = sb.git_fails(&dev, &["push", "origin", "fix-main"]);
+    assert!(
+        err.contains("would publish commits of an encrypted remote"),
+        "{err}"
+    );
+    assert!(err.contains(fix.trim()), "{err}");
+    let err = sb.git_fails(&dev, &["push", "origin", "fix-main:main"]);
+    assert!(err.contains("refusing to push to origin"), "{err}");
+    assert!(
+        sb.git(
+            &public,
+            &["rev-parse", "-q", "--verify", "refs/heads/fix-main"]
+        )
+        .stdout
+        .is_empty()
+    );
+
+    // A local commit on top of the fix, not pushed anywhere yet, counts too.
+    sb.commit_text(&dev, "fix2", "f2\n");
+    sb.git_fails(&dev, &["push", "origin", "HEAD:refs/heads/other"]);
+
+    // Ordinary public work passes, and so does the disclosure, deliberately.
+    sb.git_ok(&dev, &["checkout", "-q", "main"]);
+    sb.commit_text(&dev, "feature", "x\n");
+    sb.git_ok(&dev, &["push", "-q", "origin", "main"]);
+    sb.git_ok(&dev, &["push", "-q", "--no-verify", "origin", "fix-main"]);
+    // Once public, the fix no longer trips the guard.
+    sb.git_ok(&dev, &["fetch", "-q", "origin"]);
+    sb.git_ok(&dev, &["push", "-q", "origin", "fix-main:refs/heads/copy"]);
+
+    // An existing hook is not overwritten.
+    let out = sb
+        .cmd(&dev, "git-remote-enc")
+        .arg("install-hook")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("git-remote-enc pre-push"));
+}
