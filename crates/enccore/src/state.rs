@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -44,6 +45,12 @@ impl State {
         let dir = root.join(&key);
         fs::create_dir_all(dir.join("tmp"))
             .with_context(|| format!("creating {}", dir.display()))?;
+        // Trust state, pack names and temporary packs are nobody else's
+        // business, whatever the umask made of `.git`.
+        for d in [&root, &dir] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting {}", d.display()))?;
+        }
         // Leftovers from an interrupted run. A helper running concurrently on
         // the same remote (a push racing a fetch) owns the recent ones.
         if let Ok(entries) = fs::read_dir(dir.join("tmp")) {
@@ -250,6 +257,8 @@ mod tests {
             .unwrap();
 
         State::open(&root, "url", "refs/heads/enc").unwrap();
+        let mode = fs::metadata(root.join("enc")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
         assert!(
             fresh.exists(),
             "a concurrent helper's temp file was removed"

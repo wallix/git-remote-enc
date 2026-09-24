@@ -313,6 +313,13 @@ every linked worktree, so trust accepted in one worktree holds in all):
   can write `.git` and simply runs code through a hook instead.
 - `<common>/enc/<key>/tmp/` — temporary files for the pack pipeline.
 
+`<common>/enc/` and each `<key>/` directory are made mode 0700 on every run.
+The decrypted objects are ordinary objects of the repository, as readable as
+the umask left `.git`, and `forget` does not remove them: they are the
+repository. Once an embargo ends, the clone is deleted (on an encrypted disk,
+that is the whole cleanup), and the backend branch and any mirror of it are
+deleted on the host once the audit trail (`log`) has been exported.
+
 The encrypted blobs live in the local object store (reachable from the
 tracking ref) next to the decrypted objects, so a repository costs roughly
 twice its size locally. This is the price of using git's transfer negotiation
