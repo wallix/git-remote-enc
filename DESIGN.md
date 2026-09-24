@@ -493,7 +493,10 @@ The host is trusted for availability only: not to read, not to change what
 it stores, not to serve the same view to everyone. The participant's machine
 is trusted with everything: private keys, plaintext objects and the local
 trust state. The first contact relies on a channel outside both, through
-which a participant learns another's public key.
+which a participant learns another's public key (and, to bound a rollback or
+substitution, the repository id and generation). Git LFS, when a repository
+uses it, is a second flow from the machine to the host that does not go
+through the helper at all (5.1).
 
 | Threat | Mitigation | Residual risk |
 |---|---|---|
@@ -501,14 +504,14 @@ which a participant learns another's public key.
 | The host forges refs or a manifest | a manifest is accepted only when signed by a previously accepted participant (6.1) | none once a manifest has been accepted |
 | The host rolls the branch back | strictly increasing `generation`, checked against local state (6.2), or against `enc-minGeneration` on first contact (6.1) | a host can withhold new pushes from a client that never saw them (freeze); a first contact without `enc-minGeneration` accepts any generation its pinned signer signed |
 | The host serves different views to different clients | a changed manifest for an accepted generation is reported (6.2) | detected only by a client that sees both views |
-| The host substitutes its own remote on first contact | first contact needs a pinned participant list; `enc-repo` pins the repository; repo id lookup across URL spellings (6.1) | `enc.trustOnFirstUse = true` reopens it, by choice; without `enc-repo`, another remote signed by a pinned key passes |
+| The host substitutes its own remote on first contact | first contact needs a pinned participant list; `enc-repo` pins the repository; repo id lookup across URL spellings (6.1) | `enc.trustOnFirstUse = true` reopens it, by choice, and set in the global config it does so for every remote; without `enc-repo`, another remote signed by a pinned key passes |
 | The host deletes or recreates the branch | refused; `forget` needs a human decision (section 9) | availability: protect the branch on the host and keep a mirror; deletion stops work until restored |
 | A participant changes who participates | only admins change the lists; a push never does it implicitly (6.1, 6.3) | a remote from before format 2 has no admins until appointed; admins are fully trusted |
 | A participant rewrites or deletes refs | every change is signed and kept in the backend history (`log`, 6.6) | no per-ref permission: one remote per audience (section 1) |
 | The host rewrites the backend history, erasing the audit trail | a tip that does not descend from the last one seen is reported; `log` flags missing generations (6.6) | the removed manifests are gone unless the branch is protected on the host or mirrored; a first contact after the rewrite gets no warning, only `log`'s |
 | A removed participant reads the past | future pack keys are unknown to them (6.3) | they keep the past history; full revocation is a new remote |
 | A participant's private key is compromised | passphrase on the key; admins remove the key | the whole readable history is exposed, permanently; no hardware or agent-held keys (6.5) |
-| A local attacker rewrites the trust state | HMAC keyed from the user's identity; missing state is refused (5.4, section 9) | whoever can write `.git` can run code through hooks anyway |
+| A local attacker rewrites the trust state | HMAC keyed from the user's identity; a file with a wrong or missing tag, or missing while the tracking ref exists, is refused (5.4, section 9) | stops tampering without code execution (a restored backup, a synced or shared directory); whoever can write `.git` can run code through hooks instead |
 | A participant pushes a hostile git object (a `.git` tree entry) | received objects are fsck-checked by default (5.2) | none with the default; `fetch.fsckObjects = false` disables it |
 | A crafted `enc::` URL runs a command | the URL goes to git after `--`, and a leading `-` is refused | none known |
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
@@ -592,7 +595,15 @@ ed25519 keys:
 - concurrent push: a stale lease is retried and no pack is lost;
 - a key that is not a participant cannot read; a `age1…` reader can read but
   cannot push; a manifest signed by a non-participant is rejected;
-- rollback of the backend branch to an older tip is refused.
+- rollback of the backend branch to an older tip is refused, and so is an
+  older or substituted manifest on a first contact pinned with `enc-repo` and
+  `enc-minGeneration`;
+- a backend history rewritten by the host is reported by fetch and `log`;
+- a tampered trust file, with or without its tag line, is refused;
+- a hostile object (a `.git` tree entry) is refused on fetch;
+- a push is refused, before the hook runs, while a pre-push hook runs Git
+  LFS;
+- the pre-push guard refuses to publish commits of an encrypted remote.
 
 Unit tests cover manifest parsing/serialization, refspec parsing and the trust
 rules. Every parser of untrusted input (manifest, envelope, refspec,
