@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `git-remote-enc log` flags generations missing from the remote's history,
+  and a fetch warns when the host rewrote that history, instead of silently
+  crediting the next signer with earlier changes.
+
 - `git-remote-enc log <remote>` prints who pushed each generation of a remote,
   when, and what it changed. Pushes record their time inside the encrypted
   manifest for it.
