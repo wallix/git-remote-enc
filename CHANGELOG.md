@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The local state directories under `.git/enc/` are readable by their owner
+  only.
+
 - A manifest over 64 MiB is refused before it is read, so the host cannot
   exhaust a client's memory with one.
 
