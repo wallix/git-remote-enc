@@ -274,7 +274,8 @@ every linked worktree, so trust accepted in one worktree holds in all):
   in `mac <key id> <tag>`: HMAC-SHA256 of the lines above, keyed by
   HMAC-SHA256(identity secret, "git-remote-enc local trust state v1") for the
   first configured identity (`key id` is its public fingerprint or age
-  recipient). A file whose tag does not verify is refused. The tag stops a
+  recipient). A file whose tag does not verify, or that has no tag line, is
+  refused; so is state written by 0.1.0, which had none. The tag stops a
   rewrite by anything that lacks the private key; it does not stop someone who
   can write `.git` and simply runs code through a hook instead.
 - `<common>/enc/<key>/tmp/` — temporary files for the pack pipeline.
@@ -446,7 +447,7 @@ which a participant learns another's public key.
 | A participant rewrites or deletes refs | every change is signed and kept in the backend history (`log`, 6.6) | no per-ref permission: one remote per audience (section 1) |
 | A removed participant reads the past | future pack keys are unknown to them (6.3) | they keep the past history; full revocation is a new remote |
 | A participant's private key is compromised | passphrase on the key; admins remove the key | the whole readable history is exposed, permanently; no hardware or agent-held keys (6.5) |
-| A local attacker rewrites the trust state | HMAC keyed from the user's identity; missing state is refused (5.4, section 9) | whoever can write `.git` can run code through hooks anyway |
+| A local attacker rewrites the trust state | HMAC keyed from the user's identity; a file with a wrong or missing tag, or missing while the tracking ref exists, is refused (5.4, section 9) | stops tampering without code execution (a restored backup, a synced or shared directory); whoever can write `.git` can run code through hooks instead |
 | A crafted `enc::` URL runs a command | the URL goes to git after `--`, and a leading `-` is refused | none known |
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
 | Plaintext leaks through the developer's workflow | none in the tool: the decrypted objects live in the local `$GIT_DIR` next to any other remote's (5.4) | pushing an encrypted branch to a plain remote by mistake publishes it; use a dedicated clone, disk encryption, and delete the clone when done |
@@ -503,9 +504,9 @@ credential helpers all work.
   <remote>` removes the local state and the tracking ref, and the next contact
   is a first contact, which needs a pinned participant list (section 6.1).
 - **Local trust state missing or altered:** the trust file is gone while the
-  tracking ref shows a manifest was accepted, or its tag does not verify. The
-  helper refuses rather than falling back to a first contact; recovery is the
-  same `forget`.
+  tracking ref shows a manifest was accepted, or its tag is missing or does
+  not verify. The helper refuses rather than falling back to a first contact;
+  recovery is the same `forget`.
 - **Not a participant:** age reports no matching key; the helper says so and
   names the identities it tried.
 - **Stale lease three times:** give up with a clear message; the user retries.
@@ -523,7 +524,8 @@ ed25519 keys:
 - concurrent push: a stale lease is retried and no pack is lost;
 - a key that is not a participant cannot read; a `age1…` reader can read but
   cannot push; a manifest signed by a non-participant is rejected;
-- rollback of the backend branch to an older tip is refused.
+- rollback of the backend branch to an older tip is refused;
+- a tampered trust file, with or without its tag line, is refused.
 
 Unit tests cover manifest parsing/serialization, refspec parsing and the trust
 rules. Every parser of untrusted input (manifest, envelope, refspec,

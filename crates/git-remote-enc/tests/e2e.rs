@@ -898,6 +898,18 @@ fn local_trust_state_is_authenticated() {
     let err = sb.git_fails(&b, &["fetch", "origin"]);
     assert!(err.contains("modified outside git-remote-enc"), "{err}");
 
+    // The same rewrite with the tag line cut off: refused too, not read as
+    // unauthenticated state from an older version.
+    let untagged: String = original
+        .replace("generation 1", "generation 0")
+        .lines()
+        .filter(|l| !l.starts_with("mac "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    fs::write(&trust, untagged).unwrap();
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(err.contains("no authentication tag"), "{err}");
+
     // Deleted: refused as well, instead of falling back to first contact.
     fs::remove_file(&trust).unwrap();
     let err = sb.git_fails(&b, &["fetch", "origin"]);
