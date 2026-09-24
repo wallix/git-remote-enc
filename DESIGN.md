@@ -247,8 +247,12 @@ content from its pre-push hook to a separate LFS server, usually the forge
 named by the product's `.lfsconfig`. The helper sees only the pointers; the
 files would leave in clear, with the push succeeding. git calls the helper's
 `list for-push` before it runs the pre-push hook, so the helper refuses there
-when `hooks/pre-push` (under `core.hooksPath` too) or a `hook.*.command`
-invokes Git LFS, unless `enc-allowLfs` is set. Setting it is for a clone where
+when LFS could upload anything, unless `enc-allowLfs` is set. LFS uploads
+only from its local storage (`<common dir>/lfs/objects`, or under
+`lfs.storage`), so the test is: that storage holds a file, and a pre-push
+hook other than the guard exists (`hooks/pre-push`, under `core.hooksPath`
+too, or a `hook.*.command`). A hook is a shell script whose effect cannot be
+read off its text, so any such hook counts. Setting it is for a clone where
 LFS was neutralized (`lfs.url` pointed at nothing in the local config, which
 overrides `.lfsconfig`). Encrypting LFS objects into the backend, as a custom
 LFS transfer agent, is not implemented.
@@ -536,7 +540,7 @@ through the helper at all (5.1).
 | A crafted `enc::` URL runs a command | the URL goes to git after `--`, and a leading `-` is refused | none known |
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
 | git config reroutes pushes to an encrypted remote to a plain URL (`pushurl`, `pushInsteadOf`) | the pre-push guard refuses it; the helper refuses to fetch from such a remote (6.7) | a clone without the guard pushes in clear; an `insteadOf` that rewrites the fetch URL too never runs the helper at all |
-| Git LFS uploads tracked files in clear alongside a push | a push is refused while a pre-push hook runs Git LFS (5.1) | `enc-allowLfs` with LFS still pointed at the forge; an LFS invocation the check does not recognise (a hook manager that calls it indirectly) |
+| Git LFS uploads tracked files in clear alongside a push | a push is refused while LFS holds files locally and any pre-push hook but the guard exists (5.1) | `enc-allowLfs` with LFS still pointed at the forge; LFS storage outside the places checked |
 | Plaintext leaks through the developer's workflow | a pre-push hook, installed on first contact refuses to push content of an encrypted remote (shared objects, or a cherry-picked change by patch id) to any other remote (6.7) | clones where it could not be installed (an existing hook, `core.hooksPath`) or was turned off, `--no-verify`, content not yet tied to an encrypted ref, a fix rewritten by hand or squashed with other edits onto a diverged base; the decrypted objects live in the local `$GIT_DIR` (5.4): use a dedicated clone, disk encryption, and delete the clone when done |
 | A malicious or compromised build | reproducible builds from pinned inputs, SHA-pinned actions, Sigstore-signed provenance and an SBOM per release, `cargo audit` and `cargo deny` in CI | the build image runs Nix with `sandbox = false`; dependencies include a pre-release crate (`kem`) and an unfixed but unreachable one (`rsa`, RUSTSEC-2023-0071) |
 | A parser bug on untrusted input | Rust with panics denied by lint; the signature is checked before parsing when a signer list is known; mutation tests of every parser (section 10) | no coverage-guided fuzzing; trust on first use parses unauthenticated text |

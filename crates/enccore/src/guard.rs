@@ -245,6 +245,11 @@ pub fn install_hook() -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
+/// Is `text` the hook `install_hook` writes, and nothing else?
+pub fn is_guard_hook(text: &str) -> bool {
+    text.trim() == HOOK.trim()
+}
+
 const HOOK: &str = "#!/bin/sh\n\
 # Refuse to push commits of an encrypted remote anywhere else\n\
 # (git-remote-enc install-hook). `git push --no-verify` skips it.\n\

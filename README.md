@@ -61,14 +61,14 @@ The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 | `remote.<name>.enc-repo` / `enc.repo` | the repository id the remote must serve (the manifest's `repo` line) |
 | `remote.<name>.enc-minGeneration` / `enc.minGeneration` | the lowest manifest generation to accept |
 | `remote.<name>.enc-installHook` / `enc.installHook` | `false` skips installing the pre-push guard on first contact. Default `true` |
-| `remote.<name>.enc-allowLfs` / `enc.allowLfs` | `true` pushes even though Git LFS runs on pre-push. Default `false` (see below) |
+| `remote.<name>.enc-allowLfs` / `enc.allowLfs` | `true` pushes even though Git LFS could upload files on pre-push. Default `false` (see below) |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
 
 Git LFS files are not encrypted: LFS uploads them from its pre-push hook to
 its own server (`lfs.url`, normally the forge), and the helper only ever sees
-their pointers. A push is therefore refused while a pre-push hook runs Git
-LFS. Commit the files a fix needs outside LFS, set `lfs.url` in the clone's
+their pointers. A push is therefore refused while LFS holds files in the
+clone's LFS storage and a pre-push hook other than the guard is installed. Commit the files a fix needs outside LFS, set `lfs.url` in the clone's
 own config to an unreachable URL (it takes precedence over `.lfsconfig`),
 then set `enc-allowLfs`.
 

@@ -516,9 +516,9 @@ impl Remote {
             && let Some(hook) = lfs_pre_push_hook()?
         {
             bail!(
-                "Git LFS is set up to run before this push ({hook}): it would upload every \
-                 LFS-tracked file of the pushed commits, in clear, to the LFS server (lfs.url, \
-                 usually the forge), outside the encrypted remote. Refusing to push. Commit the \
+                "Git LFS may run before this push ({hook}): it would upload every LFS-tracked \
+                 file of the pushed commits, in clear, to the LFS server (lfs.url, usually the \
+                 forge), outside the encrypted remote. Refusing to push. Commit the \
                  files the fix needs outside LFS, point lfs.url at nothing in this clone's config \
                  (it overrides .lfsconfig), then set remote.<name>.enc-allowLfs=true; or remove \
                  the hook"
@@ -1109,14 +1109,21 @@ fn push_urls(name: &str, url: &str) -> Result<Vec<String>> {
     ])
 }
 
-/// Where Git LFS would run on pre-push: a hook file (under `core.hooksPath`
-/// too) or a config-defined hook that invokes it.
+/// Why Git LFS could upload files on this push, if it can: LFS has files
+/// in its local storage, the only place it uploads from, and a pre-push hook
+/// other than the guard runs. Hooks are shell, so what one runs cannot be
+/// read off its text; any other hook counts.
 fn lfs_pre_push_hook() -> Result<Option<String>> {
-    let runs_lfs = |text: &str| text.contains("git lfs") || text.contains("git-lfs");
+    let Some(storage) = lfs_storage_with_objects()? else {
+        return Ok(None);
+    };
     let path = git::hook_path("pre-push")?;
     match std::fs::read(&path) {
-        Ok(bytes) if runs_lfs(&String::from_utf8_lossy(&bytes)) => {
-            return Ok(Some(path.display().to_string()));
+        Ok(bytes) if !crate::guard::is_guard_hook(&String::from_utf8_lossy(&bytes)) => {
+            return Ok(Some(format!(
+                "the pre-push hook {}, with LFS files in {storage}",
+                path.display()
+            )));
         }
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1124,8 +1131,52 @@ fn lfs_pre_push_hook() -> Result<Option<String>> {
     }
     Ok(git::config_regexp(r"^hook\..*\.command$")?
         .into_iter()
-        .find(|(_, command)| runs_lfs(command))
-        .map(|(key, _)| key))
+        .find(|(_, command)| !command.trim_start().starts_with("git-remote-enc pre-push"))
+        .map(|(key, _)| format!("{key}, with LFS files in {storage}")))
+}
+
+/// The LFS object directory, if it holds any file: `<common dir>/lfs`, or
+/// `lfs.storage` (relative to the working tree, else to the common dir).
+fn lfs_storage_with_objects() -> Result<Option<String>> {
+    let common = git::common_dir()?;
+    let mut dirs = vec![common.join("lfs")];
+    if let Some(s) = git::config("lfs.storage")? {
+        let p = PathBuf::from(&s);
+        if p.is_absolute() {
+            dirs.push(p);
+        } else {
+            if let Ok(top) = git::run_line(["rev-parse", "--show-toplevel"]) {
+                dirs.push(PathBuf::from(top).join(&p));
+            }
+            dirs.push(common.join(&p));
+        }
+    }
+    for d in dirs {
+        if has_file(&d.join("objects"), 4)? {
+            return Ok(Some(d.display().to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// Is there a file under `dir`, at most `depth` levels down?
+fn has_file(dir: &std::path::Path, depth: u32) -> Result<bool> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
+    };
+    for e in entries {
+        let e = e?;
+        let ty = e.file_type()?;
+        if ty.is_file() {
+            return Ok(true);
+        }
+        if ty.is_dir() && depth > 0 && has_file(&e.path(), depth.saturating_sub(1))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// On a first contact pinned by participants only, how to pin the rest.
