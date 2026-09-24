@@ -241,6 +241,17 @@ for-push`.
 The lease is what makes concurrent pushes safe: the manifest we replace is
 provably the one we read, so no pack line can be lost.
 
+**Git LFS.** LFS replaces tracked files by pointers and uploads their
+content from its pre-push hook to a separate LFS server, usually the forge
+named by the product's `.lfsconfig`. The helper sees only the pointers; the
+files would leave in clear, with the push succeeding. git calls the helper's
+`list for-push` before it runs the pre-push hook, so the helper refuses there
+when `hooks/pre-push` (under `core.hooksPath` too) or a `hook.*.command`
+invokes Git LFS, unless `enc-allowLfs` is set. Setting it is for a clone where
+LFS was neutralized (`lfs.url` pointed at nothing in the local config, which
+overrides `.lfsconfig`). Encrypting LFS objects into the backend, as a custom
+LFS transfer agent, is not implemented.
+
 ### 5.2 Fetch
 
 After `list`, git sends the `fetch <oid> <name>` lines it wants. The helper
@@ -479,6 +490,7 @@ which a participant learns another's public key.
 | A participant pushes a hostile git object (a `.git` tree entry) | received objects are fsck-checked by default (5.2) | none with the default; `fetch.fsckObjects = false` disables it |
 | A crafted `enc::` URL runs a command | the URL goes to git after `--`, and a leading `-` is refused | none known |
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
+| Git LFS uploads tracked files in clear alongside a push | a push is refused while a pre-push hook runs Git LFS (5.1) | `enc-allowLfs` with LFS still pointed at the forge; an LFS invocation the check does not recognise (a hook manager that calls it indirectly) |
 | Plaintext leaks through the developer's workflow | none in the tool: the decrypted objects live in the local `$GIT_DIR` next to any other remote's (5.4) | pushing an encrypted branch to a plain remote by mistake publishes it; use a dedicated clone, disk encryption, and delete the clone when done |
 | A malicious or compromised build | reproducible builds from pinned inputs, SHA-pinned actions, Sigstore-signed provenance and an SBOM per release, `cargo audit` and `cargo deny` in CI | the build image runs Nix with `sandbox = false`; dependencies include a pre-release crate (`kem`) and an unfixed but unreachable one (`rsa`, RUSTSEC-2023-0071) |
 | A parser bug on untrusted input | Rust with panics denied by lint; the signature is checked before parsing when a signer list is known; mutation tests of every parser (section 10) | no coverage-guided fuzzing; trust on first use parses unauthenticated text |
@@ -514,6 +526,7 @@ which a participant learns another's public key.
 | `remote.<name>.enc-trustOnFirstUse`, `enc.trustOnFirstUse` | boolean, default false. Accept the signer of an unknown remote without a pinned participant list (section 6.1) |
 | `remote.<name>.enc-repo`, `enc.repo` | the `repo` id the remote must serve (section 6.1) |
 | `remote.<name>.enc-minGeneration`, `enc.minGeneration` | the lowest `generation` accepted (section 6.1) |
+| `remote.<name>.enc-allowLfs`, `enc.allowLfs` | boolean, default false. Push although a pre-push hook runs Git LFS (section 5.1) |
 | `fetch.fsckObjects`, `transfer.fsckObjects`, `fetch.fsck.*` | git's own keys; received objects are checked unless one of the first two is false (section 5.2) |
 
 URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to

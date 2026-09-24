@@ -24,6 +24,8 @@ pub struct Config {
     /// The lowest manifest generation to accept, learned out of band: bounds
     /// a rollback on first contact, before there is local state to do it.
     pub min_generation: Option<u64>,
+    /// Push even though Git LFS would upload files in clear alongside.
+    pub allow_lfs: bool,
     /// `index-pack` fsck option for received packs (`--fsck-objects[=…]`),
     /// `None` when disabled.
     pub fsck: Option<String>,
@@ -54,6 +56,12 @@ impl Config {
             None => false,
         };
 
+        let allow_lfs = match one("allowLfs")? {
+            Some(v) => {
+                parse_bool(&v).with_context(|| format!("enc allowLfs: `{v}` is not a boolean"))?
+            }
+            None => false,
+        };
         let repo = one("repo")?.map(|r| r.trim().to_owned());
         let min_generation = one("minGeneration")?
             .map(|v| {
@@ -74,6 +82,7 @@ impl Config {
             trust_on_first_use,
             repo,
             min_generation,
+            allow_lfs,
             fsck,
         })
     }

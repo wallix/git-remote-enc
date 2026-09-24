@@ -202,6 +202,17 @@ pub fn common_dir() -> Result<PathBuf> {
     Ok(run_line(["rev-parse", "--path-format=absolute", "--git-common-dir"])?.into())
 }
 
+/// Where git looks for hook `name`, `core.hooksPath` included.
+pub fn hook_path(name: &str) -> Result<PathBuf> {
+    Ok(run_line([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        &format!("hooks/{name}"),
+    ])?
+    .into())
+}
+
 pub fn config(key: &str) -> Result<Option<String>> {
     let (ok, out, _) = run_status(["config", "--get", key])?;
     if ok {
