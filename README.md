@@ -60,7 +60,6 @@ The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 | `remote.<name>.enc-trustOnFirstUse` / `enc.trustOnFirstUse` | `true` accepts whoever signed an unknown remote when no participant list is set. Default `false` |
 | `remote.<name>.enc-repo` / `enc.repo` | the repository id the remote must serve (the manifest's `repo` line) |
 | `remote.<name>.enc-minGeneration` / `enc.minGeneration` | the lowest manifest generation to accept |
-
 | `remote.<name>.enc-allowLfs` / `enc.allowLfs` | `true` pushes even though Git LFS runs on pre-push. Default `false` (see below) |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
