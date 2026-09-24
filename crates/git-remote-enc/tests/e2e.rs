@@ -1692,3 +1692,37 @@ fn backend_commits_are_anonymous_even_with_commit_signing_on() {
         "{commit}"
     );
 }
+
+#[test]
+fn log_flags_a_time_going_backwards() {
+    let sb = Sandbox::new("logtime");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    // A participant backdates the next generation.
+    sb.forge_manifest(&host, &alice, &[&alice_pub], |text| {
+        let text = text.replace("generation 1\n", "generation 2\n");
+        let time = text.lines().find(|l| l.starts_with("time ")).unwrap();
+        text.replace(time, "time 1000")
+    });
+    let out = sb
+        .cmd(&a, "git-remote-enc")
+        .args(["log", "enc"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(log.starts_with("generation 2 (time 1000,"), "{log}");
+    assert!(
+        log.contains("  time earlier than the generation before"),
+        "{log}"
+    );
+}
