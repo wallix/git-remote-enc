@@ -18,7 +18,9 @@
 - The local trust state is authenticated with a key derived from your identity;
   a modified or missing trust file is refused instead of silently restarting
   from first contact. `git-remote-enc forget <remote>` replaces the advice to
-  delete `.git/enc/` by hand when a remote was recreated or deleted.
+  delete `.git/enc/` by hand when a remote was recreated or deleted. Trust
+  files written by 0.1.0 carry no authentication and are refused: run
+  `git-remote-enc forget <remote>` once per remote after upgrading.
 - Breaking: first contact with an existing remote (a clone, or a new URL) is
   refused unless `enc.participants` names its signer, or
   `enc.trustOnFirstUse` is set to accept it unverified. The same remote reached

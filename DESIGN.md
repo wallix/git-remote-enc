@@ -276,7 +276,8 @@ every linked worktree, so trust accepted in one worktree holds in all):
   in `mac <key id> <tag>`: HMAC-SHA256 of the lines above, keyed by
   HMAC-SHA256(identity secret, "git-remote-enc local trust state v1") for the
   first configured identity (`key id` is its public fingerprint or age
-  recipient). A file whose tag does not verify is refused. The tag stops a
+  recipient). A file whose tag does not verify, or that has no tag line, is
+  refused; so is state written by 0.1.0, which had none. The tag stops a
   rewrite by anything that lacks the private key; it does not stop someone who
   can write `.git` and simply runs code through a hook instead.
 - `<common>/enc/<key>/tmp/` — temporary files for the pack pipeline.
@@ -504,9 +505,9 @@ credential helpers all work.
   tracking ref, and the next contact is a first contact, which needs a pinned
   participant list (section 6.1).
 - **Local trust state missing or altered:** the trust file is gone while the
-  tracking ref shows a manifest was accepted, or its tag does not verify. The
-  helper refuses rather than falling back to a first contact; recovery is the
-  same `forget`.
+  tracking ref shows a manifest was accepted, or its tag is missing or does
+  not verify. The helper refuses rather than falling back to a first contact;
+  recovery is the same `forget`.
 - **Not a participant:** age reports no matching key; the helper says so and
   names the identities it tried.
 - **Stale lease three times:** give up with a clear message; the user retries.

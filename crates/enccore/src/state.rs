@@ -196,9 +196,14 @@ fn read_trust(path: &Path, keys: &[TrustKey]) -> Result<Option<Trust>> {
             }
             body
         }
-        // Written before the state was authenticated; the next accepted
-        // manifest rewrites it with a tag.
-        _ => text,
+        // Stripping the tag must not downgrade the file to unauthenticated
+        // state. Files from before authentication existed (0.1.0) go too.
+        _ => bail!(
+            "{} carries no authentication tag: it was modified outside git-remote-enc, or written \
+             by 0.1.0. The accepted trust state for this remote cannot be relied on; after checking \
+             why, `git-remote-enc forget <remote>` drops it",
+            path.display()
+        ),
     };
     let mut t = Trust::default();
     for line in body.lines() {
@@ -281,28 +286,26 @@ mod tests {
         let err = s.trust(&[theirs]).unwrap_err().to_string();
         assert!(err.contains("not among your identities"), "{err}");
 
-        // State written before authentication existed is still read.
+        // Without its tag, the file is refused: the old unauthenticated
+        // format, or a tampered file with the tag line cut off.
         fs::write(
             s.dir().join("trust"),
             "generation 3\nrepo r\nparticipant age1x\n",
         )
         .unwrap();
-        assert_eq!(
-            s.trust(std::slice::from_ref(&ours))
-                .unwrap()
-                .map(|t| t.generation),
-            Some(3)
-        );
+        let err = s
+            .trust(std::slice::from_ref(&ours))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no authentication tag"), "{err}");
 
         // Corrupted files are errors or authenticated reads, never panics,
-        // and an authenticated read only ever returns what was saved.
+        // and a read only ever returns what was saved.
         s.save_trust(&t, &ours).unwrap();
         let saved = fs::read(s.dir().join("trust")).unwrap();
         for input in crate::mutate::variants(&saved, 3_000) {
             fs::write(s.dir().join("trust"), &input).unwrap();
-            if let Ok(Some(got)) = s.trust(std::slice::from_ref(&ours))
-                && std::str::from_utf8(&input).is_ok_and(|i| i.contains("\nmac "))
-            {
+            if let Ok(Some(got)) = s.trust(std::slice::from_ref(&ours)) {
                 assert_eq!(got, t, "{}", String::from_utf8_lossy(&input));
             }
         }
