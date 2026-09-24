@@ -390,6 +390,26 @@ impl Remote {
             },
         };
 
+        // Pinned out of band: the only rollback and substitution bound a
+        // first contact has, since there is no local state yet.
+        if let Some(r) = &self.cfg.repo
+            && *r != m.repo_id
+        {
+            bail!(
+                "{} serves repository {}, but enc-repo pins {r}: the host substituted another remote, \
+                 or the URL is wrong. Refusing it",
+                self.backend.url,
+                m.repo_id
+            );
+        }
+        if let Some(g) = self.cfg.min_generation
+            && m.generation < g
+        {
+            bail!(
+                "rollback detected: remote manifest is generation {} but enc-minGeneration requires at least {g}",
+                m.generation
+            );
+        }
         match &trust {
             Some(t) => {
                 if t.repo_id != m.repo_id {
@@ -426,12 +446,17 @@ impl Remote {
                 }
             }
             None if self.cfg.participants.is_some() => info(&format!(
-                "first contact with {}: manifest signed by configured participant {signer}",
-                self.backend.url
+                "first contact with {}: repository {} at generation {}, manifest signed by configured \
+                 participant {signer}{}",
+                self.backend.url,
+                m.repo_id,
+                m.generation,
+                unpinned_hint(&self.cfg)
             )),
             None if self.cfg.trust_on_first_use => info(&format!(
-                "first contact with {}: trusting manifest signed by {signer} (enc.trustOnFirstUse)",
-                self.backend.url
+                "first contact with {}: trusting repository {} at generation {}, manifest signed by \
+                 {signer} (enc.trustOnFirstUse)",
+                self.backend.url, m.repo_id, m.generation
             )),
             None => bail!(
                 "first contact with {}: no participant list to check its signer against. The manifest is \
@@ -1003,6 +1028,16 @@ impl Remote {
             id,
             key: Zeroizing::new(key.to_string().expose_secret().to_owned()),
         }))
+    }
+}
+
+/// On a first contact pinned by participants only, how to pin the rest.
+fn unpinned_hint(cfg: &Config) -> &'static str {
+    if cfg.repo.is_some() && cfg.min_generation.is_some() {
+        ""
+    } else {
+        "; confirm the repository and generation with an admin, or pin them (enc.repo, \
+         enc.minGeneration): without them the host can serve an older manifest or another remote"
     }
 }
 

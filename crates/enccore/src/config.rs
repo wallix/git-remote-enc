@@ -19,6 +19,11 @@ pub struct Config {
     /// Accept whoever signed the manifest on first contact when no
     /// participant list is configured. Off unless set.
     pub trust_on_first_use: bool,
+    /// The repository id the remote must serve, learned out of band.
+    pub repo: Option<String>,
+    /// The lowest manifest generation to accept, learned out of band: bounds
+    /// a rollback on first contact, before there is local state to do it.
+    pub min_generation: Option<u64>,
     /// `index-pack` fsck option for received packs (`--fsck-objects[=…]`),
     /// `None` when disabled.
     pub fsck: Option<String>,
@@ -49,6 +54,14 @@ impl Config {
             None => false,
         };
 
+        let repo = one("repo")?.map(|r| r.trim().to_owned());
+        let min_generation = one("minGeneration")?
+            .map(|v| {
+                v.trim()
+                    .parse()
+                    .with_context(|| format!("enc minGeneration: `{v}` is not a number"))
+            })
+            .transpose()?;
         let fsck = fsck_option()?;
         let participants = key_list(all("participants")?)?;
         let admins = key_list(all("admins")?)?;
@@ -59,6 +72,8 @@ impl Config {
             participants,
             admins,
             trust_on_first_use,
+            repo,
+            min_generation,
             fsck,
         })
     }

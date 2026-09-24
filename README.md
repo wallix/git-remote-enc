@@ -58,6 +58,8 @@ The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 | `remote.<name>.enc-participants` / `enc.participants` (repeatable) | one public key per value, or `@<file>` in `authorized_keys` format. Required to create a remote; on first contact with an existing one, its signer must be listed; on an existing remote a push never changes the list: `git-remote-enc participants --apply <remote>` does, after showing the difference |
 | `remote.<name>.enc-admins` / `enc.admins` (repeatable) | the participants allowed to change the participant and admin lists, same syntax. Default for a new remote: its creator; applied to an existing one by `git-remote-enc participants --apply` |
 | `remote.<name>.enc-trustOnFirstUse` / `enc.trustOnFirstUse` | `true` accepts whoever signed an unknown remote when no participant list is set. Default `false` |
+| `remote.<name>.enc-repo` / `enc.repo` | the repository id the remote must serve (the manifest's `repo` line) |
+| `remote.<name>.enc-minGeneration` / `enc.minGeneration` | the lowest manifest generation to accept |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
 
@@ -71,6 +73,17 @@ git -c enc.participants="ssh-ed25519 AAAA… alice" clone enc::git@gitlab.exampl
 
 Without it the clone is refused and the error prints the signer's fingerprint
 to confirm; `-c enc.trustOnFirstUse=true` accepts it unverified.
+
+A pinned key alone still lets the host serve an older manifest that key
+signed (one from before a participant was removed, say) or another remote the
+same person signed. An established clone refuses both; a new one needs the
+repository id and current generation too, from the `repo` and `generation`
+lines of `git-remote-enc manifest <remote>`:
+
+```bash
+git -c enc.participants="ssh-ed25519 AAAA… alice" -c enc.repo=3f9c6e4d… -c enc.minGeneration=42 \
+  clone enc::git@gitlab.example.com:team/vault.git
+```
 
 Inspect the decrypted manifest of a remote from inside a repository:
 
