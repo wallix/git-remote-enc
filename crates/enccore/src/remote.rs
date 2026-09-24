@@ -186,6 +186,9 @@ impl Remote {
             tracking_ref: state.tracking_ref.clone(),
         };
         let name = name.filter(|n| *n != url && !n.starts_with("enc::"));
+        if let Some(n) = name {
+            refuse_plain_push_url(n)?;
+        }
         Ok(Self {
             label: name.map_or_else(|| format!("enc::{url}"), str::to_owned),
             cfg: Config::load(name)?,
@@ -1044,6 +1047,63 @@ impl Remote {
             key: Zeroizing::new(key.to_string().expose_secret().to_owned()),
         }))
     }
+}
+
+/// git picks the transport from the push URL, so a `pushurl` or a
+/// `pushInsteadOf` rule that leads away from `enc::` sends pushes to that
+/// remote in clear without ever running the helper. Its fetches still run
+/// it, and so does the pre-push guard; both refuse such a remote.
+fn refuse_plain_push_url(name: &str) -> Result<()> {
+    let Some(url) = git::config(&format!("remote.{name}.url"))? else {
+        return Ok(());
+    };
+    for push_url in push_urls(name, &url)? {
+        if !push_url.starts_with("enc::") {
+            bail!(
+                "remote {name} is encrypted ({url}) but git would push to it in clear, to {push_url}, \
+                 because of remote.{name}.pushurl or a url.<base>.pushInsteadOf / insteadOf rule. \
+                 Refusing to use it until that configuration is removed"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The URLs `git push <name>` would push to, as git rewrites them.
+fn push_urls(name: &str, url: &str) -> Result<Vec<String>> {
+    let rules = |var: &str| -> Result<Vec<(String, String)>> {
+        let suffix = format!(".{var}");
+        Ok(git::config_regexp(&format!(r"^url\..*\.{var}$"))?
+            .into_iter()
+            .filter_map(|(key, prefix)| {
+                key.strip_prefix("url.")
+                    .and_then(|k| k.strip_suffix(&suffix))
+                    .map(|base| (base.to_owned(), prefix))
+            })
+            .collect())
+    };
+    // The longest matching prefix wins, as in git.
+    let rewrite = |url: &str, rules: &[(String, String)]| -> Option<String> {
+        rules
+            .iter()
+            .filter(|(_, prefix)| url.starts_with(prefix.as_str()))
+            .max_by_key(|(_, prefix)| prefix.len())
+            .map(|(base, prefix)| format!("{base}{}", url.get(prefix.len()..).unwrap_or("")))
+    };
+    let instead_of = rules("insteadof")?;
+    let explicit = git::config_all(&format!("remote.{name}.pushurl"))?;
+    if !explicit.is_empty() {
+        return Ok(explicit
+            .iter()
+            .map(|u| rewrite(u, &instead_of).unwrap_or_else(|| u.clone()))
+            .collect());
+    }
+    let push_instead_of = rules("pushinsteadof")?;
+    Ok(vec![
+        rewrite(url, &push_instead_of)
+            .or_else(|| rewrite(url, &instead_of))
+            .unwrap_or_else(|| url.to_owned()),
+    ])
 }
 
 /// Where Git LFS would run on pre-push: a hook file (under `core.hooksPath`

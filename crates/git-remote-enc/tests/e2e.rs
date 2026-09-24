@@ -1365,3 +1365,68 @@ fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("git-remote-enc pre-push"));
 }
+
+#[test]
+fn plain_push_urls_of_encrypted_remotes_are_refused() {
+    let sb = Sandbox::new("pushurl");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let out = sb
+        .cmd(&a, "git-remote-enc")
+        .arg("install-hook")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plain = sb.dir("plain.git");
+    sb.git_ok(&plain, &["init", "-q", "--bare"]);
+    let plain_has_main = || {
+        !sb.git(&plain, &["rev-parse", "-q", "--verify", "refs/heads/main"])
+            .stdout
+            .is_empty()
+    };
+    sb.commit_text(&a, "fix", "f\n");
+
+    // A push URL that is not enc:: never runs the helper on push.
+    sb.git_ok(
+        &a,
+        &[
+            "remote",
+            "set-url",
+            "--push",
+            "enc",
+            plain.to_str().unwrap(),
+        ],
+    );
+    let err = sb.git_fails(&a, &["fetch", "enc"]);
+    assert!(err.contains("would push to it in clear"), "{err}");
+    let err = sb.git_fails(&a, &["push", "enc", "main"]);
+    assert!(err.contains("reroutes it"), "{err}");
+    assert!(!plain_has_main());
+
+    // Same with a pushInsteadOf rule, typically in the global config.
+    sb.git_ok(&a, &["config", "--unset", "remote.enc.pushurl"]);
+    sb.git_ok(&a, &["fetch", "-q", "enc"]);
+    sb.git_ok(
+        &a,
+        &[
+            "config",
+            "--global",
+            &format!("url.{}.pushInsteadOf", plain.display()),
+            &url,
+        ],
+    );
+    let err = sb.git_fails(&a, &["fetch", "enc"]);
+    assert!(err.contains("would push to it in clear"), "{err}");
+    let err = sb.git_fails(&a, &["push", "enc", "main"]);
+    assert!(err.contains("reroutes it"), "{err}");
+    assert!(!plain_has_main());
+}
