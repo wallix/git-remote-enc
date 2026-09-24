@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- A manifest over 64 MiB is refused before it is read, so the host cannot
+  exhaust a client's memory with one.
+
 - A manifest whose generation runs ahead of the remote's history is refused,
   so a participant can no longer freeze a remote by pushing the largest
   possible generation.

@@ -159,6 +159,10 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 Pack lines are ordered: a pack may be *thin* relative to every pack before it,
 so a reader indexes them in manifest order (section 5.2).
 
+A reader holds the manifest in memory to decrypt and verify it, before it
+can tell who wrote it, so it refuses a manifest blob over 64 MiB (about
+450,000 pushes' worth of pack lines) without reading it.
+
 Version 1 had no `admin` item. The first push by a version 2 writer rewrites a
 version 1 manifest as version 2 with an empty admin list, which older binaries
 then refuse to read: every participant must upgrade.
@@ -569,6 +573,7 @@ through the helper at all (5.1).
 | Git LFS uploads tracked files in clear alongside a push | a push is refused while LFS holds files locally and any pre-push hook but the guard exists (5.1) | `enc-allowLfs` with LFS still pointed at the forge; LFS storage outside the places checked |
 | Plaintext leaks through the developer's workflow | a pre-push hook, installed on first contact refuses to push content of an encrypted remote (shared objects, or a cherry-picked change by patch id) to any other remote (6.7) | clones where it could not be installed (an existing hook, `core.hooksPath`) or was turned off, `--no-verify`, content not yet tied to an encrypted ref, a fix rewritten by hand or squashed with other edits onto a diverged base; the decrypted objects live in the local `$GIT_DIR` (5.4): use a dedicated clone, disk encryption, and delete the clone when done |
 | A malicious or compromised build | reproducible builds from pinned inputs, SHA-pinned actions, Sigstore-signed provenance and an SBOM per release, `cargo audit` and `cargo deny` in CI | the build image runs Nix with `sandbox = false`; dependencies include a pre-release crate (`kem`) and an unfixed but unreachable one (`rsa`, RUSTSEC-2023-0071) |
+| The host exhausts a client's memory with a huge manifest | manifest blobs over 64 MiB are refused before being read (4.2) | pack blobs are streamed, but the backend fetch itself is unbounded, as with any git fetch |
 | A parser bug on untrusted input | Rust with panics denied by lint; the signature is checked before parsing when a signer list is known; mutation tests of every parser (section 10) | no coverage-guided fuzzing; trust on first use parses unauthenticated text |
 | Traffic analysis | none (non-goal, section 1) | the host sees who pushes and fetches, when, and how much |
 

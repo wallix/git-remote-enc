@@ -1617,3 +1617,47 @@ fn a_generation_jump_past_the_history_is_refused() {
     sb.commit_text(&a, "two", "2\n");
     sb.git_ok(&a, &["push", "-q", "enc", "main"]);
 }
+
+#[test]
+fn an_oversized_manifest_is_not_read() {
+    let sb = Sandbox::new("bigmanifest");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    // The host swaps in a manifest blob larger than any real one.
+    let big = sb.dir("big").join("manifest");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len((64 << 20) + 1)
+        .unwrap();
+    let oid = sb.git_ok(&host, &["hash-object", "-w", big.to_str().unwrap()]);
+    let tree = sb.dir("big").join("tree");
+    fs::write(&tree, format!("100644 blob {}\tmanifest\n", oid.trim())).unwrap();
+    let out = sb
+        .cmd(&host, "git")
+        .arg("mktree")
+        .stdin(fs::File::open(&tree).unwrap())
+        .output()
+        .unwrap();
+    let tree = String::from_utf8(out.stdout).unwrap();
+    let commit = sb.git_ok(
+        &host,
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            "refs/heads/enc",
+            "-m",
+            "enc",
+        ],
+    );
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", commit.trim()]);
+
+    let err = sb.git_fails(&a, &["fetch", "enc"]);
+    assert!(err.contains("over the 67108864-byte limit"), "{err}");
+}
