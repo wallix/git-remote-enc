@@ -153,7 +153,7 @@ impl State {
         for a in &t.admins {
             text.push_str(&format!("admin {a}\n"));
         }
-        let tag = key.tag(text.as_bytes());
+        let tag = key.tag(text.as_bytes())?;
         text.push_str(&format!("{MAC_ITEM} {} {tag}\n", key.id));
         let tmp = self.temp_path("trust");
         fs::write(&tmp, text).context("writing trust file")?;
