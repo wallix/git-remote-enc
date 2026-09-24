@@ -249,12 +249,20 @@ ignores the individual wants and downloads every pack it has not indexed yet:
 1. For each `pack` line in manifest order not present in the local `have`
    list: `git cat-file blob <blob oid>` (already in the local object store
    from the branch fetch) → age decrypt with the pack key → `git index-pack
-   --stdin --fix-thin` → append to `have`.
+   --stdin --fix-thin --fsck-objects` → append to `have`.
 2. The SHA-256 of the ciphertext is checked against the pack name while
    streaming; a mismatch fails the fetch.
 
 Order matters because `--fix-thin` completes a thin pack with base objects
 that must already be present.
+
+The packs reach the object store through `index-pack` run by the helper, not
+through `git fetch`, which would otherwise be the one to check them. The
+helper therefore checks every object as `fetch.fsckObjects` would (a tree
+entry named `.git`, malformed objects), and does so by default, unlike git:
+content from a remote everyone trusts is where a hostile object does the most
+harm. `fetch.fsck.<msg-id>` severities and `fetch.fsck.skipList` apply;
+`fetch.fsckObjects = false` (or `transfer.fsckObjects = false`) turns it off.
 
 ### 5.3 List
 
@@ -459,6 +467,7 @@ which a participant learns another's public key.
 | A removed participant reads the past | future pack keys are unknown to them (6.3) | they keep the past history; full revocation is a new remote |
 | A participant's private key is compromised | passphrase on the key; admins remove the key | the whole readable history is exposed, permanently; no hardware or agent-held keys (6.5) |
 | A local attacker rewrites the trust state | HMAC keyed from the user's identity; missing state is refused (5.4, section 9) | whoever can write `.git` can run code through hooks anyway |
+| A participant pushes a hostile git object (a `.git` tree entry) | received objects are fsck-checked by default (5.2) | none with the default; `fetch.fsckObjects = false` disables it |
 | A crafted `enc::` URL runs a command | the URL goes to git after `--`, and a leading `-` is refused | none known |
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
 | Plaintext leaks through the developer's workflow | none in the tool: the decrypted objects live in the local `$GIT_DIR` next to any other remote's (5.4) | pushing an encrypted branch to a plain remote by mistake publishes it; use a dedicated clone, disk encryption, and delete the clone when done |
@@ -494,6 +503,7 @@ which a participant learns another's public key.
 | `remote.<name>.enc-participants`, `enc.participants` (multi) | public keys, one per value, or `@<file>` (authorized_keys-style). Required to create a remote; on first contact with an existing remote, the signer must be one of them; on an existing remote a push never applies it (it warns when it differs); `git-remote-enc participants --apply` does (section 6.3) |
 | `remote.<name>.enc-admins`, `enc.admins` (multi) | like `enc-participants`, for the admin list: the admins of a new remote (default: its creator), or the list `participants --apply` sets (section 6.1) |
 | `remote.<name>.enc-trustOnFirstUse`, `enc.trustOnFirstUse` | boolean, default false. Accept the signer of an unknown remote without a pinned participant list (section 6.1) |
+| `fetch.fsckObjects`, `transfer.fsckObjects`, `fetch.fsck.*` | git's own keys; received objects are checked unless one of the first two is false (section 5.2) |
 
 URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to
 git verbatim, so ssh aliases, `https://token@…`, insteadOf rewrites and

@@ -229,6 +229,24 @@ pub fn config_all(key: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// `(key, value)` for every config entry whose key matches `regexp`; keys
+/// come back lowercased, as git prints them.
+pub fn config_regexp(regexp: &str) -> Result<Vec<(String, String)>> {
+    let (ok, out, _) = run_status(["config", "--get-regexp", regexp])?;
+    if !ok {
+        return Ok(vec![]);
+    }
+    Ok(String::from_utf8(out)
+        .with_context(|| format!("config matching {regexp} is not UTF-8"))?
+        .lines()
+        .filter(|s| !s.is_empty())
+        .map(|l| {
+            let (k, v) = l.split_once(' ').unwrap_or((l, ""));
+            (k.to_owned(), v.to_owned())
+        })
+        .collect())
+}
+
 pub fn set_config(key: &str, value: &str) -> Result<()> {
     run(["config", key, value])?;
     Ok(())

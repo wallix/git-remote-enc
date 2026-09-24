@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::git;
 
@@ -19,6 +19,9 @@ pub struct Config {
     /// Accept whoever signed the manifest on first contact when no
     /// participant list is configured. Off unless set.
     pub trust_on_first_use: bool,
+    /// `index-pack` fsck option for received packs (`--fsck-objects[=…]`),
+    /// `None` when disabled.
+    pub fsck: Option<String>,
 }
 
 impl Config {
@@ -46,6 +49,7 @@ impl Config {
             None => false,
         };
 
+        let fsck = fsck_option()?;
         let participants = key_list(all("participants")?)?;
         let admins = key_list(all("admins")?)?;
 
@@ -55,8 +59,37 @@ impl Config {
             participants,
             admins,
             trust_on_first_use,
+            fsck,
         })
     }
+}
+
+/// Packs from an encrypted remote bypass the checks git applies on fetch,
+/// so the helper runs them itself: on unless `fetch.fsckObjects` (else
+/// `transfer.fsckObjects`) is explicitly false, with git's `fetch.fsck.*`
+/// severities and skip list.
+fn fsck_option() -> Result<Option<String>> {
+    for key in ["fetch.fsckObjects", "transfer.fsckObjects"] {
+        if let Some(v) = git::config(key)? {
+            if !parse_bool(&v).with_context(|| format!("{key}: `{v}` is not a boolean"))? {
+                return Ok(None);
+            }
+            break;
+        }
+    }
+    let mut msgs = Vec::new();
+    for (key, value) in git::config_regexp(r"^fetch\.fsck\.")? {
+        let id = key.strip_prefix("fetch.fsck.").unwrap_or(&key);
+        if id.contains([',', '=']) || value.contains(',') {
+            bail!("{key}: `{value}` cannot be passed on to git index-pack");
+        }
+        msgs.push(format!("{id}={value}"));
+    }
+    Ok(Some(if msgs.is_empty() {
+        "--fsck-objects".to_owned()
+    } else {
+        format!("--fsck-objects={}", msgs.join(","))
+    }))
 }
 
 /// `user.signingkey` when git itself signs with SSH, else `~/.ssh/id_ed25519`.
