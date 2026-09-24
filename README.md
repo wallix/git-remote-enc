@@ -95,7 +95,9 @@ by default whoever created the remote) can apply a change.
 
 `git-remote-enc log <remote>` prints the audit trail: for every generation of
 the manifest, who signed it, when (Unix time, by the pusher's clock) and which
-refs, participants and admins it changed.
+refs, participants and admins it changed. The host can drop past
+generations by rewriting the backend branch; `log` flags the missing ones, and
+a fetch warns once when it sees the rewrite.
 
 `git-remote-enc forget <remote>` drops the local trust state of a remote, which
 the helper otherwise refuses to discard when the remote was recreated,

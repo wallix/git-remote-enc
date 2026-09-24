@@ -1066,3 +1066,50 @@ fn rollback_and_recreation_are_refused() {
         "{err}"
     );
 }
+
+#[test]
+fn rewritten_backend_history_is_reported() {
+    let sb = Sandbox::new("rewrite");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for n in ["one", "two", "three"] {
+        sb.commit_text(&a, n, "x\n");
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    let b = sb.clone("bob", &url, &alice);
+
+    // The host squashes the three generations into one parentless commit
+    // carrying the same tree: the manifest itself is still the latest.
+    let tree = sb.git_ok(&host, &["rev-parse", "refs/heads/enc^{tree}"]);
+    let root = sb.git_ok(&host, &["commit-tree", tree.trim(), "-m", "enc"]);
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", root.trim()]);
+
+    let out = sb.git(&b, &["fetch", "origin"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("was rewritten"), "{err}");
+
+    let out = sb
+        .cmd(&b, "git-remote-enc")
+        .args(["log", "origin"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{log}");
+    assert!(log.starts_with("generation 3 ("), "{log}");
+    assert!(
+        log.contains("  changes relative to an empty remote\n"),
+        "{log}"
+    );
+    assert!(
+        log.contains("generations 1 to 2 are missing from the backend history"),
+        "{log}"
+    );
+
+    // Only the first fetch after the rewrite warns; `log` keeps saying so.
+    let out = sb.git(&b, &["fetch", "origin"]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("was rewritten"));
+}

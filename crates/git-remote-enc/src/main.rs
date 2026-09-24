@@ -131,10 +131,20 @@ fn log(remote: &mut Remote) -> Result<()> {
                 refs,
                 participants,
                 admins,
+                base,
             } => {
                 let time = time.map_or_else(|| "time unknown".to_owned(), |t| format!("time {t}"));
                 println!("generation {generation} ({time}, backend commit {commit})");
                 println!("  signed by {signer}");
+                // Changes relative to anything but the generation just before
+                // would credit this signer with what earlier ones did.
+                match base {
+                    Some(b) if Some(b) != generation.checked_sub(1) => {
+                        println!("  changes relative to generation {b}");
+                    }
+                    None if generation != 1 => println!("  changes relative to an empty remote"),
+                    _ => {}
+                }
                 for r in refs {
                     println!("  ref {r}");
                 }
@@ -152,6 +162,15 @@ fn log(remote: &mut Remote) -> Result<()> {
             HistoryEntry::Unreadable { commit, reason } => {
                 println!("backend commit {commit}: not readable ({reason})");
             }
+            HistoryEntry::Discontinuity { expected, found } if found > expected => {
+                let last = found.saturating_sub(1);
+                println!(
+                    "warning: generations {expected} to {last} are missing from the backend history: the host rewrote it"
+                );
+            }
+            HistoryEntry::Discontinuity { expected, found } => println!(
+                "warning: generation {found} where {expected} was expected: the backend history was rewritten"
+            ),
         }
     }
     Ok(())

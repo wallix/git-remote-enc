@@ -99,7 +99,13 @@ pub enum HistoryEntry {
         refs: Vec<String>,
         participants: ParticipantDiff,
         admins: ParticipantDiff,
+        /// The generation the changes are relative to: the previous readable
+        /// manifest's, `None` for an empty remote.
+        base: Option<u64>,
     },
+    /// The backend history skips from `expected` to `found`: generations
+    /// are missing (or repeated), so the host rewrote it.
+    Discontinuity { expected: u64, found: u64 },
     /// Not decryptable with the local identities (a manifest from before
     /// they were added, for instance) or malformed.
     Unreadable { commit: Oid, reason: String },
@@ -254,8 +260,24 @@ impl Remote {
         }
         // The tracking ref is set once a manifest has been accepted; with it
         // present, missing trust state was lost, not never written.
-        let known = git::rev_parse(&self.backend.tracking_ref)?.is_some();
+        let previous_tip = git::rev_parse(&self.backend.tracking_ref)?;
+        let known = previous_tip.is_some();
         self.tip = self.backend.fetch_tip()?;
+        // Every push appends to the backend history; a tip that does not
+        // descend from the one seen before means the host rewrote it, and
+        // the audit trail `log` reads from it is incomplete. The fetch is
+        // forced, so the old tip is still in the object store to compare.
+        if let (Some(old), Some(new)) = (&previous_tip, &self.tip)
+            && old != new
+            && !git::is_ancestor(old, new)?
+        {
+            info(&format!(
+                "warning: the history of branch {} on {} was rewritten (backend commit {old} is no \
+                 longer an ancestor of {new}): the host removed or replaced past manifests, so \
+                 `git-remote-enc log` cannot show them. Check with the other participants",
+                self.backend.branch, self.backend.url
+            ));
+        }
         match self.tip.clone() {
             Some(tip) => {
                 self.tree = Backend::tree_entries(&tip)?;
@@ -496,9 +518,19 @@ impl Remote {
         let commits = String::from_utf8(out).context("rev-list output is not UTF-8")?;
         let mut entries = Vec::new();
         let mut previous: Option<Manifest> = None;
+        // Each push appends one commit and one generation: the commit at
+        // index i carries generation i + 1 unless the host rewrote history.
+        let mut expected: u64 = 1;
         for commit in commits.lines() {
             let entry = match self.read_historical(commit) {
                 Ok((m, signer)) => {
+                    if m.generation != expected {
+                        entries.push(HistoryEntry::Discontinuity {
+                            expected,
+                            found: m.generation,
+                        });
+                    }
+                    expected = m.generation;
                     let e = HistoryEntry::Readable {
                         commit: commit.to_owned(),
                         generation: m.generation,
@@ -520,6 +552,7 @@ impl Remote {
                             previous.as_ref().map_or(&[][..], |p| &p.admins),
                             &m.admins,
                         )?,
+                        base: previous.as_ref().map(|p| p.generation),
                     };
                     previous = Some(m);
                     e
@@ -530,6 +563,7 @@ impl Remote {
                 },
             };
             entries.push(entry);
+            expected = expected.saturating_add(1);
         }
         entries.reverse();
         Ok(entries)

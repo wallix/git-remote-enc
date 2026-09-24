@@ -401,6 +401,16 @@ branch and prints, per generation, the signer, the time, and the ref,
 participant and admin changes. Manifests from before one's own key was added
 are not readable and are listed as such. `time` is self-asserted by the pusher.
 
+The host controls that branch and can rewrite it, e.g. squash past commits
+into one, without touching the current manifest. Two checks surface it:
+connect warns when the new tip does not descend from the tip fetched before
+(the forced fetch leaves the old one in the object store), and `log` reports
+every place where the generations stop following the commits one for one
+(each push adds one commit and one generation), printing which generation a
+manifest's changes are relative to when that is not the one just before. Both
+detect a rewrite; neither restores what it removed. Protecting the branch on
+the host against force pushes, and keeping the host's push log, does.
+
 ### 6.7 Threat model
 
 **Assets.** The repository's contents and history; its ref names and commit
@@ -445,6 +455,7 @@ which a participant learns another's public key.
 | The host deletes or recreates the branch | refused; `forget` needs a human decision (section 9) | availability: protect the branch on the host and keep a mirror; deletion stops work until restored |
 | A participant changes who participates | only admins change the lists; a push never does it implicitly (6.1, 6.3) | a remote from before format 2 has no admins until appointed; admins are fully trusted |
 | A participant rewrites or deletes refs | every change is signed and kept in the backend history (`log`, 6.6) | no per-ref permission: one remote per audience (section 1) |
+| The host rewrites the backend history, erasing the audit trail | a tip that does not descend from the last one seen is reported; `log` flags missing generations (6.6) | the removed manifests are gone unless the branch is protected on the host or mirrored; a first contact after the rewrite gets no warning, only `log`'s |
 | A removed participant reads the past | future pack keys are unknown to them (6.3) | they keep the past history; full revocation is a new remote |
 | A participant's private key is compromised | passphrase on the key; admins remove the key | the whole readable history is exposed, permanently; no hardware or agent-held keys (6.5) |
 | A local attacker rewrites the trust state | HMAC keyed from the user's identity; missing state is refused (5.4, section 9) | whoever can write `.git` can run code through hooks anyway |
