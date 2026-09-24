@@ -1,5 +1,6 @@
 //! Thin wrappers around git plumbing. Every command inherits `GIT_DIR` from
-//! the environment, exactly as git sets it for a remote helper.
+//! the environment, exactly as git sets it for a remote helper, and runs in
+//! the C locale.
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -22,6 +23,9 @@ where
 {
     let mut c = Command::new("git");
     c.args(args);
+    // Some failures are told apart by git's message (a missing remote ref,
+    // a stale lease), which a translated locale would reword.
+    c.env("LC_ALL", "C");
     c
 }
 
