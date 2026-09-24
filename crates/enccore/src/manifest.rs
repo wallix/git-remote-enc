@@ -13,7 +13,7 @@ const HEADER: &str = "enc-manifest";
 pub const REDACTED_KEY: &str = "<redacted>";
 
 /// A pack blob and the age identity that decrypts it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Pack {
     /// Hex SHA-256 of the ciphertext; the blob is stored as `<id>.age`.
     pub id: String,
@@ -24,6 +24,16 @@ pub struct Pack {
 impl Pack {
     pub fn blob_name(&self) -> String {
         format!("{}.age", self.id)
+    }
+}
+
+/// The key stays out of debug output, and so out of logs and panics.
+impl fmt::Debug for Pack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Pack")
+            .field("id", &self.id)
+            .field("key", &REDACTED_KEY)
+            .finish()
     }
 }
 
@@ -282,6 +292,8 @@ mod tests {
         let shown = m.serialize_redacted();
         assert!(!shown.contains("AGE-SECRET-KEY"), "{shown}");
         assert_eq!(shown, SAMPLE.replace("AGE-SECRET-KEY-1X", REDACTED_KEY));
+        let debug = format!("{m:?}");
+        assert!(!debug.contains("AGE-SECRET-KEY"), "{debug}");
     }
 
     #[test]
