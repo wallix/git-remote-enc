@@ -332,6 +332,12 @@ pub fn hash_object(data: &[u8]) -> Result<Oid> {
     )?)
 }
 
+pub fn object_size(oid: &str) -> Result<u64> {
+    run_line(["cat-file", "-s", oid])?
+        .parse()
+        .with_context(|| format!("size of object {oid}"))
+}
+
 pub fn cat_blob(oid: &str) -> Result<Vec<u8>> {
     run(["cat-file", "blob", oid])
 }

@@ -18,6 +18,9 @@ use crate::manifest::{Manifest, Pack, join_envelope, split_envelope};
 use crate::state::{State, Trust};
 
 const MANIFEST_BLOB: &str = "manifest";
+/// The manifest is read into memory before it can be authenticated, and the
+/// host chooses its size. A pack line is ~140 bytes: this is ~450,000 pushes.
+const MAX_MANIFEST_BYTES: u64 = 64 << 20;
 const PUSH_ATTEMPTS: u32 = 3;
 
 /// One `push` line from git: `[+]<src>:<dst>`; an empty `src` deletes.
@@ -362,7 +365,7 @@ impl Remote {
                 )
             })?
             .to_owned();
-        let blob = git::cat_blob(&oid)?;
+        let blob = read_manifest_blob(&oid)?;
         let identities = self.identities()?;
         let envelope = crypto::decrypt_to_vec(identities, &blob)?;
         let (text, sig) =
@@ -745,7 +748,7 @@ impl Remote {
         let oid = Backend::blob_oid(&tree, MANIFEST_BLOB)
             .ok_or_else(|| anyhow!("no manifest"))?
             .to_owned();
-        let blob = git::cat_blob(&oid)?;
+        let blob = read_manifest_blob(&oid)?;
         let envelope = crypto::decrypt_to_vec(self.identities()?, &blob)?;
         let (text, sig) =
             split_envelope(&envelope).ok_or_else(|| anyhow!("manifest is not signed"))?;
@@ -1317,6 +1320,16 @@ fn unpinned_hint(cfg: &Config) -> &'static str {
         "; confirm the repository and generation with an admin, or pin them (enc.repo, \
          enc.minGeneration): without them the host can serve an older manifest or another remote"
     }
+}
+
+fn read_manifest_blob(oid: &str) -> Result<Vec<u8>> {
+    let size = git::object_size(oid)?;
+    if size > MAX_MANIFEST_BYTES {
+        bail!(
+            "the remote's manifest is {size} bytes, over the {MAX_MANIFEST_BYTES}-byte limit; refusing to read it"
+        );
+    }
+    git::cat_blob(oid)
 }
 
 /// Do two key lists name the same keys, comments and order aside?
