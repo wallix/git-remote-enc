@@ -896,7 +896,8 @@ impl Remote {
             (Some(p), true) => p.clone(),
             (None, true) if is_new => bail!(
                 "creating an encrypted remote needs its participants: \
-                 git config --add remote.<name>.enc-participants \"$(cat ~/.ssh/id_ed25519.pub)\""
+                 git config --add remote.<name>.enc-participants \"$(cat ~/.ssh/enc_key.pub)\" \
+                 (a key not registered with any forge, which would identify you: DESIGN.md §6.4)"
             ),
             (None, true) if self.cfg.admins.is_some() => m.participants.clone(),
             (None, true) => bail!(
