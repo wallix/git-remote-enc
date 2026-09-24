@@ -434,11 +434,14 @@ files. ssh-agent cannot be used for decryption: X25519 key agreement is not an
 agent operation. The same SSH key signs; signing therefore also uses the key
 file, not the agent. Hardware-backed keys are not supported in v1.
 
-In memory, the decrypted manifest, every pack key, the key passphrase and the
-key derived for the local trust state are wiped when dropped (`zeroize`); the
-private keys themselves are wiped by age and ssh-key. Pages are not locked
-(`mlock`), so a secret can still reach swap or a core dump while it is live:
-run with encrypted swap and core dumps disabled where that matters.
+In memory, the decrypted manifest, every pack key, the key passphrase, the key
+derived for the local trust state, the identity file as read and the decrypted
+key re-encoded for age are wiped when dropped (`zeroize`); the private keys
+themselves are wiped by age and ssh-key. age's parser keeps a copy of the key
+text while parsing, which it does not wipe. Pack keys are left out of debug
+output. Pages are not locked (`mlock`), so a secret can still reach swap or a
+core dump while it is live: run with encrypted swap and core dumps disabled
+where that matters.
 
 ### 6.6 Audit trail
 

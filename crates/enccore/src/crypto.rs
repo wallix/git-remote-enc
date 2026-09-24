@@ -163,8 +163,11 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 pub fn load_identities(paths: &[PathBuf]) -> Result<Vec<Identity>> {
     let mut out = Vec::new();
     for path in paths {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading identity {}", path.display()))?;
+        // An unencrypted key file is the private key itself.
+        let text = Zeroizing::new(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading identity {}", path.display()))?,
+        );
         if text.contains("BEGIN OPENSSH PRIVATE KEY") {
             out.push(load_ssh_identity(path, &text)?);
         } else {
@@ -195,7 +198,8 @@ fn load_ssh_identity(path: &Path, pem: &str) -> Result<Identity> {
             key.algorithm()
         );
     }
-    // age parses the key itself; hand it the decrypted key re-serialised.
+    // age parses the key itself; hand it the decrypted key re-serialised
+    // (wiped on drop; age's own parsing copy is not).
     let plain = key
         .to_openssh(LineEnding::LF)
         .context("re-encoding SSH key")?;
