@@ -49,8 +49,12 @@ age = { version = "0.12", default-features = false, features = ["ssh"] }
 # same SSH key both decrypts and signs. Pure Rust, musl-static friendly.
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "ecdsa", "encryption", "std"] }
 # SHA-256 names the encrypted packs in the manifest and keys the per-remote
-# local state directory. No stdlib hash.
-sha2 = "0.11"
+# local state directory. No stdlib hash. The 0.10 line is the one age and
+# ssh-key already build on, and the one `hmac` works with.
+sha2 = "0.10"
+# HMAC-SHA256 authenticating the local trust state. Already in the tree
+# through age (HKDF); a MAC is not something to maintain by hand.
+hmac = "0.12"
 # Wiping secrets (pack keys, the decrypted manifest, passphrases, derived
 # keys) from memory when they are dropped. Already in the tree through age
 # and ssh-key, which use it for their own key types.

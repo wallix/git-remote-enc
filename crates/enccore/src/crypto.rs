@@ -60,10 +60,10 @@ impl Identity {
             Identity::Ssh { key, .. } => TrustKey::from_ssh(key),
             Identity::Age { key, .. } => {
                 use age::secrecy::ExposeSecret;
-                Ok(TrustKey::derive(
+                TrustKey::derive(
                     key.to_public().to_string(),
                     key.to_string().expose_secret().as_bytes(),
-                ))
+                )
             }
         }
     }
@@ -90,11 +90,11 @@ impl Drop for TrustKey {
 impl TrustKey {
     const DOMAIN: &'static [u8] = b"git-remote-enc local trust state v1";
 
-    fn derive(id: String, secret: &[u8]) -> Self {
-        Self {
+    fn derive(id: String, secret: &[u8]) -> Result<Self> {
+        Ok(Self {
             id,
-            key: hmac_sha256(secret, Self::DOMAIN),
-        }
+            key: hmac_sha256(secret, Self::DOMAIN)?,
+        })
     }
 
     pub fn from_ssh(key: &PrivateKey) -> Result<Self> {
@@ -102,20 +102,22 @@ impl TrustKey {
             .key_data()
             .ed25519()
             .ok_or_else(|| anyhow!("only ssh-ed25519 keys are supported"))?;
-        Ok(Self::derive(
+        Self::derive(
             key.public_key().fingerprint(HashAlg::Sha256).to_string(),
             pair.private.as_ref(),
-        ))
+        )
     }
 
     /// Hex HMAC-SHA256 tag over `data`.
-    pub fn tag(&self, data: &[u8]) -> String {
-        hex(&hmac_sha256(&self.key, data))
+    pub fn tag(&self, data: &[u8]) -> Result<String> {
+        Ok(hex(&hmac_sha256(&self.key, data)?))
     }
 
     /// Constant-time check of a hex `tag` over `data`.
     pub fn verify(&self, data: &[u8], tag: &str) -> bool {
-        let want = self.tag(data);
+        let Ok(want) = self.tag(data) else {
+            return false;
+        };
         want.len() == tag.len()
             && want
                 .bytes()
@@ -125,36 +127,12 @@ impl TrustKey {
     }
 }
 
-/// HMAC-SHA256 (RFC 2104) over sha2; no HMAC crate matches its version.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    const BLOCK: usize = 64;
-    let mut block = [0u8; BLOCK];
-    if key.len() > BLOCK {
-        for (b, k) in block.iter_mut().zip(Sha256::digest(key)) {
-            *b = k;
-        }
-    } else {
-        for (b, k) in block.iter_mut().zip(key) {
-            *b = *k;
-        }
-    }
-    // The padded blocks are the key, and the inner hash is key-dependent.
-    let pad = |byte: u8| Zeroizing::new(block.map(|b| b ^ byte));
-    let mut inner = Sha256::new()
-        .chain_update(*pad(0x36))
-        .chain_update(data)
-        .finalize();
-    let outer = Sha256::new()
-        .chain_update(*pad(0x5c))
-        .chain_update(inner)
-        .finalize();
-    block.zeroize();
-    inner.zeroize();
-    let mut out = [0u8; 32];
-    for (o, b) in out.iter_mut().zip(outer) {
-        *o = b;
-    }
-    out
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32]> {
+    use hmac::Mac;
+    let mut mac =
+        hmac::Hmac::<Sha256>::new_from_slice(key).map_err(|e| anyhow!("HMAC key: {e}"))?;
+    mac.update(data);
+    Ok(mac.finalize().into_bytes().into())
 }
 
 /// Load every identity in `paths`. Each file is either an OpenSSH private
@@ -621,19 +599,20 @@ mod tests {
     fn hmac_matches_rfc4231() {
         // Test cases 1 and 6 (a key longer than the block size).
         assert_eq!(
-            hex(&hmac_sha256(&[0x0b; 20], b"Hi There")),
+            hex(&hmac_sha256(&[0x0b; 20], b"Hi There").unwrap()),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
         );
         assert_eq!(
             hex(&hmac_sha256(
                 &[0xaa; 131],
                 b"Test Using Larger Than Block-Size Key - Hash Key First"
-            )),
+            )
+            .unwrap()),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
         let (key, _) = keypair();
         let k = TrustKey::from_ssh(&key).unwrap();
-        let tag = k.tag(b"state");
+        let tag = k.tag(b"state").unwrap();
         assert!(k.verify(b"state", &tag));
         assert!(!k.verify(b"statf", &tag));
         assert!(!k.verify(b"state", &tag[1..]));
