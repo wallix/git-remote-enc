@@ -616,7 +616,9 @@ impl Remote {
         let mut cat = Streaming::reader(["cat-file", "blob", blob_oid], None)?;
         let (hashed, digest) = HashReader::new(cat.stdout()?);
         let mut plain = crypto::decrypt_stream(&key, BufReader::new(hashed))?;
-        let mut index = Streaming::writer(["index-pack", "--stdin", "--fix-thin"])?;
+        let mut args = vec!["index-pack", "--stdin", "--fix-thin"];
+        args.extend(self.cfg.fsck.as_deref());
+        let mut index = Streaming::writer(args)?;
         {
             let mut stdin = index.stdin()?;
             io::copy(&mut plain, &mut stdin)

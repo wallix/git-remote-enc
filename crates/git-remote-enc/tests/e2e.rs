@@ -1113,3 +1113,54 @@ fn rewritten_backend_history_is_reported() {
     let out = sb.git(&b, &["fetch", "origin"]);
     assert!(!String::from_utf8_lossy(&out.stderr).contains("was rewritten"));
 }
+
+#[test]
+fn received_objects_are_fscked() {
+    let sb = Sandbox::new("fsck");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+
+    // A tree with a `.git` entry, which a checkout would write into the
+    // repository's own control directory.
+    let mktree = |input: String| {
+        let tmp = sb.dir("fsck-input").join("tree");
+        fs::write(&tmp, input).unwrap();
+        let out = sb
+            .cmd(&a, "git")
+            .arg("mktree")
+            .stdin(fs::File::open(&tmp).unwrap())
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    let blob = sb.git_ok(&a, &["hash-object", "-w", "one"]);
+    let inner = mktree(format!("100644 blob {}\tconfig\n", blob.trim()));
+    let evil = mktree(format!("040000 tree {inner}\t.git\n"));
+    let commit = sb.git_ok(&a, &["commit-tree", &evil, "-m", "attack"]);
+    sb.git_ok(
+        &a,
+        &[
+            "push",
+            "-q",
+            "enc",
+            &format!("{}:refs/heads/attack", commit.trim()),
+        ],
+    );
+
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(err.contains("hasDotgit"), "{err}");
+    assert!(sb.git(&b, &["cat-file", "-e", &evil]).status.code() != Some(0));
+
+    // git's own fetch.fsck.* severities apply.
+    sb.git_ok(
+        &b,
+        &["-c", "fetch.fsck.hasDotgit=ignore", "fetch", "-q", "origin"],
+    );
+    sb.git_ok(&b, &["cat-file", "-e", &evil]);
+}

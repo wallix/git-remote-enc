@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Objects fetched from an encrypted remote are checked like
+  `fetch.fsckObjects` does, and by default: a hostile object such as a tree
+  entry named `.git` is refused. `fetch.fsck.*` settings apply, and
+  `fetch.fsckObjects=false` turns the check off.
+
 - `git-remote-enc log` flags generations missing from the remote's history,
   and a fetch warns when the host rewrote that history, instead of silently
   crediting the next signer with earlier changes.
