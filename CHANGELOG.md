@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A manifest whose generation runs ahead of the remote's history is refused,
+  so a participant can no longer freeze a remote by pushing the largest
+  possible generation.
+
 - Each manifest names the hash of the one before it, and `git-remote-enc log`
   marks every generation it cannot chain to the accepted one as not
   verified, so the host cannot slip forged entries into the audit trail.

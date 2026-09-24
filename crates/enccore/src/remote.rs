@@ -439,6 +439,7 @@ impl Remote {
                 m.generation
             );
         }
+        self.check_generation_jump(&m, trust.as_ref())?;
         match &trust {
             Some(t) => {
                 if t.repo_id != m.repo_id {
@@ -536,9 +537,46 @@ impl Remote {
         // Validate the new lists now so a later push gets a clear error.
         Participant::parse_all(&m.participants).context("manifest participant list")?;
         check_admins(&m.participants, &m.admins).context("manifest admin list")?;
-        self.save_trust(&trust_in(&m, text))?;
+        self.save_trust(&trust_in(&m, text, self.tip.as_deref()))?;
         self.manifest_digest = Some(crypto::sha256_hex(text.as_bytes()));
         Ok(m)
+    }
+
+    /// Each push adds one backend commit and one generation, so a
+    /// generation cannot run ahead of the commits: without this bound a
+    /// participant could push generation 2^64 - 1, after which nobody can
+    /// push again and going back is refused as a rollback. Counted from the
+    /// commit of the accepted manifest when the history still descends from
+    /// it, else, on first contact, from the root.
+    fn check_generation_jump(&self, m: &Manifest, trust: Option<&Trust>) -> Result<()> {
+        let Some(tip) = self.tip.as_deref() else {
+            return Ok(());
+        };
+        let count = |range: &str| -> Result<u64> {
+            git::run_line(["rev-list", "--count", range])?
+                .parse()
+                .context("rev-list --count")
+        };
+        let (base, limit) = match trust {
+            Some(t) => match &t.commit {
+                Some(c) if git::has_object(c)? && git::is_ancestor(c, tip)? => (
+                    t.generation,
+                    t.generation.saturating_add(count(&format!("{c}..{tip}"))?),
+                ),
+                // Older state, or a rewritten history (reported by connect).
+                _ => return Ok(()),
+            },
+            None => (0, count(tip)?),
+        };
+        if m.generation > limit {
+            bail!(
+                "manifest generation {} is more than the backend history allows ({limit}, from generation \
+                 {base} and one per commit since): a participant or the host wrote an invalid manifest. \
+                 Refusing it",
+                m.generation
+            );
+        }
+        Ok(())
     }
 
     // ---- list -------------------------------------------------------------
@@ -1053,7 +1091,7 @@ impl Remote {
                 if let Some(p) = &pack {
                     self.state.add_have(&p.id)?;
                 }
-                self.save_trust(&trust_in(&m, &text))?;
+                self.save_trust(&trust_in(&m, &text, Some(&commit)))?;
                 self.manifest_digest = Some(crypto::sha256_hex(text.as_bytes()));
                 self.tip = Some(commit.clone());
                 self.tree = Backend::tree_entries(&commit)?;
@@ -1311,13 +1349,14 @@ fn verified_signer(allowed: &[String], text: &str, sig: &str) -> Result<String> 
 }
 
 /// The trust state recording `m`, whose signed text is `text`, as accepted.
-fn trust_in(m: &Manifest, text: &str) -> Trust {
+fn trust_in(m: &Manifest, text: &str, commit: Option<&str>) -> Trust {
     Trust {
         generation: m.generation,
         repo_id: m.repo_id.clone(),
         participants: m.participants.clone(),
         admins: m.admins.clone(),
         digest: Some(crypto::sha256_hex(text.as_bytes())),
+        commit: commit.map(str::to_owned),
     }
 }
 

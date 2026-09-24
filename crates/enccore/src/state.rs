@@ -32,6 +32,8 @@ pub struct Trust {
     /// SHA-256 of the accepted manifest text; absent in state written by
     /// older versions.
     pub digest: Option<String>,
+    /// The backend commit that carried it; absent in older state.
+    pub commit: Option<String>,
 }
 
 impl State {
@@ -135,6 +137,9 @@ impl State {
         if let Some(d) = &t.digest {
             text.push_str(&format!("digest {d}\n"));
         }
+        if let Some(c) = &t.commit {
+            text.push_str(&format!("commit {c}\n"));
+        }
         for p in &t.participants {
             text.push_str(&format!("participant {p}\n"));
         }
@@ -212,6 +217,7 @@ fn read_trust(path: &Path, keys: &[TrustKey]) -> Result<Option<Trust>> {
             "generation" => t.generation = rest.trim().parse().context("trust: generation")?,
             "repo" => t.repo_id = rest.trim().to_owned(),
             "digest" => t.digest = Some(rest.trim().to_owned()),
+            "commit" => t.commit = Some(rest.trim().to_owned()),
             "participant" => t.participants.push(rest.trim().to_owned()),
             "admin" => t.admins.push(rest.trim().to_owned()),
             "" => {}
@@ -276,6 +282,7 @@ mod tests {
             participants: vec!["age1x".into()],
             admins: vec![],
             digest: Some("d".into()),
+            commit: Some("c".into()),
         };
 
         s.save_trust(&t, &ours).unwrap();
