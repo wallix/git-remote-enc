@@ -1572,3 +1572,48 @@ fn log_verifies_history_against_the_accepted_manifest() {
         "the forgery named its signer: {log}"
     );
 }
+
+#[test]
+fn a_generation_jump_past_the_history_is_refused() {
+    let sb = Sandbox::new("genjump");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+    let good = sb.git_ok(&host, &["rev-parse", "refs/heads/enc"]);
+
+    // A participant signs a manifest at the last generation there is: once
+    // accepted, no push could ever follow it.
+    sb.forge_manifest(&host, &alice, &[&alice_pub], |text| {
+        text.replace("generation 1\n", &format!("generation {}\n", u64::MAX))
+    });
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(
+        err.contains("more than the backend history allows"),
+        "{err}"
+    );
+    let out = sb.git(
+        &sb.root,
+        &[
+            "-c",
+            &format!("enc.identity={}", alice.display()),
+            "-c",
+            &format!("enc.participants={alice_pub}"),
+            "clone",
+            "-q",
+            &url,
+            "fresh",
+        ],
+    );
+    assert!(!out.status.success());
+
+    // Never accepted, so restoring the branch is not a rollback.
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", good.trim()]);
+    sb.git_ok(&b, &["fetch", "-q", "origin"]);
+    sb.commit_text(&a, "two", "2\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+}

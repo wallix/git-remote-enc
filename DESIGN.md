@@ -298,7 +298,8 @@ every linked worktree, so trust accepted in one worktree holds in all):
   run.
 - `<common>/enc/<key>/have` — pack names already indexed.
 - `<common>/enc/<key>/trust` — the last accepted manifest's `generation`,
-  `repo` id, participant list and the SHA-256 of its text (section 6), ending
+  `repo` id, participant list, the SHA-256 of its text and the backend commit
+  that carried it (section 6), ending
   in `mac <key id> <tag>`: HMAC-SHA256 of the lines above, keyed by
   HMAC-SHA256(identity secret, "git-remote-enc local trust state v1") for the
   first configured identity (`key id` is its public fingerprint or age
@@ -374,6 +375,15 @@ the local state): two validly signed manifests with one generation mean the
 history forked, because the host served different views or rewound the branch
 under a pusher. A pusher always writes `previous + 1`; the lease
 guarantees "previous" is the real tip.
+
+Generations are bounded from above too. Each push adds one backend commit and
+one generation, so a manifest may be at most the accepted generation plus the
+number of commits since the accepted one's (recorded in the local state), or
+on first contact, the number of commits on the branch. Without the bound, a
+participant could sign `generation 18446744073709551615`: every reader would
+accept it, no push could follow it, and restoring the branch would read as a
+rollback. A manifest over the bound is refused, never accepted, so the host
+restoring the branch recovers.
 
 ### 6.3 Adding and removing participants
 
@@ -541,6 +551,7 @@ through the helper at all (5.1).
 | The host or a host reader reads the repository | age encryption of manifest and packs (4.3, 4.4) | the metadata of section 6.4: branch name, sizes, timing, participant count, key tags |
 | The host forges refs or a manifest | a manifest is accepted only when signed by a previously accepted participant (6.1) | none once a manifest has been accepted |
 | The host rolls the branch back | strictly increasing `generation`, checked against local state (6.2), or against `enc-minGeneration` on first contact (6.1) | a host can withhold new pushes from a client that never saw them (freeze); a first contact without `enc-minGeneration` accepts any generation its pinned signer signed |
+| A participant makes the remote unusable for everyone | a generation over the history's bound is refused (6.2); a list change not signed by an admin is refused (6.1) | a refused manifest at the tip blocks every client until the host restores the branch; the host accepts any push |
 | The host serves different views to different clients | a changed manifest for an accepted generation is reported (6.2) | detected only by a client that sees both views |
 | The host substitutes its own remote on first contact | first contact needs a pinned participant list; `enc-repo` pins the repository; repo id lookup across URL spellings (6.1) | `enc.trustOnFirstUse = true` reopens it, by choice, and set in the global config it does so for every remote; without `enc-repo`, another remote signed by a pinned key passes |
 | The host deletes or recreates the branch | refused; `forget` needs a human decision (section 9) | availability: protect the branch on the host and keep a mirror; deletion stops work until restored |
