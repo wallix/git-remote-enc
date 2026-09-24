@@ -4,11 +4,19 @@
 repository — GitLab, GitHub, or any bare repo over ssh.**
 
 ```bash
+ssh-keygen -t ed25519 -f ~/.ssh/enc_vault      # a key for this remote only
 git remote add secret enc::git@gitlab.example.com:team/vault.git
-git config --add remote.secret.enc-participants "$(cat ~/.ssh/id_ed25519.pub)"
+git config remote.secret.enc-identity ~/.ssh/enc_vault
+git config --add remote.secret.enc-participants "$(cat ~/.ssh/enc_vault.pub)"
 git config --add remote.secret.enc-participants "ssh-ed25519 AAAA… alice"
 git push secret main
 ```
+
+Use a key that is not registered with any forge: the host can match the
+ciphertext's recipient stanzas against the public keys forges publish
+(`https://<forge>/<user>.keys`) and learn who participates
+([DESIGN.md §6.4](DESIGN.md#64-what-the-host-learns)). The default identity,
+`~/.ssh/id_ed25519`, is usually such a registered key.
 
 The host stores one branch of opaque blobs. Only the participants listed in the
 signed manifest can read refs, history or the participant list itself. Pushes
