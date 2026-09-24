@@ -272,8 +272,9 @@ ignores the individual wants and downloads every pack it has not indexed yet:
    list: `git cat-file blob <blob oid>` (already in the local object store
    from the branch fetch) → age decrypt with the pack key → `git index-pack
    --stdin --fix-thin --fsck-objects` → append to `have`.
-2. The SHA-256 of the ciphertext is checked against the pack name while
-   streaming; a mismatch fails the fetch.
+2. The SHA-256 of the ciphertext is checked against the pack name first, in
+   a separate read of the blob, so nothing from a mismatching blob reaches
+   the object store; a mismatch fails the fetch.
 
 Order matters because `--fix-thin` completes a thin pack with base objects
 that must already be present.

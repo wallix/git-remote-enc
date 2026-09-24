@@ -790,9 +790,23 @@ impl Remote {
     fn index_pack(&self, pack: &Pack, blob_oid: &str) -> Result<()> {
         let key = age::x25519::Identity::from_str(&pack.key)
             .map_err(|e| anyhow!("pack {}: bad key in manifest: {e}", pack.id))?;
+        // Check the blob against its name before anything reaches the
+        // object store: one extra read of a local object.
         let mut cat = Streaming::reader(["cat-file", "blob", blob_oid], None)?;
-        let (hashed, digest) = HashReader::new(cat.stdout()?);
-        let mut plain = crypto::decrypt_stream(&key, BufReader::new(hashed))?;
+        let (mut hashed, digest) = HashReader::new(cat.stdout()?);
+        io::copy(&mut hashed, &mut io::sink())
+            .with_context(|| format!("reading pack blob {}", pack.id))?;
+        cat.finish()?;
+        let got = crypto::finalize_shared(&digest);
+        if got != pack.id {
+            bail!(
+                "pack blob {} does not match its manifest name (got {got})",
+                pack.id
+            );
+        }
+
+        let mut cat = Streaming::reader(["cat-file", "blob", blob_oid], None)?;
+        let mut plain = crypto::decrypt_stream(&key, BufReader::new(cat.stdout()?))?;
         let mut args = vec!["index-pack", "--stdin", "--fix-thin"];
         args.extend(self.cfg.fsck.as_deref());
         let mut index = Streaming::writer(args)?;
@@ -803,13 +817,6 @@ impl Remote {
         }
         index.finish()?;
         cat.finish()?;
-        let got = crypto::finalize_shared(&digest);
-        if got != pack.id {
-            bail!(
-                "pack blob {} does not match its manifest name (got {got})",
-                pack.id
-            );
-        }
         Ok(())
     }
 
