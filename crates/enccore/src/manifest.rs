@@ -74,6 +74,7 @@ pub enum ParseError {
     NotAManifest,
     UnsupportedVersion(u32),
     Malformed(usize, String),
+    Duplicate(usize, String),
     Missing(&'static str),
 }
 
@@ -85,6 +86,7 @@ impl fmt::Display for ParseError {
                 write!(f, "manifest format {v} is not supported by this binary")
             }
             Self::Malformed(line, item) => write!(f, "malformed manifest line {line}: {item}"),
+            Self::Duplicate(line, item) => write!(f, "manifest line {line} repeats `{item}`"),
             Self::Missing(what) => write!(f, "manifest lacks a `{what}` item"),
         }
     }
@@ -107,6 +109,7 @@ impl Manifest {
 
         let mut m = Manifest::default();
         let mut have_generation = false;
+        let mut seen: Vec<&str> = Vec::new();
         for (idx, line) in lines {
             let lineno = idx.saturating_add(1);
             let line = line.trim_end();
@@ -115,6 +118,13 @@ impl Manifest {
             }
             let malformed = || ParseError::Malformed(lineno, line.to_owned());
             let (item, rest) = line.split_once(' ').unwrap_or((line, ""));
+            // Items that say one thing about the remote say it once.
+            if matches!(item, "generation" | "time" | "previous" | "repo" | "head") {
+                if seen.contains(&item) {
+                    return Err(ParseError::Duplicate(lineno, item.to_owned()));
+                }
+                seen.push(item);
+            }
             match item {
                 "generation" => {
                     m.generation = rest.trim().parse().map_err(|_| malformed())?;
@@ -129,7 +139,13 @@ impl Manifest {
                     m.previous = Some(d.to_owned());
                 }
                 "repo" => m.repo_id = nonempty(rest).ok_or_else(malformed)?.to_owned(),
-                "head" => m.head = Some(nonempty(rest).ok_or_else(malformed)?.to_owned()),
+                "head" => {
+                    let head = nonempty(rest).ok_or_else(malformed)?;
+                    if !is_ref_name(head) {
+                        return Err(malformed());
+                    }
+                    m.head = Some(head.to_owned());
+                }
                 "participant" => m
                     .participants
                     .push(nonempty(rest).ok_or_else(malformed)?.to_owned()),
@@ -138,8 +154,11 @@ impl Manifest {
                     .push(nonempty(rest).ok_or_else(malformed)?.to_owned()),
                 "ref" => {
                     let (oid, name) = rest.split_once(' ').ok_or_else(malformed)?;
-                    if !is_hex(oid) || name.is_empty() || name.contains(' ') {
+                    if !is_hex(oid) || !is_ref_name(name) {
                         return Err(malformed());
+                    }
+                    if m.ref_oid(name).is_some() {
+                        return Err(ParseError::Duplicate(lineno, format!("ref {name}")));
                     }
                     m.refs.push((oid.to_owned(), name.to_owned()));
                 }
@@ -147,6 +166,9 @@ impl Manifest {
                     let (id, key) = rest.split_once(' ').ok_or_else(malformed)?;
                     if id.len() != 64 || !is_hex(id) || key.is_empty() || key.contains(' ') {
                         return Err(malformed());
+                    }
+                    if m.packs.iter().any(|p| p.id == id) {
+                        return Err(ParseError::Duplicate(lineno, format!("pack {id}")));
                     }
                     m.packs.push(Pack {
                         id: id.to_owned(),
@@ -237,6 +259,23 @@ fn nonempty(s: &str) -> Option<&str> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// A full ref name git would accept (`git check-ref-format`), as the
+/// helper hands them back to git: `refs/…`, no empty or dot-led component,
+/// no `..`, `@{`, `.lock` suffix, control or special characters.
+fn is_ref_name(name: &str) -> bool {
+    name.starts_with("refs/")
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.ends_with('/')
+        && !name.ends_with('.')
+        && name
+            .split('/')
+            .all(|c| !c.is_empty() && !c.starts_with('.') && !c.ends_with(".lock"))
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+}
+
 fn is_hex(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -319,6 +358,42 @@ mod tests {
             Manifest::parse("enc-manifest 1\ngeneration 1\nrepo x\nref nothex refs/heads/x\n"),
             Err(ParseError::Malformed(4, _))
         ));
+        // Said twice, or a ref name git would refuse.
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        for (text, want) in [
+            ("generation 1\ngeneration 2\nrepo x\n", "generation"),
+            ("generation 1\nrepo x\nrepo y\n", "repo"),
+            (
+                &*format!("generation 1\nrepo x\nref {oid} refs/heads/a\nref {oid} refs/heads/a\n"),
+                "ref refs/heads/a",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    Manifest::parse(&format!("enc-manifest 2\n{text}")),
+                    Err(ParseError::Duplicate(_, ref item)) if item == want
+                ),
+                "{text}"
+            );
+        }
+        for name in [
+            "main",
+            "refs/heads/a..b",
+            "refs/heads/.hidden",
+            "refs/heads/x.lock",
+            "refs/heads/a@{1}",
+            "refs/heads/a:b",
+            "refs//x",
+            "refs/heads/x/",
+        ] {
+            let text = format!("enc-manifest 2\ngeneration 1\nrepo x\nref {oid} {name}\n");
+            assert!(
+                matches!(Manifest::parse(&text), Err(ParseError::Malformed(4, _))),
+                "{name}"
+            );
+            let text = format!("enc-manifest 2\ngeneration 1\nrepo x\nhead {name}\n");
+            assert!(Manifest::parse(&text).is_err(), "head {name}");
+        }
     }
 
     #[test]

@@ -159,6 +159,11 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 Pack lines are ordered: a pack may be *thin* relative to every pack before it,
 so a reader indexes them in manifest order (section 5.2).
 
+A reader refuses a manifest that repeats `generation`, `time`, `previous`,
+`repo` or `head`, lists one ref name or one pack twice, or names a ref (in
+`ref` or `head`) that `git check-ref-format` would refuse or that does not
+start with `refs/`.
+
 A reader holds the manifest in memory to decrypt and verify it, before it
 can tell who wrote it, so it refuses a manifest blob over 64 MiB (about
 450,000 pushes' worth of pack lines) without reading it.
