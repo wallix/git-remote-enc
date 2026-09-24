@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A push is refused while Git LFS runs on pre-push: LFS would upload the
+  files it tracks, unencrypted, to its own server. `enc.allowLfs=true`
+  overrides it once LFS is neutralized in the clone.
+
 - `enc.repo` and `enc.minGeneration` pin the repository id and the lowest
   generation a first contact accepts, so a new clone cannot be served an
   older manifest or another remote with the same signer. The first-contact

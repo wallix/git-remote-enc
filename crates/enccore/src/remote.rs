@@ -503,6 +503,21 @@ impl Remote {
     /// `(refs, HEAD target)` for the `list` command. `for_push` tolerates a
     /// remote that does not exist yet.
     pub fn list(&mut self, for_push: bool) -> Result<(RefList, Option<String>)> {
+        // git runs the pre-push hook after `list for-push` and before
+        // `push`: refusing here is the last point where nothing has left.
+        if for_push
+            && !self.cfg.allow_lfs
+            && let Some(hook) = lfs_pre_push_hook()?
+        {
+            bail!(
+                "Git LFS is set up to run before this push ({hook}): it would upload every \
+                 LFS-tracked file of the pushed commits, in clear, to the LFS server (lfs.url, \
+                 usually the forge), outside the encrypted remote. Refusing to push. Commit the \
+                 files the fix needs outside LFS, point lfs.url at nothing in this clone's config \
+                 (it overrides .lfsconfig), then set remote.<name>.enc-allowLfs=true; or remove \
+                 the hook"
+            );
+        }
         self.connect()?;
         match &self.manifest {
             Some(m) => {
@@ -1029,6 +1044,25 @@ impl Remote {
             key: Zeroizing::new(key.to_string().expose_secret().to_owned()),
         }))
     }
+}
+
+/// Where Git LFS would run on pre-push: a hook file (under `core.hooksPath`
+/// too) or a config-defined hook that invokes it.
+fn lfs_pre_push_hook() -> Result<Option<String>> {
+    let runs_lfs = |text: &str| text.contains("git lfs") || text.contains("git-lfs");
+    let path = git::hook_path("pre-push")?;
+    match std::fs::read(&path) {
+        Ok(bytes) if runs_lfs(&String::from_utf8_lossy(&bytes)) => {
+            return Ok(Some(path.display().to_string()));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    Ok(git::config_regexp(r"^hook\..*\.command$")?
+        .into_iter()
+        .find(|(_, command)| runs_lfs(command))
+        .map(|(key, _)| key))
 }
 
 /// On a first contact pinned by participants only, how to pin the rest.
