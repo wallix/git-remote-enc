@@ -1489,3 +1489,86 @@ fn plain_push_urls_of_encrypted_remotes_are_refused() {
     assert!(err.contains("reroutes it"), "{err}");
     assert!(!plain_has_main());
 }
+
+#[test]
+fn log_verifies_history_against_the_accepted_manifest() {
+    let sb = Sandbox::new("logchain");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for n in ["one", "two"] {
+        sb.commit_text(&a, n, &format!("{n}\n"));
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    let b = sb.clone("bob", &url, &alice);
+
+    // The host forges a first generation with a key of its own, named after
+    // Alice and encrypted to her, and slides the real tip on top of it.
+    let (mallory, mallory_pub) = sb.keypair("mallory");
+    let impostor = format!(
+        "{} alice",
+        mallory_pub
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let host2 = sb.dir("host2.git");
+    sb.git_ok(&host2, &["init", "-q", "--bare"]);
+    let m = sb.repo("mallory");
+    sb.commit_text(&m, "one", "forged\n");
+    sb.add_remote(
+        &m,
+        &sb.url(&host2, None),
+        &mallory,
+        &[&impostor, &alice_pub],
+    );
+    sb.git_ok(&m, &["push", "-q", "enc", "main"]);
+    sb.git_ok(
+        &host,
+        &[
+            "fetch",
+            "-q",
+            host2.to_str().unwrap(),
+            "refs/heads/enc:refs/forged",
+        ],
+    );
+    let forged_tree = sb.git_ok(&host, &["rev-parse", "refs/forged^{tree}"]);
+    let forged = sb.git_ok(&host, &["commit-tree", forged_tree.trim(), "-m", "enc"]);
+    let tip_tree = sb.git_ok(&host, &["rev-parse", "refs/heads/enc^{tree}"]);
+    let tip = sb.git_ok(
+        &host,
+        &[
+            "commit-tree",
+            tip_tree.trim(),
+            "-p",
+            forged.trim(),
+            "-m",
+            "enc",
+        ],
+    );
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", tip.trim()]);
+
+    sb.git_ok(&b, &["fetch", "-q", "origin"]);
+    let out = sb
+        .cmd(&b, "git-remote-enc")
+        .args(["log", "origin"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{log}");
+    let (newest, oldest) = log.split_once("\ngeneration 1 ").unwrap();
+    assert!(newest.contains(&format!("signed by {alice_pub}")), "{log}");
+    assert!(!newest.contains("  not verified:"), "{log}");
+    assert!(
+        newest.contains("changes relative to generation 1, which is not verified"),
+        "{log}"
+    );
+    assert!(oldest.contains("  not verified:"), "{log}");
+    assert!(
+        oldest.contains("  signed by SHA256:"),
+        "the forgery named its signer: {log}"
+    );
+}
