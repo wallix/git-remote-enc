@@ -47,7 +47,7 @@ age = { version = "0.12", default-features = false, features = ["ssh"] }
 # OpenSSH key parsing (including passphrase-encrypted private keys) and SSH
 # signatures (`ssh-keygen -Y sign` format) for manifest authentication, so the
 # same SSH key both decrypts and signs. Pure Rust, musl-static friendly.
-ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "ecdsa", "encryption", "std"] }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "encryption", "std"] }
 # SHA-256 names the encrypted packs in the manifest and keys the per-remote
 # local state directory. No stdlib hash. The 0.10 line is the one age and
 # ssh-key already build on, and the one `hmac` works with.
