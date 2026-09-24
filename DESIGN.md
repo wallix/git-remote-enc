@@ -613,3 +613,7 @@ flips, insertions, deletions, truncation, duplicated and dropped lines) and
 must return an error or a consistent value, never panic. This stands in for
 coverage-guided fuzzing, which needs a nightly toolchain the pinned one does
 not provide.
+
+## 11. Credits
+
+- Cyrille Mucchietto — security design review
