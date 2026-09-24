@@ -112,6 +112,9 @@ pub enum HistoryEntry {
         /// Whether the manifest `base` names is verified: when it is not,
         /// the changes are relative to what may be a forgery.
         base_verified: bool,
+        /// `time` is earlier than the previous readable manifest's: a
+        /// pusher's clock was wrong, or the time was set on purpose.
+        time_regressed: bool,
     },
     /// The backend history skips from `expected` to `found`: generations
     /// are missing (or repeated), so the host rewrote it.
@@ -686,6 +689,10 @@ impl Remote {
                         base: previous.as_ref().map(|p| p.generation),
                         verified: false,
                         base_verified: true,
+                        time_regressed: matches!(
+                            (previous.as_ref().and_then(|p| p.time), m.time),
+                            (Some(before), Some(now)) if now < before
+                        ),
                     };
                     previous = Some(m);
                     e

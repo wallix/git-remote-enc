@@ -143,10 +143,16 @@ fn log(remote: &mut Remote) -> Result<()> {
                 base,
                 verified,
                 base_verified,
+                time_regressed,
             } => {
                 let time = time.map_or_else(|| "time unknown".to_owned(), |t| format!("time {t}"));
                 println!("generation {generation} ({time}, backend commit {commit})");
                 println!("  signed by {signer}");
+                if time_regressed {
+                    println!(
+                        "  time earlier than the generation before: pushers set their own time"
+                    );
+                }
                 if !verified {
                     println!(
                         "  not verified: not chained to the accepted manifest, so anyone with write \

@@ -466,7 +466,10 @@ its signer through its signature and carries its `time`, and the backend
 branch keeps every past manifest. `git-remote-enc log <remote>` walks the
 branch and prints, per generation, the signer, the time, and the ref,
 participant and admin changes. Manifests from before one's own key was added
-are not readable and are listed as such. `time` is self-asserted by the pusher.
+are not readable and are listed as such. `time` is self-asserted by the pusher:
+nothing on the host or in the format can vouch for it, and `log` only flags a
+time earlier than the generation before. The host's own push log, where it
+keeps one, is the independent clock.
 
 The host controls that branch and can rewrite it, e.g. squash past commits
 into one, without touching the current manifest. Two checks surface it:
