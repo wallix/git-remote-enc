@@ -141,6 +141,19 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Result<[u8; 32]> {
 pub fn load_identities(paths: &[PathBuf]) -> Result<Vec<Identity>> {
     let mut out = Vec::new();
     for path in paths {
+        // As ssh does: a key others can read is not private any more.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("reading identity {}", path.display()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            bail!(
+                "identity {} is accessible by others (mode {:o}); `chmod 600` it",
+                path.display(),
+                mode & 0o777
+            );
+        }
         // An unencrypted key file is the private key itself.
         let text = Zeroizing::new(
             std::fs::read_to_string(path)
@@ -558,6 +571,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("id");
         std::fs::write(&path, pem.as_bytes()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = load_identities(std::slice::from_ref(&path))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("accessible by others"), "{err}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let ids = load_identities(&[path]).unwrap();
         let ct = encrypt_to_participants(&[participant], b"secret", Vec::new()).unwrap();
         assert_eq!(*decrypt_to_vec(&ids, &ct).unwrap(), b"secret");

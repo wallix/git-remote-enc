@@ -445,7 +445,9 @@ Identities are OpenSSH private keys (`ssh-ed25519`; passphrase
 protected keys are decrypted with a prompt on `/dev/tty`) or age identity
 files. ssh-agent cannot be used for decryption: X25519 key agreement is not an
 agent operation. The same SSH key signs; signing therefore also uses the key
-file, not the agent. Hardware-backed keys are not supported in v1.
+file, not the agent. Hardware-backed keys (age plugins, FIDO) are not
+supported in v1. As with ssh, an identity file that its group or others can
+access is refused.
 
 In memory, the decrypted manifest, every pack key, the key passphrase, the
 key derived for the local trust state, the identity file as read and the

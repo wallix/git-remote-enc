@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Breaking: an identity file readable or writable by its group or others is
+  refused, as ssh does; `chmod 600` it.
+
 - The local state directories under `.git/enc/` are readable by their owner
   only.
 
