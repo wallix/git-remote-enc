@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `enc.repo` and `enc.minGeneration` pin the repository id and the lowest
+  generation a first contact accepts, so a new clone cannot be served an
+  older manifest or another remote with the same signer. The first-contact
+  message prints both values.
+
 - Objects fetched from an encrypted remote are checked like
   `fetch.fsckObjects` does, and by default: a hostile object such as a tree
   entry named `.git` is refused. `fetch.fsck.*` settings apply, and

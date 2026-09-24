@@ -313,6 +313,15 @@ Without a pinned list, whoever controls the host on first contact chooses what
 the new clone trusts: they cannot read an existing remote, but they can serve
 a fabricated one, and anything pushed to it lands in a history they control.
 
+A pinned list is not enough on its own: the host can still serve any manifest
+a pinned key ever signed, an old generation of this remote (from before a
+participant was removed, so the new clone re-encrypts to them) or another
+remote with the same signer. `enc-repo` pins the `repo` id and
+`enc-minGeneration` a floor for `generation`, both learned out of band with
+the key; a manifest that does not match is refused, on first contact and
+after. The first-contact message prints both values, and says when they were
+not pinned.
+
 After acceptance the participant list is stored locally, so:
 
 - an admin of the accepted manifest may add or remove participants (including
@@ -451,15 +460,16 @@ The host is trusted for availability only: not to read, not to change what
 it stores, not to serve the same view to everyone. The participant's machine
 is trusted with everything: private keys, plaintext objects and the local
 trust state. The first contact relies on a channel outside both, through
-which a participant learns another's public key.
+which a participant learns another's public key (and, to bound a rollback or
+substitution, the repository id and generation).
 
 | Threat | Mitigation | Residual risk |
 |---|---|---|
 | The host or a host reader reads the repository | age encryption of manifest and packs (4.3, 4.4) | the metadata of section 6.4: branch name, sizes, timing, participant count, key tags |
 | The host forges refs or a manifest | a manifest is accepted only when signed by a previously accepted participant (6.1) | none once a manifest has been accepted |
-| The host rolls the branch back | strictly increasing `generation`, checked against local state (6.2) | a host can withhold new pushes from a client that never saw them (freeze) |
+| The host rolls the branch back | strictly increasing `generation`, checked against local state (6.2), or against `enc-minGeneration` on first contact (6.1) | a host can withhold new pushes from a client that never saw them (freeze); a first contact without `enc-minGeneration` accepts any generation its pinned signer signed |
 | The host serves different views to different clients | a changed manifest for an accepted generation is reported (6.2) | detected only by a client that sees both views |
-| The host substitutes its own remote on first contact | first contact needs a pinned participant list; repo id lookup across URL spellings (6.1) | `enc.trustOnFirstUse = true` reopens it, by choice |
+| The host substitutes its own remote on first contact | first contact needs a pinned participant list; `enc-repo` pins the repository; repo id lookup across URL spellings (6.1) | `enc.trustOnFirstUse = true` reopens it, by choice, and set in the global config it does so for every remote; without `enc-repo`, another remote signed by a pinned key passes |
 | The host deletes or recreates the branch | refused; `forget` needs a human decision (section 9) | availability: protect the branch on the host and keep a mirror; deletion stops work until restored |
 | A participant changes who participates | only admins change the lists; a push never does it implicitly (6.1, 6.3) | a remote from before format 2 has no admins until appointed; admins are fully trusted |
 | A participant rewrites or deletes refs | every change is signed and kept in the backend history (`log`, 6.6) | no per-ref permission: one remote per audience (section 1) |
@@ -503,6 +513,8 @@ which a participant learns another's public key.
 | `remote.<name>.enc-participants`, `enc.participants` (multi) | public keys, one per value, or `@<file>` (authorized_keys-style). Required to create a remote; on first contact with an existing remote, the signer must be one of them; on an existing remote a push never applies it (it warns when it differs); `git-remote-enc participants --apply` does (section 6.3) |
 | `remote.<name>.enc-admins`, `enc.admins` (multi) | like `enc-participants`, for the admin list: the admins of a new remote (default: its creator), or the list `participants --apply` sets (section 6.1) |
 | `remote.<name>.enc-trustOnFirstUse`, `enc.trustOnFirstUse` | boolean, default false. Accept the signer of an unknown remote without a pinned participant list (section 6.1) |
+| `remote.<name>.enc-repo`, `enc.repo` | the `repo` id the remote must serve (section 6.1) |
+| `remote.<name>.enc-minGeneration`, `enc.minGeneration` | the lowest `generation` accepted (section 6.1) |
 | `fetch.fsckObjects`, `transfer.fsckObjects`, `fetch.fsck.*` | git's own keys; received objects are checked unless one of the first two is false (section 5.2) |
 
 URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to
@@ -545,7 +557,9 @@ ed25519 keys:
 - concurrent push: a stale lease is retried and no pack is lost;
 - a key that is not a participant cannot read; a `age1…` reader can read but
   cannot push; a manifest signed by a non-participant is rejected;
-- rollback of the backend branch to an older tip is refused;
+- rollback of the backend branch to an older tip is refused, and so is an
+  older or substituted manifest on a first contact pinned with `enc-repo` and
+  `enc-minGeneration`;
 - a backend history rewritten by the host is reported by fetch and `log`;
 - a tampered trust file, with or without its tag line, is refused;
 - a hostile object (a `.git` tree entry) is refused on fetch.

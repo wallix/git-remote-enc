@@ -1164,3 +1164,81 @@ fn received_objects_are_fscked() {
     );
     sb.git_ok(&b, &["cat-file", "-e", &evil]);
 }
+
+#[test]
+fn first_contact_can_pin_repository_and_generation() {
+    let sb = Sandbox::new("pinrepo");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let gen1 = sb.git_ok(&host, &["rev-parse", "refs/heads/enc"]);
+    sb.commit_text(&a, "two", "2\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    // What an admin hands out with their key.
+    let out = sb
+        .cmd(&a, "git-remote-enc")
+        .args(["manifest", "enc"])
+        .output()
+        .unwrap();
+    let manifest = String::from_utf8(out.stdout).unwrap();
+    let repo = manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("repo "))
+        .unwrap()
+        .to_owned();
+
+    let clone = |name: &str, pins: &[String]| {
+        let mut args = vec![
+            "-c".to_owned(),
+            format!("enc.identity={}", alice.display()),
+            "-c".to_owned(),
+            format!("enc.participants={alice_pub}"),
+        ];
+        for p in pins {
+            args.extend(["-c".to_owned(), p.clone()]);
+        }
+        args.extend(["clone", "-q", &url, name].map(str::to_owned));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        sb.git(&sb.root, &args)
+    };
+    let pins = |repo: &str, generation: u64| {
+        [
+            format!("enc.repo={repo}"),
+            format!("enc.minGeneration={generation}"),
+        ]
+    };
+
+    // The host serves the older, validly signed generation to a new clone.
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", gen1.trim()]);
+    let out = clone("participants-only", &[]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains(&format!("repository {repo} at generation 1"))
+            && err.contains("enc.minGeneration"),
+        "{err}"
+    );
+    let out = clone("floor", &pins(&repo, 2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("enc-minGeneration requires at least 2"),
+        "{err}"
+    );
+
+    // Another remote the same admin signed, substituted by the host.
+    let out = clone("other-repo", &pins("0123456789abcdef0123456789abcdef", 1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("enc-repo pins"), "{err}");
+
+    let out = clone("pinned", &pins(&repo, 1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("enc.minGeneration"), "{err}");
+}
