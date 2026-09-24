@@ -120,6 +120,9 @@ impl Sandbox {
         let dir = self.dir("keys");
         let path = dir.join(name);
         fs::write(&path, key.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        fs::set_permissions(&path, perms).unwrap();
         let public = format!("{} {name}", key.public_key().to_openssh().unwrap());
         (path, public)
     }
@@ -580,6 +583,9 @@ fn access_control() {
         use age::secrecy::ExposeSecret;
         let mut f = fs::File::create(&reader_path).unwrap();
         writeln!(f, "{}", reader.to_string().expose_secret()).unwrap();
+        let mut perms = f.metadata().unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        f.set_permissions(perms).unwrap();
     }
 
     let a = sb.repo("alice");
