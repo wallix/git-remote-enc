@@ -24,6 +24,8 @@ pub struct Config {
     /// The lowest manifest generation to accept, learned out of band: bounds
     /// a rollback on first contact, before there is local state to do it.
     pub min_generation: Option<u64>,
+    /// Install the pre-push guard on first contact.
+    pub install_hook: bool,
     /// Push even though Git LFS would upload files in clear alongside.
     pub allow_lfs: bool,
     /// `index-pack` fsck option for received packs (`--fsck-objects[=…]`),
@@ -56,6 +58,11 @@ impl Config {
             None => false,
         };
 
+        let install_hook = match one("installHook")? {
+            Some(v) => parse_bool(&v)
+                .with_context(|| format!("enc installHook: `{v}` is not a boolean"))?,
+            None => true,
+        };
         let allow_lfs = match one("allowLfs")? {
             Some(v) => {
                 parse_bool(&v).with_context(|| format!("enc allowLfs: `{v}` is not a boolean"))?
@@ -82,6 +89,7 @@ impl Config {
             trust_on_first_use,
             repo,
             min_generation,
+            install_hook,
             allow_lfs,
             fsck,
         })

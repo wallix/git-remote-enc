@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The pre-push guard is installed on the first clone of, or push to, an
+  encrypted remote, unless a pre-push hook already exists or
+  `enc.installHook=false`.
+
 - An encrypted remote whose pushes git would send in clear, because of a
   `pushurl` or a `pushInsteadOf` rule, is refused: the pre-push guard stops
   the push, and fetches from it fail until the configuration is fixed.

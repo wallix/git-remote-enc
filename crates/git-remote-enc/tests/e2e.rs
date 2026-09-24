@@ -1401,16 +1401,28 @@ fn plain_push_urls_of_encrypted_remotes_are_refused() {
     sb.commit_text(&a, "one", "1\n");
     sb.add_remote(&a, &url, &alice, &[&alice_pub]);
     sb.git_ok(&a, &["push", "-q", "enc", "main"]);
-    let out = sb
-        .cmd(&a, "git-remote-enc")
-        .arg("install-hook")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    // The guard was installed on first contact, as in every clone.
+    let hook = fs::read_to_string(a.join(".git/hooks/pre-push")).unwrap();
+    assert!(hook.contains("git-remote-enc pre-push"), "{hook}");
+    let opted_out = sb.root.join("opted-out");
+    sb.git_ok(
+        &sb.root,
+        &[
+            "-c",
+            &format!("enc.identity={}", alice.display()),
+            "-c",
+            &format!("enc.participants={alice_pub}"),
+            "-c",
+            "enc.installHook=false",
+            "clone",
+            "-q",
+            &url,
+            opted_out.to_str().unwrap(),
+        ],
     );
+    assert!(!opted_out.join(".git/hooks/pre-push").exists());
+    let b = sb.clone("bob", &url, &alice);
+    assert!(b.join(".git/hooks/pre-push").exists());
     let plain = sb.dir("plain.git");
     sb.git_ok(&plain, &["init", "-q", "--bare"]);
     let plain_has_main = || {

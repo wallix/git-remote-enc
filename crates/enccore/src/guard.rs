@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail};
 
 use crate::git::{self, Oid};
+use crate::info;
 
 /// A pushed ref that would publish content of an encrypted remote.
 pub struct Leak {
@@ -184,6 +185,38 @@ fn trivial_objects() -> Result<BTreeSet<Oid>> {
         set.insert(git::run_line(["hash-object", "-t", ty, "--stdin"])?);
     }
     Ok(set)
+}
+
+/// On first contact with an encrypted remote, install the guard unless a
+/// pre-push hook is already there, which is only reported, or hooks come
+/// from a shared `core.hooksPath` directory, which is left alone.
+pub fn ensure_hook() -> Result<()> {
+    let path = git::hook_path("pre-push")?;
+    match std::fs::read(&path) {
+        Ok(text) if String::from_utf8_lossy(&text).contains("git-remote-enc pre-push") => {}
+        Ok(_) => info(&format!(
+            "warning: {} exists and does not run the git-remote-enc guard, so nothing stops a \
+             push of this remote's commits to a plain remote; make it run \
+             `git-remote-enc pre-push \"$1\" \"$2\"` (DESIGN.md §6.7)",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if git::config("core.hooksPath")?.is_some() {
+                info(
+                    "warning: core.hooksPath is set, so the git-remote-enc pre-push guard was not installed; \
+                      see `git-remote-enc install-hook` (DESIGN.md §6.7)",
+                );
+            } else {
+                let path = install_hook()?;
+                info(&format!(
+                    "installed the pre-push guard {} (enc.installHook=false turns this off)",
+                    path.display()
+                ));
+            }
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    Ok(())
 }
 
 /// Write the pre-push hook that runs the guard. An existing hook is left

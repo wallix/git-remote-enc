@@ -265,6 +265,9 @@ impl Remote {
         // present, missing trust state was lost, not never written.
         let previous_tip = git::rev_parse(&self.backend.tracking_ref)?;
         let known = previous_tip.is_some();
+        if !known && self.cfg.install_hook {
+            crate::guard::ensure_hook()?;
+        }
         self.tip = self.backend.fetch_tip()?;
         // Every push appends to the backend history; a tip that does not
         // descend from the one seen before means the host rewrote it, and
