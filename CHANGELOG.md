@@ -15,9 +15,11 @@
   so a participant can no longer freeze a remote by pushing the largest
   possible generation.
 
-- Each manifest names the hash of the one before it, and `git-remote-enc log`
-  marks every generation it cannot chain to the accepted one as not
-  verified, so the host cannot slip forged entries into the audit trail.
+- On-remote format 3 (breaking): each manifest names the hash of the one
+  before it, and `git-remote-enc log` marks every generation it cannot chain
+  to the accepted one as not verified, so the host cannot slip forged entries
+  into the audit trail. The first push with this version upgrades a remote to
+  format 3, which older versions cannot read.
 
 - The pre-push guard is installed on the first clone of, or push to, an
   encrypted remote, unless a pre-push hook already exists or

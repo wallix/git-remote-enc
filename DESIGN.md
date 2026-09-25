@@ -123,10 +123,10 @@ twice in either direction.
 ### 4.2 Manifest
 
 The manifest plaintext is UTF-8 text, one item per line, `\n`-terminated. Its
-first line is the format tag. Version 2:
+first line is the format tag. Version 3:
 
 ```
-enc-manifest 2
+enc-manifest 3
 generation 42
 time 1790000000
 previous 9a4c...e1
@@ -144,10 +144,10 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 
 | item | meaning |
 |---|---|
-| `enc-manifest <n>` | format version; a reader refuses an unknown `n`. Readers accept 1 and 2 and write 2 |
+| `enc-manifest <n>` | format version; a reader refuses an unknown `n`. Readers accept 1 to 3 and write 3 |
 | `generation <n>` | strictly increasing per push; anti-rollback (section 6.2) |
 | `time <unix seconds>` | when the pusher wrote it, by the pusher's clock; for the audit trail only, never for trust decisions. New in version 2 |
-| `previous <sha256>` | hex SHA-256 of the previous generation's manifest text; absent on a remote's first manifest. Chains the history so the accepted manifest authenticates every one before it (section 6.6). New in version 2 |
+| `previous <sha256>` | hex SHA-256 of the previous generation's manifest text; absent on a remote's first manifest. Chains the history so the accepted manifest authenticates every one before it (section 6.6). New in version 3 |
 | `repo <hex>` | random id chosen at creation; detects a recreated remote |
 | `head <ref>` | what `HEAD` points to on clone (first pushed branch by default) |
 | `participant <key>` | an `ssh-ed25519` public key (may read, may push) or an `age1…` recipient (read-only, cannot sign) |
@@ -168,9 +168,10 @@ A reader holds the manifest in memory to decrypt and verify it, before it
 can tell who wrote it, so it refuses a manifest blob over 64 MiB (about
 450,000 pushes' worth of pack lines) without reading it.
 
-Version 1 had no `admin` item. The first push by a version 2 writer rewrites a
-version 1 manifest as version 2 with an empty admin list, which older binaries
-then refuse to read: every participant must upgrade.
+Version 1 had no `admin` item, version 2 no `previous` item. The first push
+by a version 3 writer rewrites either as version 3 (a version 1 manifest with
+an empty admin list), which older binaries then refuse to read: every
+participant must upgrade.
 
 ### 4.3 Manifest envelope
 
@@ -487,7 +488,7 @@ therefore carries the SHA-256 of its predecessor's text (`previous`). `log`
 starts from the manifest connect accepted, which is authentic, and follows the
 chain down; a manifest reached that way is verified, and every one below the
 first break (a digest that does not match, an unreadable manifest, a manifest
-from before version 2 had `previous`) is printed as not verified, with its
+from before version 3 had `previous`) is printed as not verified, with its
 signer as a bare fingerprint, and the changes relative to it flagged. Connect
 also reports a manifest one generation past the accepted one whose
 `previous` is not the accepted one's digest: the history forked. Protecting the branch on

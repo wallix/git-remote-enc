@@ -394,7 +394,7 @@ fn push_clone_fetch_roundtrip() {
         String::from_utf8(out.stdout).unwrap()
     };
     let m = manifest(&["manifest", "enc"]);
-    assert!(m.starts_with("enc-manifest 2\n"), "{m}");
+    assert!(m.starts_with("enc-manifest 3\n"), "{m}");
     assert!(m.contains("participant ssh-ed25519"));
     // Three pushes carried objects; the tag, branch and deletion pushes
     // only moved refs and stored no pack.
@@ -710,7 +710,7 @@ fn only_admins_change_the_participant_list() {
     sb.add_remote(&a, &url, &alice, &[&alice_pub, &bob_pub]);
     sb.git_ok(&a, &["push", "-q", "enc", "main"]);
     let (ok, m) = enc(&a, &["manifest", "enc"]);
-    assert!(ok && m.starts_with("enc-manifest 2\n"), "{m}");
+    assert!(ok && m.starts_with("enc-manifest 3\n"), "{m}");
     assert!(m.contains(&format!("admin {alice_pub}\n")), "{m}");
 
     // Bob pushes, but may not add Carol.
@@ -777,7 +777,7 @@ fn only_admins_change_the_participant_list() {
             .unwrap()
             .parse()
             .unwrap();
-        text.replace("enc-manifest 2\n", "enc-manifest 1\n")
+        text.replace("enc-manifest 3\n", "enc-manifest 1\n")
             .replace(&format!("admin {alice_pub}\n"), "")
             .replace(
                 &format!("generation {generation}\n"),
