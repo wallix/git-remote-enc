@@ -517,10 +517,16 @@ or squash creates commits the encrypted remote never had. A push is refused
 when the objects it would send (commits, trees, blobs; the empty blob and
 tree aside) share one with the objects only the encrypted remote has, which
 catches a fixed file carried over unchanged; or when one of its commits has
-the patch id (`git patch-id --stable`) of an encrypted-only commit, which
-catches the same change applied to a diverged file. Any git failure while
-checking refuses the push. A change rewritten by hand, or squashed together
-with other edits to the same files onto a diverged base, matches neither.
+the patch id (`git patch-id --stable`) of an encrypted-only commit, taken
+over the diff without context lines, which catches the same change applied
+where the lines around it differ; or when one of its hunks adds what a hunk
+of an encrypted-only commit adds, whitespace and line breaks aside, which
+catches a fix whose removed lines changed in a conflict resolution, or that
+was squashed with other edits. Hunks adding under 24 bytes, whitespace
+aside, are too common to count (a lone `}`), so a fix that small is matched
+only by the first two tests. Any git failure while checking refuses the
+push. A fix whose added lines were rewritten, by hand or to resolve a
+conflict inside them, matches none.
 
 git chooses the transport from the push URL, so `remote.<name>.pushurl`, or
 a `url.<base>.pushInsteadOf` (or `insteadOf`) rule, can send pushes to an
@@ -595,7 +601,7 @@ through the helper at all (5.1).
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
 | git config reroutes pushes to an encrypted remote to a plain URL (`pushurl`, `pushInsteadOf`) | the pre-push guard refuses it; the helper refuses to fetch from such a remote (6.7) | a clone without the guard pushes in clear; an `insteadOf` that rewrites the fetch URL too never runs the helper at all |
 | Git LFS uploads tracked files in clear alongside a push | a push is refused while LFS holds files locally and any pre-push hook but the guard exists (5.1) | `enc-allowLfs` with LFS still pointed at the forge; LFS storage outside the places checked |
-| Plaintext leaks through the developer's workflow | a pre-push hook, installed on first contact refuses to push content of an encrypted remote (shared objects, or a cherry-picked change by patch id) to any other remote (6.7) | clones where it could not be installed (an existing hook, `core.hooksPath`: reported on every fetch and push) or was turned off, `--no-verify`, content not yet tied to an encrypted ref, a fix rewritten by hand or squashed with other edits onto a diverged base; the decrypted objects live in the local `$GIT_DIR` (5.4): use a dedicated clone, disk encryption, and delete the clone when done |
+| Plaintext leaks through the developer's workflow | a pre-push hook, installed on first contact refuses to push content of an encrypted remote (shared objects, or a cherry-picked change by patch id) to any other remote (6.7) | clones where it could not be installed (an existing hook, `core.hooksPath`: reported on every fetch and push) or was turned off, `--no-verify`, content not yet tied to an encrypted ref, a fix whose added lines were rewritten, a fix adding under 24 bytes whose removed lines changed in a conflict or that was squashed with other edits; the decrypted objects live in the local `$GIT_DIR` (5.4): use a dedicated clone, disk encryption, and delete the clone when done |
 | A malicious or compromised build | reproducible builds from pinned inputs, SHA-pinned actions, Sigstore-signed provenance and an SBOM per release, `cargo audit` and `cargo deny` in CI | the build image runs Nix with `sandbox = false`; dependencies include a pre-release crate (`kem`) and an unfixed but unreachable one (`rsa`, RUSTSEC-2023-0071) |
 | The host exhausts a client's memory with a huge manifest | manifest blobs over 64 MiB are refused before being read (4.2) | pack blobs are streamed, but the backend fetch itself is unbounded, as with any git fetch |
 | A parser bug on untrusted input | Rust with panics denied by lint; the signature is checked before parsing when a signer list is known; mutation tests of every parser (section 10) | no coverage-guided fuzzing; trust on first use parses unauthenticated text |

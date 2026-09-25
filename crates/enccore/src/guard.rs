@@ -12,7 +12,8 @@ use crate::info;
 pub struct Leak {
     pub local_ref: String,
     /// What it shares with the encrypted remote that the destination does
-    /// not have: `commit <oid>`, `object <oid>` or `the change of <oid>`.
+    /// not have: `commit <oid>`, `object <oid>`, `the change of <oid>` or
+    /// `the lines added by <oid>`.
     pub what: String,
     /// The encrypted remote it comes from.
     pub source: String,
@@ -84,8 +85,10 @@ pub fn check_pre_push(remote: &str, url: &str, updates: &str) -> Result<Vec<Leak
 
     // Content, not topology: a cherry-pick or a squash of the fix shares no
     // commit with the encrypted remote, but it shares its blobs (the fixed
-    // file), or its patch id when applied to a different base. Every git
-    // failure is an error, so the push is refused rather than let through.
+    // file), or when applied to a different base its patch id, or the lines
+    // one of its hunks adds when a conflict was resolved around them. Every
+    // git failure is an error, so the push is refused rather than let
+    // through.
     let trivial = trivial_objects()?;
     let mut leaks = Vec::new();
     for (name, refs) in &sources {
@@ -96,7 +99,7 @@ pub fn check_pre_push(remote: &str, url: &str, updates: &str) -> Result<Vec<Leak
         if secret_objects.is_empty() {
             continue;
         }
-        let secret_patches = patch_ids(refs, &excludes)?;
+        let secret = changes(refs, &excludes)?;
         for (local_ref, local) in &pushed {
             let tip = std::slice::from_ref(local);
             let what = match objects(tip, &excludes)?
@@ -105,13 +108,21 @@ pub fn check_pre_push(remote: &str, url: &str, updates: &str) -> Result<Vec<Leak
             {
                 Some(o) if git::object_type(&o)? == "commit" => Some(format!("commit {o}")),
                 Some(o) => Some(format!("object {o}")),
-                None => patch_ids(tip, &excludes)?
-                    .into_iter()
-                    .find_map(|(id, commit)| {
-                        secret_patches
-                            .contains_key(&id)
-                            .then(|| format!("the change of {commit}"))
-                    }),
+                None => {
+                    let pushed = changes(tip, &excludes)?;
+                    pushed
+                        .patches
+                        .keys()
+                        .find_map(|id| secret.patches.get(id))
+                        .map(|c| format!("the change of {c}"))
+                        .or_else(|| {
+                            pushed
+                                .hunks
+                                .keys()
+                                .find_map(|h| secret.hunks.get(h))
+                                .map(|c| format!("the lines added by {c}"))
+                        })
+                }
             };
             if let Some(what) = what {
                 leaks.push(Leak {
@@ -138,14 +149,24 @@ fn objects(tips: &[String], excludes: &[Oid]) -> Result<Vec<Oid>> {
         .collect())
 }
 
-/// `patch id → commit` for the non-merge commits reachable from `tips` but
-/// not from `excludes`.
-fn patch_ids(tips: &[String], excludes: &[Oid]) -> Result<BTreeMap<String, Oid>> {
+/// Fingerprints of the non-merge commits reachable from some tips but not
+/// from others, each mapped to the commit it was taken from.
+struct Changes {
+    /// `git patch-id --stable` of the diff without context lines, so a
+    /// change applied where its surroundings differ keeps its id.
+    patches: BTreeMap<String, Oid>,
+    /// Per hunk, the lines it adds (see [`hunk_prints`]): what survives a
+    /// conflict resolved around the fix, or a squash with other changes.
+    hunks: BTreeMap<String, Oid>,
+}
+
+fn changes(tips: &[String], excludes: &[Oid]) -> Result<Changes> {
     let log = git::run_input(
         [
             "log",
             "--no-merges",
             "-p",
+            "-U0",
             "--no-color",
             "--no-ext-diff",
             "--no-textconv",
@@ -155,12 +176,58 @@ fn patch_ids(tips: &[String], excludes: &[Oid]) -> Result<BTreeMap<String, Oid>>
         revs(tips, excludes).as_bytes(),
     )?;
     let out = git::run_input(["patch-id", "--stable"], &log)?;
-    Ok(String::from_utf8(out)
+    let patches = String::from_utf8(out)
         .context("patch-id output is not UTF-8")?
         .lines()
         .filter_map(|l| l.split_once(' '))
         .map(|(id, commit)| (id.to_owned(), commit.to_owned()))
-        .collect())
+        .collect();
+    Ok(Changes {
+        patches,
+        hunks: hunk_prints(&log),
+    })
+}
+
+/// Hunks adding less than this, whitespace aside, are too common (a closing
+/// brace, an `else`) to tell a backport from unrelated work.
+const MIN_HUNK_BYTES: usize = 24;
+
+/// `SHA-256 → commit` of what each hunk of a `git log -p -U0
+/// --format="commit %H"` output adds, whitespace and line breaks dropped
+/// (reindenting or rewrapping the fix keeps it), for the hunks adding at
+/// least [`MIN_HUNK_BYTES`].
+fn hunk_prints(log: &[u8]) -> BTreeMap<String, Oid> {
+    let mut prints = BTreeMap::new();
+    let mut commit: Option<&str> = None;
+    let mut in_hunk = false;
+    let mut added: Vec<u8> = Vec::new();
+    let mut flush = |added: &mut Vec<u8>, commit: Option<&str>| {
+        if added.len() >= MIN_HUNK_BYTES
+            && let Some(c) = commit
+        {
+            prints
+                .entry(crate::crypto::sha256_hex(added))
+                .or_insert_with(|| c.to_owned());
+        }
+        added.clear();
+    };
+    for line in log.split(|&b| b == b'\n') {
+        if let Some(c) = line.strip_prefix(b"commit ") {
+            flush(&mut added, commit);
+            commit = std::str::from_utf8(c).ok();
+            in_hunk = false;
+        } else if line.starts_with(b"diff ") {
+            flush(&mut added, commit);
+            in_hunk = false;
+        } else if line.starts_with(b"@@") {
+            flush(&mut added, commit);
+            in_hunk = true;
+        } else if in_hunk && let Some(text) = line.strip_prefix(b"+") {
+            added.extend(text.iter().filter(|b| !b.is_ascii_whitespace()));
+        }
+    }
+    flush(&mut added, commit);
+    prints
 }
 
 fn revs(tips: &[String], excludes: &[Oid]) -> String {
@@ -305,4 +372,21 @@ fn ref_oids(prefix: &str) -> Result<Vec<Oid>> {
 
 fn is_zero(oid: &str) -> bool {
     oid.bytes().all(|b| b == b'0')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hunk_prints_ignore_context_whitespace_and_small_hunks() {
+        let a = b"commit aaaa\ndiff --git a/x b/x\n@@ -3 +3 @@ ctx\n-\treturn n;\n+\treturn n < 0 || n > LIMIT ? -EINVAL : n;\n@@ -9,0 +10 @@\n+}\n";
+        let b = b"commit bbbb\ndiff --git a/y b/y\n@@ -7 +7,2 @@ other\n-\treturn (long)n;\n+  return n < 0 || n > LIMIT ?\n+    -EINVAL : n;\n\n";
+        let (pa, pb) = (hunk_prints(a), hunk_prints(b));
+        assert_eq!(pa.len(), 1, "the one-brace hunk is too small");
+        assert_eq!(pa.keys().collect::<Vec<_>>(), pb.keys().collect::<Vec<_>>());
+        assert_eq!(pa.values().next().map(String::as_str), Some("aaaa"));
+        // A line starting with `+` outside a hunk is a header, not content.
+        assert!(hunk_prints(b"commit cccc\n+++ b/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n").is_empty());
+    }
 }
