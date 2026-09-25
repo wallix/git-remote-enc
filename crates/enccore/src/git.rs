@@ -311,6 +311,90 @@ pub fn have_objects(oids: &[Oid]) -> Result<Vec<Oid>> {
         .collect())
 }
 
+/// The paths of the Git LFS pointers among the blobs reachable from `tips`
+/// but not from `excludes`: files whose content is in LFS storage, not in
+/// the objects.
+pub fn lfs_pointers(tips: &[Oid], excludes: &[Oid]) -> Result<Vec<String>> {
+    let mut revs = String::new();
+    for t in tips {
+        revs.push_str(t);
+        revs.push('\n');
+    }
+    for e in excludes {
+        revs.push('^');
+        revs.push_str(e);
+        revs.push('\n');
+    }
+    // The pointer format caps a pointer at 1024 bytes.
+    let listed = run_input(
+        [
+            "rev-list",
+            "--objects",
+            "--filter=blob:limit=1024",
+            "--stdin",
+        ],
+        revs.as_bytes(),
+    )?;
+    // `<oid> <path>` for trees and blobs; commits have no path.
+    let named: Vec<(&[u8], &[u8])> = listed
+        .split(|&b| b == b'\n')
+        .filter_map(|l| {
+            let at = l.iter().position(|&b| b == b' ')?;
+            Some((l.get(..at)?, l.get(at.saturating_add(1)..)?))
+        })
+        .collect();
+    if named.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut input = Vec::new();
+    for (oid, _) in &named {
+        input.extend_from_slice(oid);
+        input.push(b'\n');
+    }
+    let types = run_input(["cat-file", "--batch-check=%(objecttype)"], &input)?;
+    let blobs: Vec<&(&[u8], &[u8])> = named
+        .iter()
+        .zip(types.split(|&b| b == b'\n'))
+        .filter(|(_, ty)| *ty == b"blob")
+        .map(|(n, _)| n)
+        .collect();
+    if blobs.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut input = Vec::new();
+    for (oid, _) in &blobs {
+        input.extend_from_slice(oid);
+        input.push(b'\n');
+    }
+    // `<oid> blob <size>\n<content>\n` per blob, in input order.
+    let out = run_input(["cat-file", "--batch"], &input)?;
+    let mut rest = out.as_slice();
+    let mut pointers = Vec::new();
+    for (_, path) in blobs {
+        let header_end = rest
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| anyhow!("short cat-file --batch output"))?;
+        let size: usize = std::str::from_utf8(rest.get(..header_end).unwrap_or_default())
+            .ok()
+            .and_then(|h| h.rsplit(' ').next())
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| anyhow!("malformed cat-file --batch header"))?;
+        let start = header_end.saturating_add(1);
+        let end = start.saturating_add(size);
+        let content = rest
+            .get(start..end)
+            .ok_or_else(|| anyhow!("short cat-file --batch output"))?;
+        if content.starts_with(b"version https://git-lfs.github.com/spec/")
+            || content.starts_with(b"version https://hawser.github.com/spec/")
+        {
+            pointers.push(String::from_utf8_lossy(path).into_owned());
+        }
+        rest = rest.get(end.saturating_add(1)..).unwrap_or_default();
+    }
+    Ok(pointers)
+}
+
 pub fn is_ancestor(old: &str, new: &str) -> Result<bool> {
     Ok(run_status(["merge-base", "--is-ancestor", old, new])?.0)
 }

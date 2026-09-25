@@ -42,8 +42,10 @@
 
 - A push is refused while Git LFS could upload files alongside it (LFS holds
   files locally and a pre-push hook is installed): LFS would upload the files
-  it tracks, unencrypted, to its own server. `enc.allowLfs=true`
-  overrides it once LFS is neutralized in the clone.
+  it tracks, unencrypted, to its own server. A push carrying LFS pointers
+  is refused too: the other participants would get the pointers without the
+  files. `enc.allowLfs=true` overrides both once LFS is neutralized in the
+  clone.
 
 - `enc.repo` and `enc.minGeneration` pin the repository id and the lowest
   generation a first contact accepts, so a new clone cannot be served an

@@ -1057,6 +1057,20 @@ impl Remote {
         let wants: Vec<Oid> = accepted.iter().filter_map(|(_, o)| o.clone()).collect();
         let known: Vec<Oid> = m.refs.iter().map(|(oid, _)| oid.clone()).collect();
         let excludes = git::have_objects(&known)?;
+        // LFS uploads a file's content from its own pre-push hook, which an
+        // encrypted push refuses (`list`) or does not run: the other
+        // participants would get the pointer and nothing to resolve it.
+        if !self.cfg.allow_lfs
+            && !wants.is_empty()
+            && let Some(path) = git::lfs_pointers(&wants, &excludes)?.first()
+        {
+            bail!(
+                "{path} is a Git LFS pointer: the file itself is in LFS storage, which an encrypted \
+                 push does not carry, so the other participants would get the pointer only. Commit \
+                 such files outside LFS (git lfs migrate export), or set \
+                 remote.<name>.enc-allowLfs=true to push the pointers anyway"
+            );
+        }
         let pack = if wants.is_empty() {
             None
         } else {
