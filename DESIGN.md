@@ -692,12 +692,15 @@ ed25519 keys:
 - rollback of the backend branch to an older tip is refused, and so is an
   older or substituted manifest on a first contact pinned with `enc-repo` and
   `enc-minGeneration`;
-- a backend history rewritten by the host is reported by fetch and `log`;
+- a backend history rewritten by the host is reported by fetch and `log`, and
+  a forked one is refused;
 - a tampered trust file, with or without its tag line, is refused;
 - a hostile object (a `.git` tree entry) is refused on fetch;
 - a push is refused, before the hook runs, while a pre-push hook runs Git
   LFS, and a push carrying LFS pointers is refused;
-- the pre-push guard refuses to publish commits of an encrypted remote.
+- the pre-push guard refuses to publish commits of an encrypted remote,
+  backports onto diverged code and through a conflict included, and every
+  contact reinstalls it when missing or reports it when replaced.
 
 Unit tests cover manifest parsing/serialization, refspec parsing and the trust
 rules. Every parser of untrusted input (manifest, envelope, refspec,
