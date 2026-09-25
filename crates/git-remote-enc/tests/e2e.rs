@@ -1420,6 +1420,58 @@ fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
 }
 
 #[test]
+fn the_guard_is_checked_on_every_contact() {
+    let sb = Sandbox::new("reguard");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let hook = a.join(".git/hooks/pre-push");
+    let fetch_stderr = || {
+        let out = sb.git(&a, &["fetch", "enc"]);
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    assert!(!fetch_stderr().contains("warning"));
+
+    // Replaced by another tool (`git lfs install --force` does this).
+    fs::write(&hook, "#!/bin/sh\ngit lfs pre-push \"$@\"\n").unwrap();
+    let err = fetch_stderr();
+    assert!(
+        err.contains("does not run the git-remote-enc guard"),
+        "{err}"
+    );
+
+    // Removed: installed again.
+    fs::remove_file(&hook).unwrap();
+    let err = fetch_stderr();
+    assert!(err.contains("installed the pre-push guard"), "{err}");
+    assert!(
+        fs::read_to_string(&hook)
+            .unwrap()
+            .contains("git-remote-enc pre-push")
+    );
+
+    // Present but not executable, so git skips it.
+    let mut perms = fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+    fs::set_permissions(&hook, perms).unwrap();
+    let err = fetch_stderr();
+    assert!(err.contains("is not executable"), "{err}");
+
+    // A shared hooks directory without it.
+    fs::remove_file(&hook).unwrap();
+    let shared = sb.dir("shared-hooks");
+    sb.git_ok(&a, &["config", "core.hooksPath", shared.to_str().unwrap()]);
+    let err = fetch_stderr();
+    assert!(err.contains("core.hooksPath is set"), "{err}");
+    assert!(!shared.join("pre-push").exists());
+}
+
+#[test]
 fn plain_push_urls_of_encrypted_remotes_are_refused() {
     let sb = Sandbox::new("pushurl");
     let host = sb.host();
