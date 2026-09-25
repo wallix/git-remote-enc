@@ -79,8 +79,10 @@
   refused unless `enc.participants` names its signer, or
   `enc.trustOnFirstUse` is set to accept it unverified. The same remote reached
   through another spelling of its URL keeps the trust already accepted.
-- A fetch warns when the remote serves a different manifest for the generation
-  it already accepted, i.e. the remote's history forked.
+- A fetch refuses a manifest that forks from the one it accepted (a different
+  manifest for the same generation, or a next one that does not follow it),
+  since the host served another view. `enc.refuseForks=false` accepts the
+  view the participants agree to keep.
 - Linked worktrees share the repository's trust state for a remote instead of
   starting from first contact.
 - Breaking: `ssh-rsa` keys are no longer accepted as participants or

@@ -955,7 +955,7 @@ fn local_trust_state_is_authenticated() {
 }
 
 #[test]
-fn forked_generation_is_reported() {
+fn forked_history_is_refused() {
     let sb = Sandbox::new("fork");
     let host = sb.host();
     let url = sb.url(&host, None);
@@ -971,16 +971,29 @@ fn forked_generation_is_reported() {
     sb.commit_text(&a, "two", "2\n");
     sb.git_ok(&a, &["push", "-q", "enc", "main"]);
     let b = sb.clone("bob", &url, &alice);
+    let c = sb.clone("carol", &url, &alice);
 
     // The host rewinds; the stale clone pushes its own generation 2.
     sb.git_ok(&host, &["update-ref", "refs/heads/enc", gen1.trim()]);
     sb.commit_text(&a2, "other", "2'\n");
     sb.git_ok(&a2, &["push", "-q", "origin", "main"]);
+    let err = sb.git_fails(&c, &["fetch", "origin"]);
+    assert!(err.contains("different manifest for generation 2"), "{err}");
+    assert!(err.contains("Refusing it"), "{err}");
 
-    let out = sb.git(&b, &["fetch", "origin"]);
+    // One generation later, the fork shows in the chain.
+    sb.commit_text(&a2, "three", "3'\n");
+    sb.git_ok(&a2, &["push", "-q", "origin", "main"]);
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(err.contains("does not follow the generation 2"), "{err}");
+
+    // The participants keep this view: accepted once on request, then as
+    // the new baseline.
+    let out = sb.git(&b, &["-c", "enc.refuseForks=false", "fetch", "origin"]);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{err}");
-    assert!(err.contains("different manifest for generation 2"), "{err}");
+    assert!(err.contains("warning:") && err.contains("forked"), "{err}");
+    sb.git_ok(&b, &["fetch", "origin"]);
 }
 
 #[test]

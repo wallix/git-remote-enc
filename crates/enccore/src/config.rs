@@ -29,6 +29,9 @@ pub struct Config {
     pub install_hook: bool,
     /// Push even though Git LFS would upload files in clear alongside.
     pub allow_lfs: bool,
+    /// Refuse a manifest that forks from the accepted one, rather than
+    /// warn and accept it. On unless set to false.
+    pub refuse_forks: bool,
     /// `index-pack` fsck option for received packs (`--fsck-objects[=…]`),
     /// `None` when disabled.
     pub fsck: Option<String>,
@@ -70,6 +73,11 @@ impl Config {
             }
             None => false,
         };
+        let refuse_forks = match one("refuseForks")? {
+            Some(v) => parse_bool(&v)
+                .with_context(|| format!("enc refuseForks: `{v}` is not a boolean"))?,
+            None => true,
+        };
         let repo = one("repo")?.map(|r| r.trim().to_owned());
         let min_generation = one("minGeneration")?
             .map(|v| {
@@ -92,6 +100,7 @@ impl Config {
             min_generation,
             install_hook,
             allow_lfs,
+            refuse_forks,
             fsck,
         })
     }

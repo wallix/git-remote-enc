@@ -70,6 +70,7 @@ The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 | `remote.<name>.enc-minGeneration` / `enc.minGeneration` | the lowest manifest generation to accept |
 | `remote.<name>.enc-installHook` / `enc.installHook` | `false` skips installing, and checking for, the pre-push guard. Default `true` |
 | `remote.<name>.enc-allowLfs` / `enc.allowLfs` | `true` pushes even though Git LFS could upload files on pre-push. Default `false` (see below) |
+| `remote.<name>.enc-refuseForks` / `enc.refuseForks` | `false` accepts, with a warning, a manifest that forks from the one accepted before, once the participants agree to keep that view. Default `true` |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
 
