@@ -21,9 +21,10 @@
   into the audit trail. The first push with this version upgrades a remote to
   format 3, which older versions cannot read.
 
-- The pre-push guard is installed on the first clone of, or push to, an
-  encrypted remote, unless a pre-push hook already exists or
-  `enc.installHook=false`.
+- The pre-push guard is installed on every clone of, fetch from, or push to
+  an encrypted remote where no pre-push hook exists, unless
+  `enc.installHook=false`. A pre-push hook that does not run it, as after
+  `git lfs install --force`, is reported each time.
 
 - An encrypted remote whose pushes git would send in clear, because of a
   `pushurl` or a `pushInsteadOf` rule, is refused: the pre-push guard stops

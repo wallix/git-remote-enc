@@ -68,7 +68,7 @@ The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 | `remote.<name>.enc-trustOnFirstUse` / `enc.trustOnFirstUse` | `true` accepts whoever signed an unknown remote when no participant list is set. Default `false` |
 | `remote.<name>.enc-repo` / `enc.repo` | the repository id the remote must serve (the manifest's `repo` line) |
 | `remote.<name>.enc-minGeneration` / `enc.minGeneration` | the lowest manifest generation to accept |
-| `remote.<name>.enc-installHook` / `enc.installHook` | `false` skips installing the pre-push guard on first contact. Default `true` |
+| `remote.<name>.enc-installHook` / `enc.installHook` | `false` skips installing, and checking for, the pre-push guard. Default `true` |
 | `remote.<name>.enc-allowLfs` / `enc.allowLfs` | `true` pushes even though Git LFS could upload files on pre-push. Default `false` (see below) |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
@@ -129,12 +129,12 @@ refs, participants and admins it changed. The host can drop past
 generations by rewriting the backend branch; `log` flags the missing ones, and
 a fetch warns once when it sees the rewrite.
 
-The first clone of, or push to, an encrypted remote installs a pre-push hook
-that refuses to push its content to any other remote, backports by
+Every clone of, fetch from, or push to an encrypted remote installs a pre-push
+hook, if none exists, that refuses to push its content to any other remote, backports by
 cherry-pick included, so an embargoed fix is not published by a slip of `git
 push origin`. Push with `--no-verify` when publishing it is the intent. It is
 not installed over an existing pre-push hook or into a `core.hooksPath`
-directory (both are reported), nor with `enc.installHook=false`;
+directory (both are reported each time), nor with `enc.installHook=false`;
 `git-remote-enc install-hook` installs it by hand.
 
 `git-remote-enc forget <remote>` drops the local trust state of a remote, which

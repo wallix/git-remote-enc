@@ -24,7 +24,8 @@ pub struct Config {
     /// The lowest manifest generation to accept, learned out of band: bounds
     /// a rollback on first contact, before there is local state to do it.
     pub min_generation: Option<u64>,
-    /// Install the pre-push guard on first contact.
+    /// Install the pre-push guard where no pre-push hook exists, and report
+    /// one that does not run it, on every contact.
     pub install_hook: bool,
     /// Push even though Git LFS would upload files in clear alongside.
     pub allow_lfs: bool,

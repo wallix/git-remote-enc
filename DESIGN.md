@@ -498,12 +498,14 @@ the host against force pushes, and keeping the host's push log, does.
 
 Encryption ends at `$GIT_DIR`: a clone that knows both an encrypted remote
 and a plain one holds the decrypted commits of the first and can push them to
-the second with one command. The first contact with an encrypted remote (a
-clone, or the push creating it) installs a pre-push hook running
-`git-remote-enc pre-push <remote> <url>`, unless `enc.installHook = false`, a
-pre-push hook already exists (reported: it has to call the guard itself), or
-`core.hooksPath` points at a shared directory (reported too);
-`git-remote-enc install-hook` installs it by hand. The hook refuses a push
+the second with one command. Every contact with an encrypted remote (a
+clone, a fetch, a push) checks for a pre-push hook running
+`git-remote-enc pre-push <remote> <url>` and installs it where none exists,
+unless `enc.installHook = false`. A pre-push hook that does not run the guard
+(it has to call it itself), a guard that is not executable, or a
+`core.hooksPath` directory without one is left alone and reported, on every
+contact: another tool (`git lfs install --force`) can replace the guard at
+any time. `git-remote-enc install-hook` installs it by hand. The hook refuses a push
 that carries content of an encrypted remote the destination does not already
 have. "The encrypted remote" is every other remote with an `enc::` URL: its
 remote-tracking refs, and the local branches whose upstream it is (they hold
@@ -593,7 +595,7 @@ through the helper at all (5.1).
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
 | git config reroutes pushes to an encrypted remote to a plain URL (`pushurl`, `pushInsteadOf`) | the pre-push guard refuses it; the helper refuses to fetch from such a remote (6.7) | a clone without the guard pushes in clear; an `insteadOf` that rewrites the fetch URL too never runs the helper at all |
 | Git LFS uploads tracked files in clear alongside a push | a push is refused while LFS holds files locally and any pre-push hook but the guard exists (5.1) | `enc-allowLfs` with LFS still pointed at the forge; LFS storage outside the places checked |
-| Plaintext leaks through the developer's workflow | a pre-push hook, installed on first contact refuses to push content of an encrypted remote (shared objects, or a cherry-picked change by patch id) to any other remote (6.7) | clones where it could not be installed (an existing hook, `core.hooksPath`) or was turned off, `--no-verify`, content not yet tied to an encrypted ref, a fix rewritten by hand or squashed with other edits onto a diverged base; the decrypted objects live in the local `$GIT_DIR` (5.4): use a dedicated clone, disk encryption, and delete the clone when done |
+| Plaintext leaks through the developer's workflow | a pre-push hook, installed on first contact refuses to push content of an encrypted remote (shared objects, or a cherry-picked change by patch id) to any other remote (6.7) | clones where it could not be installed (an existing hook, `core.hooksPath`: reported on every fetch and push) or was turned off, `--no-verify`, content not yet tied to an encrypted ref, a fix rewritten by hand or squashed with other edits onto a diverged base; the decrypted objects live in the local `$GIT_DIR` (5.4): use a dedicated clone, disk encryption, and delete the clone when done |
 | A malicious or compromised build | reproducible builds from pinned inputs, SHA-pinned actions, Sigstore-signed provenance and an SBOM per release, `cargo audit` and `cargo deny` in CI | the build image runs Nix with `sandbox = false`; dependencies include a pre-release crate (`kem`) and an unfixed but unreachable one (`rsa`, RUSTSEC-2023-0071) |
 | The host exhausts a client's memory with a huge manifest | manifest blobs over 64 MiB are refused before being read (4.2) | pack blobs are streamed, but the backend fetch itself is unbounded, as with any git fetch |
 | A parser bug on untrusted input | Rust with panics denied by lint; the signature is checked before parsing when a signer list is known; mutation tests of every parser (section 10) | no coverage-guided fuzzing; trust on first use parses unauthenticated text |
@@ -629,7 +631,7 @@ through the helper at all (5.1).
 | `remote.<name>.enc-trustOnFirstUse`, `enc.trustOnFirstUse` | boolean, default false. Accept the signer of an unknown remote without a pinned participant list (section 6.1) |
 | `remote.<name>.enc-repo`, `enc.repo` | the `repo` id the remote must serve (section 6.1) |
 | `remote.<name>.enc-minGeneration`, `enc.minGeneration` | the lowest `generation` accepted (section 6.1) |
-| `remote.<name>.enc-installHook`, `enc.installHook` | boolean, default true. Install the pre-push guard on first contact (section 6.7) |
+| `remote.<name>.enc-installHook`, `enc.installHook` | boolean, default true. Install the pre-push guard where no pre-push hook exists, and report one that does not run it, on every contact (section 6.7) |
 | `remote.<name>.enc-allowLfs`, `enc.allowLfs` | boolean, default false. Push although a pre-push hook runs Git LFS (section 5.1) |
 | `fetch.fsckObjects`, `transfer.fsckObjects`, `fetch.fsck.*` | git's own keys; received objects are checked unless one of the first two is false (section 5.2) |
 

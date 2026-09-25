@@ -187,25 +187,43 @@ fn trivial_objects() -> Result<BTreeSet<Oid>> {
     Ok(set)
 }
 
-/// On first contact with an encrypted remote, install the guard unless a
-/// pre-push hook is already there, which is only reported, or hooks come
-/// from a shared `core.hooksPath` directory, which is left alone.
+/// On every contact with an encrypted remote, check that the guard runs:
+/// install it where no pre-push hook exists (again, if something removed
+/// it), and report a pre-push hook that does not run it, one that is not
+/// executable, or a shared `core.hooksPath` directory without one, which
+/// are left alone. Another tool (`git lfs install --force`) may replace
+/// the guard at any time, so a check on first contact only is not enough.
 pub fn ensure_hook() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let path = git::hook_path("pre-push")?;
+    let unguarded = "so nothing stops a push of this remote's commits to a plain remote";
+    let silence = "enc.installHook=false silences this";
     match std::fs::read(&path) {
-        Ok(text) if String::from_utf8_lossy(&text).contains("git-remote-enc pre-push") => {}
+        Ok(text) if String::from_utf8_lossy(&text).contains("git-remote-enc pre-push") => {
+            let mode = std::fs::metadata(&path)
+                .with_context(|| format!("reading {}", path.display()))?
+                .permissions()
+                .mode();
+            if mode & 0o111 == 0 {
+                info(&format!(
+                    "warning: {} is not executable, so git does not run it, {unguarded}; \
+                     chmod +x it ({silence}; DESIGN.md §6.7)",
+                    path.display()
+                ));
+            }
+        }
         Ok(_) => info(&format!(
-            "warning: {} exists and does not run the git-remote-enc guard, so nothing stops a \
-             push of this remote's commits to a plain remote; make it run \
-             `git-remote-enc pre-push \"$1\" \"$2\"` (DESIGN.md §6.7)",
+            "warning: {} exists and does not run the git-remote-enc guard, {unguarded}; make it \
+             run `git-remote-enc pre-push \"$1\" \"$2\"` ({silence}; DESIGN.md §6.7)",
             path.display()
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if git::config("core.hooksPath")?.is_some() {
-                info(
-                    "warning: core.hooksPath is set, so the git-remote-enc pre-push guard was not installed; \
-                      see `git-remote-enc install-hook` (DESIGN.md §6.7)",
-                );
+                info(&format!(
+                    "warning: core.hooksPath is set and {} does not exist, {unguarded}; see \
+                     `git-remote-enc install-hook` ({silence}; DESIGN.md §6.7)",
+                    path.display()
+                ));
             } else {
                 let path = install_hook()?;
                 info(&format!(
