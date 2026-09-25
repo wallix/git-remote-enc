@@ -94,13 +94,22 @@ where
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning `git {desc}`"))?;
-    child
+    let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| anyhow!("no stdin for `git {desc}`"))?
-        .write_all(input)?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
+        .ok_or_else(|| anyhow!("no stdin for `git {desc}`"))?;
+    // Written from another thread while the output is read: a command that
+    // answers as it reads (`patch-id`, `cat-file --batch`) would otherwise
+    // block on a full stdout pipe while this blocks on a full stdin one.
+    let (written, out) = std::thread::scope(|s| {
+        let writer = s.spawn(move || stdin.write_all(input));
+        let out = child.wait_with_output();
+        (writer.join(), out)
+    });
+    let out = out?;
+    if out.status.success() {
+        written.map_err(|_| anyhow!("writing to `git {desc}` panicked"))??;
+    } else {
         bail!(
             "`git {desc}` failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -408,4 +417,21 @@ pub fn commit_tree(tree: &str, parent: Option<&str>, message: &str) -> Result<Oi
         );
     }
     ascii_line(&out.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_input_survives_output_larger_than_a_pipe() {
+        let mut log = String::new();
+        for i in 0..3000 {
+            log.push_str(&format!(
+                "commit {i:040x}\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a{i}\n+b{i}\n"
+            ));
+        }
+        let out = run_input(["patch-id", "--stable"], log.as_bytes()).unwrap();
+        assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 3000);
+    }
 }

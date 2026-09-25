@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The pre-push guard no longer hangs a push to a plain remote when the
+  encrypted remote holds several hundred commits that remote lacks.
+
 - Breaking: an identity file readable or writable by its group or others is
   refused, as ssh does; `chmod 600` it.
 
