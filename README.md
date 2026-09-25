@@ -69,7 +69,7 @@ The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
 | `remote.<name>.enc-repo` / `enc.repo` | the repository id the remote must serve (the manifest's `repo` line) |
 | `remote.<name>.enc-minGeneration` / `enc.minGeneration` | the lowest manifest generation to accept |
 | `remote.<name>.enc-installHook` / `enc.installHook` | `false` skips installing, and checking for, the pre-push guard. Default `true` |
-| `remote.<name>.enc-allowLfs` / `enc.allowLfs` | `true` pushes even though Git LFS could upload files on pre-push. Default `false` (see below) |
+| `remote.<name>.enc-allowLfs` / `enc.allowLfs` | `true` pushes even though Git LFS could upload files on pre-push, or the push carries LFS pointers. Default `false` (see below) |
 | `remote.<name>.enc-refuseForks` / `enc.refuseForks` | `false` accepts, with a warning, a manifest that forks from the one accepted before, once the participants agree to keep that view. Default `true` |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
@@ -77,9 +77,11 @@ URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.
 Git LFS files are not encrypted: LFS uploads them from its pre-push hook to
 its own server (`lfs.url`, normally the forge), and the helper only ever sees
 their pointers. A push is therefore refused while LFS holds files in the
-clone's LFS storage and a pre-push hook other than the guard is installed. Commit the files a fix needs outside LFS, set `lfs.url` in the clone's
-own config to an unreachable URL (it takes precedence over `.lfsconfig`),
-then set `enc-allowLfs`.
+clone's LFS storage and a pre-push hook other than the guard is installed,
+and so is a push carrying LFS pointers, which would reach the other
+participants without their files. Commit the files a fix needs outside LFS,
+set `lfs.url` in the clone's own config to an unreachable URL (it takes
+precedence over `.lfsconfig`), then set `enc-allowLfs`.
 
 Cloning an existing remote needs the public key of someone who pushes to it,
 obtained from them out of band, so a host cannot substitute a remote of its

@@ -1334,6 +1334,32 @@ fn git_lfs_pre_push_hook_blocks_the_push() {
 }
 
 #[test]
+fn git_lfs_pointers_are_not_pushed_alone() {
+    let sb = Sandbox::new("lfs-pointer");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    // What `git add` stores for an LFS-tracked file: its pointer.
+    sb.commit_text(
+        &a,
+        "big.bin",
+        "version https://git-lfs.github.com/spec/v1\n\
+         oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
+         size 12345\n",
+    );
+    let err = sb.git_fails(&a, &["push", "enc", "main"]);
+    assert!(err.contains("big.bin is a Git LFS pointer"), "{err}");
+
+    sb.git_ok(&a, &["config", "remote.enc.enc-allowLfs", "true"]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+}
+
+#[test]
 fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
     let sb = Sandbox::new("guard");
     let host = sb.host();

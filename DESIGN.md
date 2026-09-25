@@ -266,7 +266,11 @@ hook other than the guard exists (`hooks/pre-push`, under `core.hooksPath`
 too, or a `hook.*.command`). A hook is a shell script whose effect cannot be
 read off its text, so any such hook counts. Setting it is for a clone where
 LFS was neutralized (`lfs.url` pointed at nothing in the local config, which
-overrides `.lfsconfig`). Encrypting LFS objects into the backend, as a custom
+overrides `.lfsconfig`). Without LFS's hook, the push carries the pointers
+and not the files, and the other participants get nothing to resolve them
+with; so a push whose new blobs include an LFS pointer (a blob of at most
+1024 bytes in the pointer format) is refused as well, unless
+`enc-allowLfs` is set. Encrypting LFS objects into the backend, as a custom
 LFS transfer agent, is not implemented.
 
 ### 5.2 Fetch
@@ -640,7 +644,7 @@ through the helper at all (5.1).
 | `remote.<name>.enc-repo`, `enc.repo` | the `repo` id the remote must serve (section 6.1) |
 | `remote.<name>.enc-minGeneration`, `enc.minGeneration` | the lowest `generation` accepted (section 6.1) |
 | `remote.<name>.enc-installHook`, `enc.installHook` | boolean, default true. Install the pre-push guard where no pre-push hook exists, and report one that does not run it, on every contact (section 6.7) |
-| `remote.<name>.enc-allowLfs`, `enc.allowLfs` | boolean, default false. Push although a pre-push hook runs Git LFS (section 5.1) |
+| `remote.<name>.enc-allowLfs`, `enc.allowLfs` | boolean, default false. Push although a pre-push hook runs Git LFS, or the pushed commits hold LFS pointers (section 5.1) |
 | `remote.<name>.enc-refuseForks`, `enc.refuseForks` | boolean, default true. Refuse a manifest that forks from the accepted one; false accepts it with a warning (section 6.2) |
 | `fetch.fsckObjects`, `transfer.fsckObjects`, `fetch.fsck.*` | git's own keys; received objects are checked unless one of the first two is false (section 5.2) |
 
@@ -692,7 +696,7 @@ ed25519 keys:
 - a tampered trust file, with or without its tag line, is refused;
 - a hostile object (a `.git` tree entry) is refused on fetch;
 - a push is refused, before the hook runs, while a pre-push hook runs Git
-  LFS;
+  LFS, and a push carrying LFS pointers is refused;
 - the pre-push guard refuses to publish commits of an encrypted remote.
 
 Unit tests cover manifest parsing/serialization, refspec parsing and the trust
