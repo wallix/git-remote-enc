@@ -33,7 +33,9 @@
 - `git-remote-enc install-hook` installs a pre-push hook that refuses to push
   content of an encrypted remote to any other remote, such as the public
   repository before the disclosure date, including a backport made by
-  cherry-pick or squash; `--no-verify` bypasses it.
+  cherry-pick or squash, onto code that diverged around the fix, or through
+  a conflict resolution that kept the fix's added lines; `--no-verify`
+  bypasses it.
 
 - A push is refused while Git LFS could upload files alongside it (LFS holds
   files locally and a pre-push hook is installed): LFS would upload the files

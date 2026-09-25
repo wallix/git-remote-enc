@@ -1420,6 +1420,57 @@ fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
 }
 
 #[test]
+fn backports_onto_diverged_code_are_refused() {
+    let sb = Sandbox::new("backport");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let public = sb.dir("public.git");
+    sb.git_ok(&public, &["init", "-q", "--bare"]);
+    let seed = sb.repo("seed");
+    let code = "int f(int n)\n{\n\treturn n;\n}\n";
+    sb.commit_text(&seed, "a.c", code);
+    sb.git_ok(&seed, &["push", "-q", public.to_str().unwrap(), "main"]);
+    sb.git_ok(&sb.root, &["clone", "-q", public.to_str().unwrap(), "dev"]);
+    let dev = sb.root.join("dev");
+    sb.add_remote(&dev, &url, &alice, &[&alice_pub]);
+    let fixed_line = "\treturn n < 0 || n > LIMIT ? -EINVAL : n;\n";
+    sb.git_ok(&dev, &["checkout", "-q", "-b", "fix"]);
+    sb.commit_text(&dev, "a.c", &code.replace("\treturn n;\n", fixed_line));
+    sb.git_ok(&dev, &["push", "-q", "-u", "enc", "fix"]);
+
+    // A line added within the fix's diff context: the cherry-pick applies
+    // cleanly, and only the context of its diff differs.
+    sb.git_ok(&dev, &["checkout", "-q", "-b", "maint-3", "origin/main"]);
+    sb.commit_text(&dev, "a.c", &format!("/* header v1 */\n{code}"));
+    sb.git_ok(&dev, &["cherry-pick", "fix"]);
+    let err = sb.git_fails(&dev, &["push", "origin", "maint-3"]);
+    assert!(err.contains("contains the change of"), "{err}");
+
+    // The fixed line itself diverged: a conflict, resolved by hand.
+    sb.git_ok(&dev, &["checkout", "-q", "-b", "maint-2", "origin/main"]);
+    let maint = "long f(long n)\n{\n\treturn (long)n;\n}\n";
+    sb.commit_text(&dev, "a.c", maint);
+    assert!(!sb.git(&dev, &["cherry-pick", "fix"]).status.success());
+    fs::write(
+        dev.join("a.c"),
+        maint.replace("\treturn (long)n;\n", fixed_line),
+    )
+    .unwrap();
+    sb.git_ok(&dev, &["add", "a.c"]);
+    sb.git_ok(
+        &dev,
+        &["-c", "core.editor=true", "cherry-pick", "--continue"],
+    );
+    let err = sb.git_fails(&dev, &["push", "origin", "maint-2"]);
+    assert!(err.contains("contains the lines added by"), "{err}");
+
+    // The maintenance branch's own work still goes out.
+    sb.git_ok(&dev, &["reset", "-q", "--hard", "HEAD~1"]);
+    sb.git_ok(&dev, &["push", "-q", "origin", "maint-2"]);
+}
+
+#[test]
 fn the_guard_is_checked_on_every_contact() {
     let sb = Sandbox::new("reguard");
     let host = sb.host();
