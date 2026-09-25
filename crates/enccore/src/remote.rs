@@ -468,7 +468,8 @@ impl Remote {
                 }
                 // Two different manifests with one generation: the history
                 // forked (the host served another view, or rewound the branch
-                // under a pusher). Both are signed, so accept but say so.
+                // under a pusher). Both are signed: refused unless the
+                // participants settled on this one and turned that off.
                 let forked_here = m.generation == t.generation
                     && t.digest
                         .as_ref()
@@ -479,19 +480,31 @@ impl Remote {
                     && m.previous.is_some()
                     && t.digest.is_some()
                     && m.previous != t.digest;
-                if forked_here {
-                    info(&format!(
-                        "warning: {} now serves a different manifest for generation {} than the one \
-                         accepted earlier; the remote's history forked, check with the other participants",
+                let fork = if forked_here {
+                    Some(format!(
+                        "{} now serves a different manifest for generation {} than the one accepted \
+                         earlier",
                         self.backend.url, m.generation
-                    ));
-                }
-                if forked_before {
-                    info(&format!(
-                        "warning: {} serves a generation {} that does not follow the generation {} \
-                         accepted earlier; the remote's history forked, check with the other participants",
+                    ))
+                } else if forked_before {
+                    Some(format!(
+                        "{} serves a generation {} that does not follow the generation {} accepted \
+                         earlier",
                         self.backend.url, m.generation, t.generation
-                    ));
+                    ))
+                } else {
+                    None
+                };
+                match fork {
+                    Some(f) if self.cfg.refuse_forks => bail!(
+                        "{f}: the remote's history forked (the host served another view, or rewound \
+                         the branch under a pusher). Refusing it. Once the participants agree this \
+                         view is the one to keep, `git -c enc.refuseForks=false fetch` accepts it"
+                    ),
+                    Some(f) => info(&format!(
+                        "warning: {f}; the remote's history forked, check with the other participants"
+                    )),
+                    None => {}
                 }
             }
             None if self.cfg.participants.is_some() => info(&format!(

@@ -387,12 +387,14 @@ Read-only participants (`age1…` keys) cannot sign and therefore cannot push.
 ### 6.2 Rollback
 
 `generation` is strictly increasing. A reader refuses a manifest whose
-generation is lower than the last one it accepted, and warns when it is equal
-but the content differs (compared by the SHA-256 of the manifest text kept in
-the local state): two validly signed manifests with one generation mean the
-history forked, because the host served different views or rewound the branch
-under a pusher. A pusher always writes `previous + 1`; the lease
-guarantees "previous" is the real tip.
+generation is lower than the last one it accepted, and one whose generation
+is equal but whose content differs (compared by the SHA-256 of the manifest
+text kept in the local state): two validly signed manifests with one
+generation mean the history forked, because the host served different views
+or rewound the branch under a pusher. Which view to keep is the
+participants' decision; `enc.refuseForks = false` accepts the one served,
+with a warning, and it becomes the baseline. A pusher always writes
+`previous + 1`; the lease guarantees "previous" is the real tip.
 
 Generations are bounded from above too. Each push adds one backend commit and
 one generation, so a manifest may be at most the accepted generation plus the
@@ -490,8 +492,8 @@ chain down; a manifest reached that way is verified, and every one below the
 first break (a digest that does not match, an unreadable manifest, a manifest
 from before version 3 had `previous`) is printed as not verified, with its
 signer as a bare fingerprint, and the changes relative to it flagged. Connect
-also reports a manifest one generation past the accepted one whose
-`previous` is not the accepted one's digest: the history forked. Protecting the branch on
+also refuses a manifest one generation past the accepted one whose
+`previous` is not the accepted one's digest: the history forked (6.2). Protecting the branch on
 the host against force pushes, and keeping the host's push log, does.
 
 ### 6.7 Publishing by mistake
@@ -586,7 +588,7 @@ through the helper at all (5.1).
 | The host forges refs or a manifest | a manifest is accepted only when signed by a previously accepted participant (6.1) | none once a manifest has been accepted |
 | The host rolls the branch back | strictly increasing `generation`, checked against local state (6.2), or against `enc-minGeneration` on first contact (6.1) | a host can withhold new pushes from a client that never saw them (freeze); a first contact without `enc-minGeneration` accepts any generation its pinned signer signed |
 | A participant makes the remote unusable for everyone | a generation over the history's bound is refused (6.2); a list change not signed by an admin is refused (6.1) | a refused manifest at the tip blocks every client until the host restores the branch; the host accepts any push |
-| The host serves different views to different clients | a changed manifest for an accepted generation is reported (6.2) | detected only by a client that sees both views |
+| The host serves different views to different clients | a changed manifest for an accepted generation, or a next one not chained to it, is refused (6.2) | detected only by a client that sees both views, and further apart than one generation only by `log` |
 | The host substitutes its own remote on first contact | first contact needs a pinned participant list; `enc-repo` pins the repository; repo id lookup across URL spellings (6.1) | `enc.trustOnFirstUse = true` reopens it, by choice, and set in the global config it does so for every remote; without `enc-repo`, another remote signed by a pinned key passes |
 | The host deletes or recreates the branch | refused; `forget` needs a human decision (section 9) | availability: protect the branch on the host and keep a mirror; deletion stops work until restored |
 | A participant changes who participates | only admins change the lists; a push never does it implicitly (6.1, 6.3) | a remote from before format 2 has no admins until appointed; admins are fully trusted |
@@ -639,6 +641,7 @@ through the helper at all (5.1).
 | `remote.<name>.enc-minGeneration`, `enc.minGeneration` | the lowest `generation` accepted (section 6.1) |
 | `remote.<name>.enc-installHook`, `enc.installHook` | boolean, default true. Install the pre-push guard where no pre-push hook exists, and report one that does not run it, on every contact (section 6.7) |
 | `remote.<name>.enc-allowLfs`, `enc.allowLfs` | boolean, default false. Push although a pre-push hook runs Git LFS (section 5.1) |
+| `remote.<name>.enc-refuseForks`, `enc.refuseForks` | boolean, default true. Refuse a manifest that forks from the accepted one; false accepts it with a warning (section 6.2) |
 | `fetch.fsckObjects`, `transfer.fsckObjects`, `fetch.fsck.*` | git's own keys; received objects are checked unless one of the first two is false (section 5.2) |
 
 URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to
