@@ -54,7 +54,7 @@ ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "e
 sha2 = "0.10"
 # HMAC-SHA256 authenticating the local trust state. Already in the tree
 # through age (HKDF); a MAC is not something to maintain by hand.
-hmac = "0.12"
+hmac = "0.13"
 # Wiping secrets (pack keys, the decrypted manifest, passphrases, derived
 # keys) from memory when they are dropped. Already in the tree through age
 # and ssh-key, which use it for their own key types.
