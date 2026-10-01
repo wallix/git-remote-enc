@@ -18,6 +18,7 @@ pub mod git;
 pub mod guard;
 pub mod manifest;
 pub mod remote;
+pub mod setup;
 pub mod state;
 pub mod version;
 

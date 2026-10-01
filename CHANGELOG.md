@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- New setup commands: `init` creates a remote (key, remote, participant list,
+  guard) after checking the host, `invite` adds participants and prints the
+  `join` command that pins the remote for them, `join` sets their clone up and
+  fetches, `doctor` reports everything a push or fetch could trip on.
+  `participants --add/--remove` changes the list in one step.
+
 - `install-hook --chain` puts the guard in front of an existing pre-push
   hook; `install-hook` where the guard is already installed is no longer an
   error.

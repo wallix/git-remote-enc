@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ssh_key::PrivateKey;
 use zeroize::Zeroizing;
 
-use crate::backend::{Backend, DEFAULT_BRANCH, PushOutcome};
+use crate::backend::{Backend, PushOutcome};
 use crate::config::Config;
 use crate::crypto::{self, HashReader, HashWriter, Identity, Participant, TrustKey};
 use crate::git::{self, Oid, Streaming, TreeEntry};
@@ -163,6 +163,12 @@ pub struct Access {
     pub admins_diff: Option<ParticipantDiff>,
 }
 
+pub struct Pins {
+    pub repo: String,
+    pub generation: u64,
+    pub participants: Vec<String>,
+}
+
 pub enum PushStatus {
     Ok(String),
     Error(String, String),
@@ -188,22 +194,8 @@ impl Remote {
     /// `name` is git's remote name (absent when it equals the URL); `url` is
     /// the helper URL with or without its `enc::` prefix.
     pub fn open(name: Option<&str>, url: &str) -> Result<Self> {
-        let url = url.strip_prefix("enc::").unwrap_or(url);
-        let (url, fragment) = match url.rsplit_once('#') {
-            Some((u, f)) if !f.is_empty() => (u, Some(f)),
-            _ => (url, None),
-        };
-        // git would parse a leading dash as an option (`--upload-pack=…`)
-        // wherever the URL is not behind `--`.
-        if url.is_empty() || url.starts_with('-') {
-            bail!("refusing the backend URL `{url}`: it is empty or starts with `-`");
-        }
-        let branch = fragment.unwrap_or(DEFAULT_BRANCH);
-        let branch = if branch.starts_with("refs/") {
-            branch.to_owned()
-        } else {
-            format!("refs/heads/{branch}")
-        };
+        let (url, branch) = crate::setup::split_url(url)?;
+        let url = url.as_str();
         // Per repository, not per worktree: trust accepted in one worktree
         // must hold in all of them.
         let state = State::open(&git::common_dir()?, url, &branch)?;
@@ -233,6 +225,34 @@ impl Remote {
 
     pub fn url(&self) -> &str {
         &self.backend.url
+    }
+
+    pub fn identity_paths(&self) -> &[PathBuf] {
+        &self.cfg.identity_paths
+    }
+
+    /// Whether contact installs, or reports on, the pre-push guard.
+    pub fn set_install_hook(&mut self, on: bool) {
+        self.cfg.install_hook = on;
+    }
+
+    /// What a new clone pins on first contact (DESIGN.md §6.1); `None` for
+    /// a remote nobody pushed to yet.
+    pub fn pins(&mut self) -> Result<Option<Pins>> {
+        self.connect()?;
+        Ok(self.manifest.as_ref().map(|m| Pins {
+            repo: m.repo_id.clone(),
+            generation: m.generation,
+            participants: m.participants.clone(),
+        }))
+    }
+
+    /// Why a push would be refused for Git LFS, if it would.
+    pub fn lfs_refusal(&self) -> Result<Option<String>> {
+        if self.cfg.allow_lfs {
+            return Ok(None);
+        }
+        lfs_pre_push_hook()
     }
 
     fn identities(&mut self) -> Result<&[Identity]> {

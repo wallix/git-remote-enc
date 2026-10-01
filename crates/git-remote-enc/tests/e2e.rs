@@ -1926,6 +1926,86 @@ fn log_flags_a_time_going_backwards() {
 }
 
 #[test]
+fn init_invite_and_join_set_a_remote_up() {
+    let sb = Sandbox::new("setup");
+    let host = sb.host();
+    let host_url = host.to_str().unwrap();
+    let (alice, _) = sb.keypair("alice");
+    let (bob, bob_pub) = sb.keypair("bob");
+    let (carol, _) = sb.keypair("carol");
+
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.enc_ok(
+        &a,
+        &[
+            "init",
+            "enc",
+            host_url,
+            "--identity",
+            alice.to_str().unwrap(),
+        ],
+    );
+    let (ok, _, err) = sb.enc(&a, &["init", "enc", host_url]);
+    assert!(!ok && err.contains("remote enc already exists"), "{err}");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let (ok, _, err) = sb.enc(&a, &["init", "again", host_url]);
+    assert!(
+        !ok && err.contains("already holds an encrypted remote"),
+        "{err}"
+    );
+
+    // The printed command pins the participants, repository and generation.
+    let line = sb.enc_ok(&a, &["invite", "enc", &bob_pub, "--yes"]);
+    assert!(line.starts_with("git-remote-enc join 'enc' "), "{line}");
+    assert!(
+        line.contains("--repo ") && line.contains("--min-generation 2"),
+        "{line}"
+    );
+    let b = sb.repo("bob");
+    let join = format!("{} --identity {}", line.trim(), bob.display());
+    let out = sb.cmd(&b, "sh").args(["-c", &join]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        sb.git_ok(&b, &["rev-parse", "refs/remotes/enc/main"]),
+        sb.git_ok(&a, &["rev-parse", "main"])
+    );
+    sb.git_ok(&b, &["checkout", "-q", "-b", "main", "enc/main"]);
+    sb.commit_text(&b, "two", "2\n");
+    sb.git_ok(&b, &["push", "-q", "enc", "main"]);
+
+    // Someone not invited is told what to send.
+    let c = sb.repo("carol");
+    let join = format!("{} --identity {}", line.trim(), carol.display());
+    let out = sb.cmd(&c, "sh").args(["-c", &join]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("If you are not a participant yet"),
+        "{err}"
+    );
+
+    // Removed by fingerprint, bob reads no more.
+    let fp = ssh_key::PublicKey::from_openssh(&bob_pub)
+        .unwrap()
+        .fingerprint(ssh_key::HashAlg::Sha256)
+        .to_string();
+    sb.git_ok(&a, &["pull", "-q", "enc", "main"]);
+    sb.enc_ok(&a, &["participants", "--remove", &fp, "--yes", "enc"]);
+    let out = sb.enc_ok(&a, &["participants", "enc"]);
+    assert!(
+        !out.contains("bob") && out.contains("the configuration matches"),
+        "{out}"
+    );
+    sb.commit_text(&a, "three", "3\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.git_fails(&b, &["fetch", "enc"]);
+}
+
+#[test]
 fn install_hook_chain_runs_the_guard_before_an_existing_hook() {
     let sb = Sandbox::new("chain");
     let host = sb.host();
@@ -1978,4 +2058,38 @@ fn install_hook_chain_runs_the_guard_before_an_existing_hook() {
     sb.git_ok(&a, &["push", "-q", "enc", "main"]);
     let err = sb.git_fails(&a, &["push", "public", "main"]);
     assert!(err.contains("refusing to push to public"), "{err}");
+}
+
+#[test]
+fn doctor_reports_what_would_get_in_the_way() {
+    let sb = Sandbox::new("doctor");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let out = sb.enc_ok(&a, &["doctor", "enc"]);
+    assert!(
+        out.contains("ok    manifest") && out.contains("ok    participant"),
+        "{out}"
+    );
+
+    fs::write(a.join(".git/hooks/pre-push"), "#!/bin/sh\n").unwrap();
+    let (ok, out, _) = sb.enc(&a, &["doctor", "enc"]);
+    assert!(!ok && out.contains("FAIL  pre-push guard"), "{out}");
+    // doctor changes nothing.
+    assert_eq!(
+        fs::read_to_string(a.join(".git/hooks/pre-push")).unwrap(),
+        "#!/bin/sh\n"
+    );
+
+    // State left from a remote the host deleted.
+    sb.git_ok(&host, &["update-ref", "-d", "refs/heads/enc"]);
+    let (ok, out, _) = sb.enc(&a, &["doctor", "enc"]);
+    assert!(
+        !ok && out.contains("FAIL  local state") && out.contains("forget"),
+        "{out}"
+    );
 }

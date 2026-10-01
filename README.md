@@ -4,13 +4,13 @@
 repository — GitLab, GitHub, or any bare repo over ssh.**
 
 ```bash
-ssh-keygen -t ed25519 -f ~/.ssh/enc_vault      # a key for this remote only
-git remote add secret enc::git@gitlab.example.com:team/vault.git
-git config remote.secret.enc-identity ~/.ssh/enc_vault
-git config --add remote.secret.enc-participants "$(cat ~/.ssh/enc_vault.pub)"
-git config --add remote.secret.enc-participants "ssh-ed25519 AAAA… alice"
+git-remote-enc init secret git@gitlab.example.com:team/vault.git   # key, remote, guard
 git push secret main
+git-remote-enc invite secret "ssh-ed25519 AAAA… alice"            # prints alice's join command
 ```
+
+Alice runs the printed `git-remote-enc join …` in her clone. Before that, she
+sends her public key; `join` creates her key and prints it if she has none.
 
 Use a key that is not registered with any forge: the host can match the
 ciphertext's recipient stanzas against the public keys forges publish
@@ -83,6 +83,29 @@ files. Commit the files a fix needs outside LFS, set `lfs.url` in the clone's
 own config to an unreachable URL (it takes precedence over `.lfsconfig`), then
 set `enc-allowLfs`.
 
+## Setting up
+
+`git-remote-enc init <name> <git-url>` checks the host is reachable and
+empty (an scp-style URL without `git@` is flagged: ssh would log in as you),
+creates `~/.ssh/enc_<name>` with `ssh-keygen` unless `--identity` names a
+key, adds the remote with you as its participant (plus every
+`--participant <key|@file>`), and installs the pre-push guard or puts it in
+front of an existing hook. The first push creates the remote.
+
+`git-remote-enc invite <remote> [<key>…]` adds the keys (showing the change,
+asking first unless `--yes`) and prints the command for them:
+`git-remote-enc join <name> <git-url> --repo … --min-generation …
+--participant …`, which pins the remote they get (see below) and sets up
+their identity and guard, then fetches. It is not secret, but it must reach
+them over a channel the host does not control.
+
+`git-remote-enc doctor <remote>` checks for push or fetch problems: the host and
+its credentials, identity files, the guard, a shallow clone, Git LFS, the
+manifest, whether you are a participant, and a pending participant change. It
+exits 1 on a problem and installs nothing.
+
+## Joining by hand
+
 Cloning an existing remote needs the public key of someone who pushes to it,
 obtained from them out of band, so a host cannot substitute a remote of its
 own:
@@ -116,7 +139,14 @@ Pack keys are replaced by `<redacted>` unless `--show-keys` is given: together
 they decrypt the whole history, so keep them out of terminals, logs and bug
 reports.
 
-Change who can read and push by editing `remote.<name>.enc-participants`, then:
+Change who can read and push:
+
+```bash
+git-remote-enc participants --add "ssh-ed25519 AAAA… bob" secret   # shows the change, asks, pushes it
+git-remote-enc participants --remove SHA256:… secret                # a key or its fingerprint
+```
+
+or edit `remote.<name>.enc-participants`, then:
 
 ```bash
 git-remote-enc participants secret          # the remote's list and the pending change

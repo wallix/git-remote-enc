@@ -89,7 +89,9 @@ Two crates:
   `backend` (git-hosted store), `state` (local per-remote state), `remote`
   (connect / list / fetch / push), `config`, `guard` (pre-push hook,
   section 6.7).
-- `git-remote-enc` — the protocol loop and a `manifest` inspection subcommand.
+- `git-remote-enc` — the protocol loop, inspection subcommands (`manifest`,
+  `participants`, `log`) and setup ones (`init`, `invite`, `join`,
+  `doctor`, `install-hook`; section 8.1), over `enccore`'s `setup`.
 
 All object-level work (pack generation, thin-pack completion, indexing, transfer
 negotiation) is delegated to `git pack-objects`, `git index-pack`, `git fetch`
@@ -664,6 +666,33 @@ URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to
 git verbatim, so ssh aliases, `https://token@…`, insteadOf rewrites and
 credential helpers all work.
 
+### 8.1 Setup commands
+
+They write only the keys of the table above and run the same checks as a
+push or fetch, earlier and in one place:
+
+- `init <name> <git-url>` refuses a host that is unreachable (with a hint for
+  an scp-style URL without a user) or already has the backend branch, makes
+  `~/.ssh/enc_<name>` with `ssh-keygen` unless `--identity` is given, sets the
+  identity and participant list (its public key first, read from the key
+  file without the passphrase), and installs or chains the guard.
+- `invite <remote> [<key>…]` adds the keys as `participants --add` does, then
+  prints `join` with the current participant list, `repo` and `generation`:
+  the pins of a first contact (section 6.1). They are authentic only if the
+  line reaches the joiner over a channel the host does not control.
+- `join <name> <git-url> --participant … [--repo] [--min-generation]` writes
+  those pins as `enc-participants`, `enc-repo` and `enc-minGeneration`, sets
+  up identity and guard, and fetches; on failure it prints the joiner's key to
+  send to a participant.
+- `participants --add/--remove <remote>` edits `enc-participants` (seeded from
+  the remote's list when unset; a list read from `@<file>` is refused), shows
+  the difference, asks on the terminal (`--yes` skips) and applies it; a
+  refusal restores the previous configuration.
+- `doctor <remote>` reports, without installing the guard: the host, the
+  identity files, the guard, a shallow clone, Git LFS, then the manifest
+  (first-contact and local-state refusals included), membership and pending
+  list changes.
+
 ## 9. Failure modes and recovery
 
 - **Push interrupted after step 7:** the host has the new commit, the local
@@ -712,6 +741,9 @@ ed25519 keys:
 - a push that reaches a shallow clone's boundary is refused;
 - `install-hook --chain` runs the guard ahead of an existing hook, which
   still gets the ref list;
+- `init`, `invite` and `join` set a remote up end to end, `participants
+  --remove` locks a participant out of new pushes, and `doctor` reports a
+  foreign hook and state left from a deleted remote;
 - the pre-push guard refuses to publish commits of an encrypted remote,
   backports onto diverged code and through a conflict included, and every
   contact reinstalls it when missing or reports it when replaced.
