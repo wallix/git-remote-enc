@@ -209,10 +209,10 @@ fn read_trust(path: &Path, keys: &[TrustKey]) -> Result<Option<Trust>> {
             body
         }
         // Stripping the tag must not downgrade the file to unauthenticated
-        // state. Files from before authentication existed (0.1.0) go too.
+        // state. Files from pre-release builds, which had no tag, go too.
         _ => bail!(
             "{} carries no authentication tag: it was modified outside git-remote-enc, or written \
-             by 0.1.0. The accepted trust state for this remote cannot be relied on; after checking \
+             by a pre-release build. The accepted trust state for this remote cannot be relied on; after checking \
              why, `git-remote-enc forget <remote>` drops it",
             path.display()
         ),

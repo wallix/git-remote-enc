@@ -169,10 +169,10 @@ A reader holds the manifest in memory to decrypt and verify it, before it
 can tell who wrote it, so it refuses a manifest blob over 64 MiB (about
 450,000 pushes' worth of pack lines) without reading it.
 
-Version 1 had no `admin` item, version 2 no `previous` item. The first push
-by a version 3 writer rewrites either as version 3 (a version 1 manifest with
-an empty admin list), which older binaries then refuse to read: every
-participant must upgrade.
+Versions 1 and 2 come from pre-release builds: version 1 had no `admin`
+item, version 2 no `previous` item. Readers still accept both, and the first
+push rewrites either as version 3 (a version 1 manifest with an empty admin
+list).
 
 ### 4.3 Manifest envelope
 
@@ -329,7 +329,7 @@ every linked worktree, so trust accepted in one worktree holds in all):
   HMAC-SHA256(identity secret, "git-remote-enc local trust state v1") for the
   first configured identity (`key id` is its public fingerprint or age
   recipient). A file whose tag does not verify, or that has no tag line, is
-  refused; so is state written by 0.1.0, which had none. The tag stops a
+  refused; so is state written by pre-release builds, which had none. The tag stops a
   rewrite by anything that lacks the private key; it does not stop someone who
   can write `.git` and simply runs code through a hook instead.
 - `<common>/enc/<key>/tmp/` — temporary files for the pack pipeline.
