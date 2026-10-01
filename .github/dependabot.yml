@@ -10,6 +10,13 @@ updates:
       cargo:
         patterns: ["*"]
         update-types: [minor, patch]
+    # sha2 and hmac must share age's and ssh-key's digest line (0.10), or the
+    # MAC no longer builds; bump the three together once those two move.
+    ignore:
+      - dependency-name: sha2
+        versions: [">=0.11"]
+      - dependency-name: hmac
+        versions: [">=0.13"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
