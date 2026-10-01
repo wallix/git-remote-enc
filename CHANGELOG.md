@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The pre-push guard returns at once on a push that only deletes refs,
+  instead of walking the encrypted remote's whole history.
+
 - A push from a shallow clone whose history reaches the clone's boundary is
   refused: the pack lacked the missing parents, so nobody could fetch it.
   Run `git fetch --unshallow` first.

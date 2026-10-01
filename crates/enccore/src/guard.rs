@@ -57,6 +57,11 @@ pub fn check_pre_push(remote: &str, url: &str, updates: &str) -> Result<Vec<Leak
             pushed.push((local_ref.to_owned(), local.to_owned()));
         }
     }
+    // Only deletions: nothing leaves, and walking the encrypted history
+    // costs as much as a full push check.
+    if pushed.is_empty() {
+        return Ok(vec![]);
+    }
 
     // Each encrypted remote's content: its remote-tracking refs and local
     // branches building on it, which hold commits not pushed there yet.
