@@ -272,6 +272,16 @@ with; so a push whose new blobs include an LFS pointer (a blob of at most
 `enc-allowLfs` is set. Encrypting LFS objects into the backend, as a custom
 LFS transfer agent, is not implemented.
 
+**Shallow clones.** A shallow clone lacks the parents of its boundary
+commits (`$GIT_DIR/shallow`), and `pack-objects` stops at them: a pack of a
+range that reaches a boundary names parents it does not carry, and every
+fetch of it fails git's connectivity check. A push is refused when a commit
+reachable from the new tips but not from the manifest refs is a boundary,
+with a hint to `git fetch --unshallow`. A boundary the remote already holds is
+fine, so a shallow clone of a populated remote still pushes new commits. The
+helper does not unshallow by itself: the shallow file does not record which
+remote the clone came from, and the download can be the whole history.
+
 ### 5.2 Fetch
 
 After `list`, git sends the `fetch <oid> <name>` lines it wants. The helper
@@ -697,6 +707,7 @@ ed25519 keys:
 - a hostile object (a `.git` tree entry) is refused on fetch;
 - a push is refused, before the hook runs, while a pre-push hook runs Git
   LFS, and a push carrying LFS pointers is refused;
+- a push that reaches a shallow clone's boundary is refused;
 - the pre-push guard refuses to publish commits of an encrypted remote,
   backports onto diverged code and through a conflict included, and every
   contact reinstalls it when missing or reports it when replaced.

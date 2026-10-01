@@ -1071,6 +1071,16 @@ impl Remote {
                  remote.<name>.enc-allowLfs=true to push the pointers anyway"
             );
         }
+        // A shallow clone's pack would reference parents it does not hold,
+        // and every fetch of it would fail.
+        if let Some(c) = git::shallow_boundaries(&wants, &excludes)?.first() {
+            bail!(
+                "this clone is shallow and the pushed history reaches its boundary at {c}, whose \
+                 parents are not here: the other participants could not fetch the push. Fetch the \
+                 full history first (git fetch --unshallow <the remote it was cloned from>), then \
+                 push again"
+            );
+        }
         let pack = if wants.is_empty() {
             None
         } else {

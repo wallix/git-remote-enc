@@ -311,10 +311,8 @@ pub fn have_objects(oids: &[Oid]) -> Result<Vec<Oid>> {
         .collect())
 }
 
-/// The paths of the Git LFS pointers among the blobs reachable from `tips`
-/// but not from `excludes`: files whose content is in LFS storage, not in
-/// the objects.
-pub fn lfs_pointers(tips: &[Oid], excludes: &[Oid]) -> Result<Vec<String>> {
+/// `rev-list --stdin` input for `tips` minus `excludes`.
+fn rev_list_input(tips: &[Oid], excludes: &[Oid]) -> String {
     let mut revs = String::new();
     for t in tips {
         revs.push_str(t);
@@ -325,6 +323,45 @@ pub fn lfs_pointers(tips: &[Oid], excludes: &[Oid]) -> Result<Vec<String>> {
         revs.push_str(e);
         revs.push('\n');
     }
+    revs
+}
+
+/// The commits of `tips` minus `excludes` that are shallow boundaries of
+/// this clone: their parents are missing here, so a pack of that range
+/// references commits it cannot carry.
+pub fn shallow_boundaries(tips: &[Oid], excludes: &[Oid]) -> Result<Vec<Oid>> {
+    let path = run_line([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "shallow",
+    ])?;
+    let shallow = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e).with_context(|| format!("reading {path}")),
+    };
+    let shallow: std::collections::HashSet<&str> = shallow.lines().collect();
+    if shallow.is_empty() {
+        return Ok(vec![]);
+    }
+    let listed = run_input(
+        ["rev-list", "--stdin"],
+        rev_list_input(tips, excludes).as_bytes(),
+    )?;
+    Ok(String::from_utf8(listed)
+        .context("rev-list output is not UTF-8")?
+        .lines()
+        .filter(|c| shallow.contains(c))
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The paths of the Git LFS pointers among the blobs reachable from `tips`
+/// but not from `excludes`: files whose content is in LFS storage, not in
+/// the objects.
+pub fn lfs_pointers(tips: &[Oid], excludes: &[Oid]) -> Result<Vec<String>> {
+    let revs = rev_list_input(tips, excludes);
     // The pointer format caps a pointer at 1024 bytes.
     let listed = run_input(
         [

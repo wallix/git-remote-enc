@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A push from a shallow clone whose history reaches the clone's boundary is
+  refused: the pack lacked the missing parents, so nobody could fetch it.
+  Run `git fetch --unshallow` first.
+
 - The pre-push guard no longer hangs a push to a plain remote when the
   encrypted remote holds several hundred commits that remote lacks.
 

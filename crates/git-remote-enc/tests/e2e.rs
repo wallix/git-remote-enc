@@ -1360,6 +1360,49 @@ fn git_lfs_pointers_are_not_pushed_alone() {
 }
 
 #[test]
+fn shallow_history_is_not_pushed() {
+    let sb = Sandbox::new("shallow");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let public = sb.dir("public.git");
+    sb.git_ok(&public, &["init", "-q", "--bare"]);
+    let seed = sb.repo("seed");
+    sb.commit_text(&seed, "one", "1\n");
+    sb.commit_text(&seed, "two", "2\n");
+    sb.git_ok(&seed, &["push", "-q", public.to_str().unwrap(), "main"]);
+    let public_url = format!("file://{}", public.display());
+
+    // The pack would name the first commit as a parent without holding it.
+    sb.git_ok(&sb.root, &["clone", "-q", "--depth=1", &public_url, "dev"]);
+    let dev = sb.root.join("dev");
+    sb.add_remote(&dev, &url, &alice, &[&alice_pub]);
+    let err = sb.git_fails(&dev, &["push", "enc", "main"]);
+    assert!(err.contains("this clone is shallow"), "{err}");
+    sb.git_ok(&dev, &["fetch", "-q", "--unshallow", "origin"]);
+    sb.git_ok(&dev, &["push", "-q", "enc", "main"]);
+
+    // A boundary the remote already holds is fine: only new commits are packed.
+    sb.git_ok(&sb.root, &["clone", "-q", "--depth=1", &public_url, "dev2"]);
+    let dev2 = sb.root.join("dev2");
+    sb.add_remote(&dev2, &url, &alice, &[&alice_pub]);
+    sb.commit_text(&dev2, "three", "3\n");
+    sb.git_ok(
+        &dev2,
+        &[
+            "-c",
+            "enc.trustOnFirstUse=true",
+            "push",
+            "-q",
+            "enc",
+            "main",
+        ],
+    );
+    let c = sb.clone("bob", &url, &alice);
+    assert_eq!(sb.git_ok(&c, &["rev-list", "--count", "main"]).trim(), "3");
+}
+
+#[test]
 fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
     let sb = Sandbox::new("guard");
     let host = sb.host();
