@@ -33,29 +33,38 @@ and for why this exists instead of git-remote-gcrypt.
 
 ## Installation
 
+From a release (`linux-x86_64`, `linux-aarch64`, `macos-x86_64`,
+`macos-aarch64`), verified before it is unpacked:
+
 ```bash
-cargo install --path crates/git-remote-enc
+v=v0.1.0 p=linux-x86_64
+gh release download "$v" --repo wallix/git-remote-enc -p "git-remote-enc-$p.*"
+sha256sum -c "git-remote-enc-$p.sha256"
+gh attestation verify "git-remote-enc-$p.tar.gz" --repo wallix/git-remote-enc
+tar -xzf "git-remote-enc-$p.tar.gz" git-remote-enc && install -m 755 git-remote-enc ~/.local/bin/
 ```
 
-Release binaries are built reproducibly: `./build.sh --verify` (Docker or vk)
-builds a static-musl binary inside a Nix-pinned image, rebuilds it from a clean
-copy and checks the two are byte-identical. `dist/git-remote-enc.sha256` records
-the commit and every pinned input so a release can be re-derived and compared
-years later.
+From source: `cargo install --git https://github.com/wallix/git-remote-enc git-remote-enc`.
+
+The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
+`enc::` URL. It needs `git`, and `ssh-keygen` for `init` and `join` to create
+a key. Windows is not supported.
 
 Every release archive carries Sigstore-signed SLSA build provenance and a
 CycloneDX SBOM (`git-remote-enc-<platform>.cdx.json`), both attested by the
-release workflow. Verify an archive before installing it:
+release workflow. Offline, verify against the bundle published with the
+release:
 
 ```bash
-gh attestation verify git-remote-enc-linux-x86_64.tar.gz --repo wallix/git-remote-enc
-# offline, with the bundle published next to the archives:
 gh attestation verify git-remote-enc-linux-x86_64.tar.gz --repo wallix/git-remote-enc \
   --bundle git-remote-enc.provenance.sigstore.jsonl
 ```
 
-The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
-`enc::` URL.
+Linux binaries are reproducible: `./build.sh --verify` (Docker or vk) builds a
+static-musl binary inside a Nix-pinned image, rebuilds it from a clean copy and
+checks they are byte-identical. Its `dist/git-remote-enc.sha256`, published as
+`git-remote-enc-linux-<arch>.build-info.txt`, records the commit and every
+pinned input, so a release can be re-derived and compared years later.
 
 ## Configuration
 
