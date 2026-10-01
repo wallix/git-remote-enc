@@ -518,7 +518,9 @@ the second with one command. Every contact with an encrypted remote (a
 clone, a fetch, a push) checks for a pre-push hook running
 `git-remote-enc pre-push <remote> <url>` and installs it where none exists,
 unless `enc.installHook = false`. A pre-push hook that does not run the guard
-(it has to call it itself), a guard that is not executable, or a
+(it has to call it itself: `install-hook --chain` inserts the call after
+the `#!` line of a shell hook, reading the ref list once and handing it to
+the rest of the hook on stdin), a guard that is not executable, or a
 `core.hooksPath` directory without one is left alone and reported, on every
 contact: another tool (`git lfs install --force`) can replace the guard at
 any time. `git-remote-enc install-hook` installs it by hand. The hook refuses a push
@@ -708,6 +710,8 @@ ed25519 keys:
 - a push is refused, before the hook runs, while a pre-push hook runs Git
   LFS, and a push carrying LFS pointers is refused;
 - a push that reaches a shallow clone's boundary is refused;
+- `install-hook --chain` runs the guard ahead of an existing hook, which
+  still gets the ref list;
 - the pre-push guard refuses to publish commits of an encrypted remote,
   backports onto diverged code and through a conflict included, and every
   contact reinstalls it when missing or reports it when replaced.

@@ -138,7 +138,9 @@ including cherry-picked backports, so an accidental `git push origin` does not
 publish an embargoed fix. Push with `--no-verify` to publish intentionally. It
 is not installed over an existing pre-push hook or into a `core.hooksPath`
 directory (both are reported each time), nor with `enc.installHook=false`;
-`git-remote-enc install-hook` installs it by hand.
+`git-remote-enc install-hook` installs it by hand, and `install-hook --chain`
+puts it at the top of an existing shell hook (kept as `pre-push.enc-orig`),
+which then gets git's ref list on stdin as before.
 
 `git-remote-enc forget <remote>` drops the local trust state of a remote, which
 the helper otherwise refuses to discard when the remote was recreated,

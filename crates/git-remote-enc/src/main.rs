@@ -54,13 +54,13 @@ fn run() -> Result<()> {
             participants(&mut open_by_name_or_url(target)?, target, apply)
         }
         [cmd, remote, url] if cmd == "pre-push" => pre_push(remote, url),
-        [cmd] if cmd == "install-hook" => {
-            let path = enccore::guard::install_hook()?;
-            eprintln!(
-                "enc: installed {}: pushing commits of an encrypted remote anywhere else is refused",
-                path.display()
-            );
-            Ok(())
+        [cmd, rest @ ..] if cmd == "install-hook" && rest.len() <= 1 => {
+            let chain = match rest {
+                [] => false,
+                [flag] if flag == "--chain" => true,
+                _ => usage(),
+            };
+            install_hook(chain)
         }
         [cmd, target] if cmd == "log" => log(&mut open_by_name_or_url(target)?),
         [cmd, target] if cmd == "forget" => {
@@ -79,7 +79,7 @@ fn run() -> Result<()> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc participants [--apply] <remote|url>\n       git-remote-enc log <remote|url>\n       git-remote-enc forget <remote|url>\n       git-remote-enc install-hook\n       git-remote-enc pre-push <remote> <url>   (as a pre-push hook)\n       git-remote-enc --version"
+        "usage: git-remote-enc <remote> <url>   (invoked by git for enc:: URLs)\n       git-remote-enc manifest [--show-keys] <remote|url>\n       git-remote-enc participants [--apply] <remote|url>\n       git-remote-enc log <remote|url>\n       git-remote-enc forget <remote|url>\n       git-remote-enc install-hook [--chain]\n       git-remote-enc pre-push <remote> <url>   (as a pre-push hook)\n       git-remote-enc --version"
     );
     std::process::exit(2);
 }
@@ -221,6 +221,32 @@ fn pre_push(remote: &str, url: &str) -> Result<()> {
         "refusing to push to {remote}: it would publish commits of an encrypted remote. If that is \
          the disclosure, push with --no-verify"
     )
+}
+
+fn install_hook(chain: bool) -> Result<()> {
+    use enccore::guard::{HookState, chain_hook, hook_state, install_hook};
+    let (state, path) = hook_state()?;
+    match state {
+        HookState::Guard | HookState::NotExecutable => {
+            eprintln!("enc: {} already runs the guard", path.display());
+            return Ok(());
+        }
+        HookState::Other if chain => {
+            let path = chain_hook()?;
+            eprintln!(
+                "enc: {} now runs the guard first (the original is pre-push.enc-orig beside it)",
+                path.display()
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+    let path = install_hook()?;
+    eprintln!(
+        "enc: installed {}: pushing commits of an encrypted remote anywhere else is refused",
+        path.display()
+    );
+    Ok(())
 }
 
 /// A configured remote name resolves to its URL and its config.

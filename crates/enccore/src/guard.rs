@@ -264,48 +264,141 @@ fn trivial_objects() -> Result<BTreeSet<Oid>> {
 /// are left alone. Another tool (`git lfs install --force`) may replace
 /// the guard at any time, so a check on first contact only is not enough.
 pub fn ensure_hook() -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let path = git::hook_path("pre-push")?;
     let unguarded = "so nothing stops a push of this remote's commits to a plain remote";
     let silence = "enc.installHook=false silences this";
-    match std::fs::read(&path) {
+    match hook_state()? {
+        (HookState::Guard, _) => {}
+        (HookState::NotExecutable, path) => info(&format!(
+            "warning: {} is not executable, so git does not run it, {unguarded}; \
+             chmod +x it ({silence}; DESIGN.md §6.7)",
+            path.display()
+        )),
+        (HookState::Other, path) => info(&format!(
+            "warning: {} exists and does not run the git-remote-enc guard, {unguarded}; \
+             `git-remote-enc install-hook --chain` makes it run `git-remote-enc pre-push \"$1\" \"$2\"` \
+             first ({silence}; DESIGN.md §6.7)",
+            path.display()
+        )),
+        (HookState::MissingHooksPath, path) => info(&format!(
+            "warning: core.hooksPath is set and {} does not exist, {unguarded}; see \
+             `git-remote-enc install-hook` ({silence}; DESIGN.md §6.7)",
+            path.display()
+        )),
+        (HookState::Missing, _) => {
+            let path = install_hook()?;
+            info(&format!(
+                "installed the pre-push guard {} (enc.installHook=false turns this off)",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Where the pre-push hook stands, and its path.
+pub enum HookState {
+    /// It runs the guard.
+    Guard,
+    /// It runs the guard but git does not run it.
+    NotExecutable,
+    /// It does not run the guard.
+    Other,
+    /// None, and the guard can be installed.
+    Missing,
+    /// None, in a `core.hooksPath` directory shared with other clones.
+    MissingHooksPath,
+}
+
+pub fn hook_state() -> Result<(HookState, std::path::PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = git::hook_path("pre-push")?;
+    let state = match std::fs::read(&path) {
         Ok(text) if String::from_utf8_lossy(&text).contains("git-remote-enc pre-push") => {
             let mode = std::fs::metadata(&path)
                 .with_context(|| format!("reading {}", path.display()))?
                 .permissions()
                 .mode();
             if mode & 0o111 == 0 {
-                info(&format!(
-                    "warning: {} is not executable, so git does not run it, {unguarded}; \
-                     chmod +x it ({silence}; DESIGN.md §6.7)",
-                    path.display()
-                ));
+                HookState::NotExecutable
+            } else {
+                HookState::Guard
             }
         }
-        Ok(_) => info(&format!(
-            "warning: {} exists and does not run the git-remote-enc guard, {unguarded}; make it \
-             run `git-remote-enc pre-push \"$1\" \"$2\"` ({silence}; DESIGN.md §6.7)",
-            path.display()
-        )),
+        Ok(_) => HookState::Other,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if git::config("core.hooksPath")?.is_some() {
-                info(&format!(
-                    "warning: core.hooksPath is set and {} does not exist, {unguarded}; see \
-                     `git-remote-enc install-hook` ({silence}; DESIGN.md §6.7)",
-                    path.display()
-                ));
+                HookState::MissingHooksPath
             } else {
-                let path = install_hook()?;
-                info(&format!(
-                    "installed the pre-push guard {} (enc.installHook=false turns this off)",
-                    path.display()
-                ));
+                HookState::Missing
             }
         }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    }
-    Ok(())
+    };
+    Ok((state, path))
 }
+
+/// Make an existing shell pre-push hook run the guard first: insert it
+/// after the `#!` line, reading git's ref list once and handing it on to
+/// the rest of the hook on stdin. The original is kept beside it as
+/// `pre-push.enc-orig`. Returns the hook's path.
+pub fn chain_hook() -> Result<std::path::PathBuf> {
+    let path = git::hook_path("pre-push")?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    if text.contains("git-remote-enc pre-push") {
+        return Ok(path);
+    }
+    let (first, rest) = text.split_once('\n').unwrap_or((&text, ""));
+    if !is_shell(first) {
+        bail!(
+            "{} is not a shell script (`{first}`), so the guard cannot be put in front of it; \
+             make it run `git-remote-enc pre-push \"$1\" \"$2\"` with the same stdin first",
+            path.display()
+        );
+    }
+    let backup = path.with_file_name("pre-push.enc-orig");
+    std::fs::copy(&path, &backup).with_context(|| format!("writing {}", backup.display()))?;
+    let chained = format!("{first}\n{CHAIN}{rest}");
+    let tmp = path.with_file_name("pre-push.enc-tmp");
+    std::fs::write(&tmp, chained).with_context(|| format!("writing {}", tmp.display()))?;
+    let mode = std::fs::metadata(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .permissions();
+    std::fs::set_permissions(&tmp, mode).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+/// A `#!` line for a POSIX-style shell, directly or through `env`.
+fn is_shell(first: &str) -> bool {
+    let Some(cmd) = first.strip_prefix("#!") else {
+        return false;
+    };
+    let mut words = cmd.split_whitespace();
+    let mut prog = words.next().unwrap_or_default();
+    if prog.ends_with("/env") {
+        prog = words.find(|w| !w.starts_with('-')).unwrap_or_default();
+    }
+    matches!(
+        prog.rsplit('/').next(),
+        Some("sh" | "bash" | "dash" | "ksh" | "zsh")
+    )
+}
+
+/// The guard in front of an existing hook (`chain_hook`). `$(cat)` drops
+/// the trailing newline the here-document puts back.
+const CHAIN: &str = "# git-remote-enc guard (git-remote-enc install-hook --chain): refuse to push\n\
+# commits of an encrypted remote anywhere else, then run the rest of this\n\
+# hook on the same ref list.\n\
+enc_refs=$(cat)\n\
+printf '%s\\n' \"$enc_refs\" | git-remote-enc pre-push \"$1\" \"$2\" || exit 1\n\
+if [ -n \"$enc_refs\" ]; then\n\
+exec <<ENC_REFS\n\
+$enc_refs\n\
+ENC_REFS\n\
+else\n\
+exec </dev/null\n\
+fi\n";
 
 /// Write the pre-push hook that runs the guard. An existing hook is left
 /// alone: it has to call the guard itself.
@@ -323,8 +416,8 @@ pub fn install_hook() -> Result<std::path::PathBuf> {
         .open(&path)
         .with_context(|| {
             format!(
-                "creating {}; if a hook is already there, make it run \
-                 `git-remote-enc pre-push \"$1\" \"$2\"` with the same stdin",
+                "creating {}; if a hook is already there, `git-remote-enc install-hook --chain` \
+                 makes it run `git-remote-enc pre-push \"$1\" \"$2\"` first",
                 path.display()
             )
         })?;

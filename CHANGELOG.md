@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `install-hook --chain` puts the guard in front of an existing pre-push
+  hook; `install-hook` where the guard is already installed is no longer an
+  error.
+
 - The pre-push guard returns at once on a push that only deletes refs,
   instead of walking the encrypted remote's whole history.
 

@@ -93,6 +93,22 @@ impl Sandbox {
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
+    /// `git-remote-enc <args>` in `dir`: (success, stdout, stderr).
+    fn enc(&self, dir: &Path, args: &[&str]) -> (bool, String, String) {
+        let out = self.cmd(dir, "git-remote-enc").args(args).output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    fn enc_ok(&self, dir: &Path, args: &[&str]) -> String {
+        let (ok, out, err) = self.enc(dir, args);
+        assert!(ok, "git-remote-enc {args:?} failed:\n{out}\n{err}");
+        out
+    }
+
     fn dir(&self, name: &str) -> PathBuf {
         let d = self.root.join(name);
         fs::create_dir_all(&d).unwrap();
@@ -1491,14 +1507,11 @@ fn pre_push_guard_keeps_encrypted_commits_off_other_remotes() {
     sb.git_ok(&dev, &["fetch", "-q", "origin"]);
     sb.git_ok(&dev, &["push", "-q", "origin", "fix-main:refs/heads/copy"]);
 
-    // An existing hook is not overwritten.
-    let out = sb
-        .cmd(&dev, "git-remote-enc")
-        .arg("install-hook")
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("git-remote-enc pre-push"));
+    // Installing again is a no-op; another hook is not overwritten.
+    sb.enc_ok(&dev, &["install-hook"]);
+    fs::write(dev.join(".git/hooks/pre-push"), "#!/bin/sh\n").unwrap();
+    let (ok, _, err) = sb.enc(&dev, &["install-hook"]);
+    assert!(!ok && err.contains("install-hook --chain"), "{err}");
 }
 
 #[test]
@@ -1910,4 +1923,59 @@ fn log_flags_a_time_going_backwards() {
         log.contains("  time earlier than the generation before"),
         "{log}"
     );
+}
+
+#[test]
+fn install_hook_chain_runs_the_guard_before_an_existing_hook() {
+    let sb = Sandbox::new("chain");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let public = sb.dir("public.git");
+    sb.git_ok(&public, &["init", "-q", "--bare"]);
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.git_ok(&a, &["push", "-q", public.to_str().unwrap(), "main"]);
+    sb.git_ok(&a, &["remote", "add", "public", public.to_str().unwrap()]);
+    sb.git_ok(&a, &["fetch", "-q", "public"]);
+
+    let hook = a.join(".git/hooks/pre-push");
+    fs::write(&hook, "#!/usr/bin/env python3\n").unwrap();
+    let (ok, _, err) = sb.enc(&a, &["install-hook", "--chain"]);
+    assert!(!ok && err.contains("is not a shell script"), "{err}");
+
+    // An existing hook that records its stdin.
+    fs::write(
+        &hook,
+        "#!/bin/sh\ncat > \"$(git rev-parse --git-dir)/seen\"\n",
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&hook, perms).unwrap();
+    sb.enc_ok(&a, &["install-hook", "--chain"]);
+    assert!(a.join(".git/hooks/pre-push.enc-orig").is_file());
+    sb.enc_ok(&a, &["install-hook", "--chain"]);
+    assert_eq!(
+        fs::read_to_string(&hook)
+            .unwrap()
+            .matches("git-remote-enc pre-push")
+            .count(),
+        1
+    );
+
+    sb.commit_text(&a, "two", "2\n");
+    sb.git_ok(&a, &["push", "-q", "public", "main"]);
+    let seen = fs::read_to_string(a.join(".git/seen")).unwrap();
+    assert!(
+        seen.starts_with("refs/heads/main ") && seen.ends_with('\n'),
+        "{seen:?}"
+    );
+
+    // The guard itself runs first.
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_text(&a, "secret", "s\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let err = sb.git_fails(&a, &["push", "public", "main"]);
+    assert!(err.contains("refusing to push to public"), "{err}");
 }
