@@ -2,127 +2,48 @@
 
 ## Unreleased
 
-- New setup commands: `init` creates a remote (key, remote, participant list,
-  guard) after checking the host, `invite` adds participants and prints the
-  `join` command that pins the remote for them, `join` sets their clone up and
-  fetches, `doctor` reports everything a push or fetch could trip on.
-  `participants --add/--remove` changes the list in one step.
+## v0.1.0 - 2026-10-02
 
-- `install-hook --chain` puts the guard in front of an existing pre-push
-  hook; `install-hook` where the guard is already installed is no longer an
-  error.
+First release.
 
-- The pre-push guard returns at once on a push that only deletes refs,
-  instead of walking the encrypted remote's whole history.
-
-- A push from a shallow clone whose history reaches the clone's boundary is
-  refused: the pack lacked the missing parents, so nobody could fetch it.
-  Run `git fetch --unshallow` first.
-
-- The pre-push guard no longer hangs a push to a plain remote when the
-  encrypted remote holds several hundred commits that remote lacks.
-
-- Breaking: an identity file readable or writable by its group or others is
-  refused, as ssh does; `chmod 600` it.
-
-- The local state directories under `.git/enc/` are readable by their owner
-  only.
-
-- A manifest over 64 MiB is refused before it is read, so the host cannot
-  exhaust a client's memory with one.
-
-- A manifest whose generation runs ahead of the remote's history is refused,
-  so a participant can no longer freeze a remote by pushing the largest
-  possible generation.
-
-- On-remote format 3 (breaking): each manifest names the hash of the one
-  before it, and `git-remote-enc log` marks every generation it cannot chain
-  to the accepted one as not verified, so the host cannot slip forged entries
-  into the audit trail. The first push with this version upgrades a remote to
-  format 3, which older versions cannot read.
-
-- The pre-push guard is installed on every clone of, fetch from, or push to
-  an encrypted remote where no pre-push hook exists, unless
-  `enc.installHook=false`. A pre-push hook that does not run it, as after
-  `git lfs install --force`, is reported each time.
-
-- An encrypted remote whose pushes git would send in clear, because of a
-  `pushurl` or a `pushInsteadOf` rule, is refused: the pre-push guard stops
-  the push, and fetches from it fail until the configuration is fixed.
-
-- `git-remote-enc install-hook` installs a pre-push hook that refuses to push
-  content of an encrypted remote to any other remote, such as the public
-  repository before the disclosure date, including a backport made by
-  cherry-pick or squash, onto code that diverged around the fix, or through
-  a conflict resolution that kept the fix's added lines; `--no-verify`
-  bypasses it.
-
-- A push is refused while Git LFS could upload files alongside it (LFS holds
-  files locally and a pre-push hook is installed): LFS would upload the files
-  it tracks, unencrypted, to its own server. A push carrying LFS pointers
-  is refused too: the other participants would get the pointers without the
-  files. `enc.allowLfs=true` overrides both once LFS is neutralized in the
-  clone.
-
-- `enc.repo` and `enc.minGeneration` pin the repository id and the lowest
-  generation a first contact accepts, so a new clone cannot be served an
-  older manifest or another remote with the same signer. The first-contact
-  message prints both values.
-
-- Objects fetched from an encrypted remote are checked like
-  `fetch.fsckObjects` does, and by default: a hostile object such as a tree
-  entry named `.git` is refused. `fetch.fsck.*` settings apply, and
-  `fetch.fsckObjects=false` turns the check off.
-
-- `git-remote-enc log` flags generations missing from the remote's history,
-  and a fetch warns when the host rewrote that history, instead of silently
-  crediting the next signer with earlier changes.
-
-- `git-remote-enc log <remote>` prints who pushed each generation of a remote,
-  when, and what it changed. Pushes record their time inside the encrypted
-  manifest for it.
-- On-remote format 2 (breaking): remotes gain admins, the only participants
-  who may change the participant list. A new remote's admin is its creator
-  unless `enc.admins` says otherwise. The first push with this version
-  upgrades an existing remote to format 2, which older versions cannot read,
-  so every participant must upgrade; `git-remote-enc participants --apply`
-  with `enc.admins` set appoints its admins.
-- Breaking: a push no longer replaces the remote's participant list with the
-  configured one, so a stale local list cannot drop someone by accident.
-  `git-remote-enc participants <remote>` shows the difference and `--apply`
-  applies it; a push warns when they differ.
-- The local trust state is authenticated with a key derived from your identity;
-  a modified or missing trust file is refused instead of silently restarting
-  from first contact. `git-remote-enc forget <remote>` replaces the advice to
-  delete `.git/enc/` by hand when a remote was recreated or deleted. Trust
-  files written by 0.1.0 carry no authentication and are refused: run
-  `git-remote-enc forget <remote>` once per remote after upgrading.
-- Breaking: first contact with an existing remote (a clone, or a new URL) is
-  refused unless `enc.participants` names its signer, or
-  `enc.trustOnFirstUse` is set to accept it unverified. The same remote reached
-  through another spelling of its URL keeps the trust already accepted.
-- A fetch refuses a manifest that forks from the one it accepted (a different
-  manifest for the same generation, or a next one that does not follow it),
-  since the host served another view. `enc.refuseForks=false` accepts the
-  view the participants agree to keep.
-- Linked worktrees share the repository's trust state for a remote instead of
-  starting from first contact.
-- Breaking: `ssh-rsa` keys are no longer accepted as participants or
-  identities (the RSA implementation has an unfixed timing side channel,
-  RUSTSEC-2023-0071). A remote whose participant list names an `ssh-rsa` key
-  must have it replaced by an `ssh-ed25519` or `age1…` key.
-- The undocumented `GIT_ENC_PASSPHRASE` environment variable is no longer
-  read: a passphrase-protected key is unlocked only from the terminal.
-- Security: `git-remote-enc manifest` no longer prints the pack keys, which
-  decrypt the whole history; `--show-keys` prints them.
-- Security: an `enc::` URL starting with `-` could make git run an arbitrary
-  command (`enc::--upload-pack=…`). Such URLs are now refused, and the backend
-  URL can no longer be read as a git option.
-
-## v0.1.0 - 2026-09-21
-
-- Initial implementation: `enc::<git-url>[#<branch>]` remotes store an
-  end-to-end encrypted repository on any git host. Pushes are incremental and
-  atomic (compare-and-swap on the backend branch), non-fast-forward pushes are
-  rejected like on a plain remote, and access is controlled by a signed
-  participant list of SSH (`ssh-ed25519`, `ssh-rsa`) or age public keys.
+- `enc::<git-url>[#<branch>]` remotes store an end-to-end encrypted
+  repository on one branch of any git host (GitLab, GitHub, a bare repo over
+  ssh). The host sees opaque age blobs; refs, history and the participant
+  list are readable only by the participants.
+- Pushes and fetches are incremental, concurrent pushes are safe
+  (compare-and-swap on the backend branch), and a non-fast-forward push is
+  rejected as on a plain remote.
+- Participants are `ssh-ed25519` keys, or `age1…` keys for read-only access.
+  Every manifest is SSH-signed and names the hash of the one before it.
+  Admins (by default the creator) are the only ones who may change the
+  participant list, and only with `git-remote-enc participants --apply` or
+  `--add`/`--remove`: a push never changes it.
+- First contact with a remote is refused unless the signer is pinned
+  (`enc.participants`, or `enc.trustOnFirstUse`); `enc.repo` and
+  `enc.minGeneration` also pin the repository and a lower bound on its
+  generation. An established clone refuses a rollback, a fork, a recreated
+  or deleted remote, a tampered local trust state, and a manifest over
+  64 MiB; `git-remote-enc forget` drops the trust state when the
+  participants confirm a remote was recreated.
+- `git-remote-enc log` prints the audit trail: who pushed each generation,
+  when, and what it changed, flagging generations the host removed and any
+  not chained to the accepted manifest.
+- A pre-push guard, installed on every contact where no pre-push hook exists,
+  refuses to push the content of an encrypted remote to any other remote,
+  backports by cherry-pick or squash included; `install-hook --chain` puts it
+  in front of an existing shell hook.
+- Refused pushes: through a `pushurl` or `pushInsteadOf` rule that would send
+  them in clear, while Git LFS could upload files alongside or the commits
+  carry LFS pointers (`enc.allowLfs` overrides), and from a shallow clone
+  whose history reaches its boundary.
+- Fetched objects are fsck-checked by default (`fetch.fsck.*` applies).
+  Identity files readable by others are refused, passphrases are read from
+  the terminal only, local state is owner-only, and `manifest` prints pack
+  keys only with `--show-keys`.
+- Setup commands: `init` creates a remote after checking the host, `invite`
+  adds participants and prints the `join` command that pins the remote for
+  them, `join` sets their clone up and fetches, and `doctor` reports what a
+  push or fetch would trip on.
+- Release builds are static, reproducible binaries for Linux (x86_64,
+  aarch64) and macOS (x86_64, aarch64), with Sigstore build provenance and a
+  CycloneDX SBOM per archive.
