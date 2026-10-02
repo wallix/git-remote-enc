@@ -446,8 +446,19 @@ pub fn delete_ref(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Store a ciphertext file as an uncompressed blob; deflating it gains
+/// nothing. Set both loose and pack compression levels because files over
+/// `core.bigFileThreshold` go straight into a pack.
 pub fn hash_object_file(path: &Path) -> Result<Oid> {
-    let mut c = command(["hash-object", "-w", "--no-filters"]);
+    let mut c = command([
+        "-c",
+        "core.looseCompression=0",
+        "-c",
+        "pack.compression=0",
+        "hash-object",
+        "-w",
+        "--no-filters",
+    ]);
     c.arg(path);
     let out = c.stdin(Stdio::null()).output()?;
     if !out.status.success() {

@@ -30,6 +30,11 @@ impl Backend {
     pub fn fetch_tip(&self) -> Result<Option<Oid>> {
         let refspec = format!("+{}:{}", self.branch, self.tracking_ref);
         let (ok, _, stderr) = git::run_status([
+            // Fewer than `fetch.unpackLimit` objects (nearly every fetch
+            // here: a few large blobs) are unpacked into loose objects,
+            // deflated by default: slow for ciphertext, and useless.
+            "-c",
+            "core.looseCompression=0",
             "fetch",
             "-q",
             "--no-tags",
@@ -91,7 +96,13 @@ impl Backend {
             expected_old.unwrap_or("")
         );
         let refspec = format!("{commit}:{}", self.branch);
+        // Backend objects are ciphertext: deflating them, or searching them
+        // for deltas, only costs time.
         let (ok, _, stderr) = git::run_status([
+            "-c",
+            "pack.compression=0",
+            "-c",
+            "pack.window=0",
             "push",
             "-q",
             "--no-verify",

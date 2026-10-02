@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Faster clone, fetch and push of large repositories: encrypted data is no
+  longer compressed or delta-searched locally.
+
 ## v0.1.0 - 2026-10-02
 
 First release.

@@ -203,6 +203,12 @@ blob       = age.Encrypt(recipients = [key.public], pack)
 name       = hex(sha256(blob)) ‖ ".age"
 ```
 
+The helper stores backend blobs uncompressed and pushes them without
+compression or delta search (`core.looseCompression=0`, `pack.compression=0`,
+`pack.window=0` on its own git commands): ciphertext gains nothing from
+either. The host's own storage and fetch responses follow
+its configuration.
+
 The per-pack identity goes in the manifest's `pack` line. Encrypting to a
 throwaway X25519 key rather than using a raw symmetric key keeps every
 ciphertext a standard age file (`age -d -i <key>` reads it), with age's own
