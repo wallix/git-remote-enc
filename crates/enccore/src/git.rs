@@ -1,8 +1,9 @@
-//! Thin wrappers around git plumbing. Every command inherits `GIT_DIR` from
-//! the environment, exactly as git sets it for a remote helper, and runs in
-//! the C locale.
+//! Thin wrappers around git plumbing, in the C locale. A command runs in the
+//! user's repository, inheriting `GIT_DIR` from the environment exactly as
+//! git sets it for a remote helper ([`USER`] and the free functions), or in
+//! another repository (a [`Git`] made by [`Git::at`]).
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -18,17 +19,103 @@ pub type Oid = String;
 /// `(mode, type, oid, name)` as printed by `git ls-tree`.
 pub type TreeEntry = (String, String, Oid, String);
 
+/// The repository commands run in.
+pub struct Git {
+    /// `None`: the user's repository, as the environment names it.
+    dir: Option<PathBuf>,
+    /// Extra environment for every command.
+    env: Vec<(OsString, OsString)>,
+}
+
+/// The user's repository.
+pub static USER: Git = Git {
+    dir: None,
+    env: Vec::new(),
+};
+
+/// Variables through which git names the repository to work on, or alters
+/// how it reads it; a command in another repository must not inherit them.
+/// `git rev-parse --local-env-vars` also lists `GIT_CONFIG_PARAMETERS` and
+/// `GIT_CONFIG_COUNT` (with its `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`):
+/// those stay inherited on purpose, as they carry the user's `-c` settings,
+/// transport options among them.
+const REPO_ENV: [&str; 15] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_CONFIG",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_SHALLOW_FILE",
+    "GIT_QUARANTINE_PATH",
+    "GIT_PREFIX",
+];
+
+// Show only environment variable names: values may contain credentials
+// (for example, an `http.extraHeader`).
+impl std::fmt::Debug for Git {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Git")
+            .field("dir", &self.dir)
+            .field("env", &self.env.iter().map(|(k, _)| k).collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl Git {
+    /// Commands in `dir`, which must be a bare repository, with `env` added
+    /// to every command. `env` must not set a `REPO_ENV` variable, which
+    /// would point the command back at another repository.
+    pub fn at(dir: PathBuf, env: Vec<(OsString, OsString)>) -> Self {
+        debug_assert!(
+            !env.iter()
+                .any(|(k, _)| REPO_ENV.iter().any(|v| k.as_os_str() == OsStr::new(v))),
+            "Git::at: env sets a repository variable"
+        );
+        Self {
+            dir: Some(dir),
+            env,
+        }
+    }
+
+    /// The repository's directory; `None` for the user's repository.
+    pub fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
+    }
+
+    fn command<I, S>(&self, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut c = Command::new("git");
+        if let Some(dir) = &self.dir {
+            for v in REPO_ENV {
+                c.env_remove(v);
+            }
+            c.arg("--git-dir").arg(dir);
+        }
+        c.args(args);
+        c.envs(self.env.iter().map(|(k, v)| (k, v)));
+        // Distinguish failures (a missing remote ref, a stale lease) by git's
+        // message, which a translated locale would reword.
+        c.env("LC_ALL", "C");
+        c
+    }
+}
+
 fn command<I, S>(args: I) -> Command
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut c = Command::new("git");
-    c.args(args);
-    // Distinguish failures (a missing remote ref, a stale lease) by git's
-    // message, which a translated locale would reword.
-    c.env("LC_ALL", "C");
-    c
+    USER.command(args)
 }
 
 fn describe<I, S>(args: I) -> String
@@ -42,82 +129,361 @@ where
         .join(" ")
 }
 
-/// Run a git command and return its stdout. A non-zero exit is an error
-/// carrying git's stderr.
+impl Git {
+    /// Run a git command and return its stdout. A non-zero exit is an error
+    /// carrying git's stderr.
+    pub fn run<I, S>(&self, args: I) -> Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
+        let (ok, stdout, stderr) = self.run_status(args.clone())?;
+        if !ok {
+            bail!("`git {}` failed: {}", describe(args), stderr.trim());
+        }
+        Ok(stdout)
+    }
+
+    /// Run a git command, returning `(success, stdout, stderr)` without failing
+    /// on a non-zero exit.
+    pub fn run_status<I, S>(&self, args: I) -> Result<(bool, Vec<u8>, String)>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
+        let out = self
+            .command(args.clone())
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("spawning `git {}`", describe(args)))?;
+        Ok((
+            out.status.success(),
+            out.stdout,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    }
+
+    /// [`Self::run`] for commands whose output is a single ASCII line.
+    pub fn run_line<I, S>(&self, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
+        ascii_line(&self.run(args)?)
+    }
+
+    /// Run with `input` on stdin and return stdout.
+    pub fn run_input<I, S>(&self, args: I, input: &[u8]) -> Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
+        let desc = describe(args.clone());
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning `git {desc}`"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("no stdin for `git {desc}`"))?;
+        // Write from another thread while reading output: commands that answer as
+        // they read (`patch-id`, `cat-file --batch`) would otherwise block on a
+        // full stdout pipe while this thread blocks on a full stdin pipe.
+        let (written, out) = std::thread::scope(|s| {
+            let writer = s.spawn(move || stdin.write_all(input));
+            let out = child.wait_with_output();
+            (writer.join(), out)
+        });
+        let out = out?;
+        if out.status.success() {
+            written.map_err(|_| anyhow!("writing to `git {desc}` panicked"))??;
+        } else {
+            bail!(
+                "`git {desc}` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(out.stdout)
+    }
+
+    /// [`Self::run_status`], with git's stderr also shown as it arrives when `tee`:
+    /// for `fetch`/`push --progress`.
+    pub fn run_status_tee<I, S>(&self, args: I, tee: bool) -> Result<(bool, Vec<u8>, String)>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
+        let desc = describe(args.clone());
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning `git {desc}`"))?;
+        let stderr = drain_stderr(&mut child, tee);
+        let mut stdout = Vec::new();
+        // Reaped and its stderr collected even when the read fails; the dropped
+        // pipe ends git if it is still writing.
+        let read = child
+            .stdout
+            .take()
+            .map_or(Ok(0), |mut o| o.read_to_end(&mut stdout));
+        let status = child.wait();
+        let stderr = join_stderr(stderr);
+        read.with_context(|| format!("reading `git {desc}`"))?;
+        let status = status.with_context(|| format!("waiting for `git {desc}`"))?;
+        Ok((status.success(), stdout, stderr))
+    }
+
+    /// Resolve a revision to an object id, `None` if it does not exist locally.
+    pub fn rev_parse(&self, rev: &str) -> Result<Option<Oid>> {
+        let spec = format!("{rev}^{{object}}");
+        let (ok, out, _) = self.run_status(["rev-parse", "-q", "--verify", &spec])?;
+        if ok {
+            Ok(Some(ascii_line(&out)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn has_object(&self, oid: &str) -> Result<bool> {
+        Ok(self.run_status(["cat-file", "-e", oid])?.0)
+    }
+
+    /// Filter `oids` down to those present in the local object store.
+    pub fn have_objects(&self, oids: &[Oid]) -> Result<Vec<Oid>> {
+        if oids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut input = oids.join("\n");
+        input.push('\n');
+        let out = self.run_input(["cat-file", "--batch-check"], input.as_bytes())?;
+        let text = std::str::from_utf8(&out).context("cat-file output is not UTF-8")?;
+        Ok(text
+            .lines()
+            .filter(|l| !l.ends_with(" missing"))
+            .filter_map(|l| l.split(' ').next().map(str::to_owned))
+            .collect())
+    }
+
+    pub fn is_ancestor(&self, old: &str, new: &str) -> Result<bool> {
+        Ok(self
+            .run_status(["merge-base", "--is-ancestor", old, new])?
+            .0)
+    }
+
+    pub fn update_ref(&self, name: &str, oid: &str) -> Result<()> {
+        self.run(["update-ref", name, oid])?;
+        Ok(())
+    }
+
+    pub fn delete_ref(&self, name: &str) -> Result<()> {
+        self.run(["update-ref", "-d", name])?;
+        Ok(())
+    }
+
+    /// Store a ciphertext file as an uncompressed blob; deflating it gains
+    /// nothing. Set both loose and pack compression levels because files over
+    /// `core.bigFileThreshold` go straight into a pack.
+    pub fn hash_object_file(&self, path: &Path) -> Result<Oid> {
+        let mut c = self.command([
+            "-c",
+            "core.looseCompression=0",
+            "-c",
+            "pack.compression=0",
+            "hash-object",
+            "-w",
+            "--no-filters",
+        ]);
+        c.arg(path);
+        let out = c.stdin(Stdio::null()).output()?;
+        if !out.status.success() {
+            bail!(
+                "git hash-object failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        ascii_line(&out.stdout)
+    }
+
+    pub fn hash_object(&self, data: &[u8]) -> Result<Oid> {
+        ascii_line(&self.run_input(["hash-object", "-w", "--stdin", "--no-filters"], data)?)
+    }
+
+    pub fn object_size(&self, oid: &str) -> Result<u64> {
+        self.run_line(["cat-file", "-s", oid])?
+            .parse()
+            .with_context(|| format!("size of object {oid}"))
+    }
+
+    pub fn cat_blob(&self, oid: &str) -> Result<Vec<u8>> {
+        self.run(["cat-file", "blob", oid])
+    }
+
+    pub fn ls_tree(&self, treeish: &str) -> Result<Vec<TreeEntry>> {
+        let out = self.run(["ls-tree", "-z", treeish])?;
+        let mut entries = Vec::new();
+        for raw in out.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+            let entry = std::str::from_utf8(raw).context("non-UTF-8 name in backend tree")?;
+            let (meta, name) = entry.split_once('\t').context("malformed ls-tree output")?;
+            let mut it = meta.split(' ');
+            let mode = it.next().context("ls-tree mode")?;
+            let ty = it.next().context("ls-tree type")?;
+            let oid = it.next().context("ls-tree oid")?;
+            entries.push((mode.into(), ty.into(), oid.into(), name.into()));
+        }
+        Ok(entries)
+    }
+
+    pub fn mktree(&self, entries: &[TreeEntry]) -> Result<Oid> {
+        let mut input = Vec::new();
+        for (mode, ty, oid, name) in entries {
+            input.extend_from_slice(format!("{mode} {ty} {oid}\t{name}\0").as_bytes());
+        }
+        ascii_line(&self.run_input(["mktree", "-z"], &input)?)
+    }
+
+    /// A deterministic, anonymous commit: fixed author/committer/date so the
+    /// backend history leaks nothing about who pushed or when. Never signed,
+    /// whatever `commit.gpgSign` says: a signature would name the pusher.
+    pub fn commit_tree(&self, tree: &str, parents: &[&str], message: &str) -> Result<Oid> {
+        let mut args = vec!["commit-tree", "--no-gpg-sign", tree];
+        for p in parents {
+            args.push("-p");
+            args.push(p);
+        }
+        let mut c = self.command(&args);
+        for (k, v) in [
+            ("GIT_AUTHOR_NAME", "enc"),
+            ("GIT_AUTHOR_EMAIL", "enc@localhost"),
+            ("GIT_AUTHOR_DATE", "1000000000 +0000"),
+            ("GIT_COMMITTER_NAME", "enc"),
+            ("GIT_COMMITTER_EMAIL", "enc@localhost"),
+            ("GIT_COMMITTER_DATE", "1000000000 +0000"),
+        ] {
+            c.env(k, v);
+        }
+        let mut child = c
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawning git commit-tree")?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("no stdin for git commit-tree"))?
+            .write_all(message.as_bytes())?;
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!(
+                "git commit-tree failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        ascii_line(&out.stdout)
+    }
+}
+
+// The user's repository: shorthands for the [`USER`] methods, whose docs
+// apply. Functions with no `Git` method below run there too.
+
 pub fn run<I, S>(args: I) -> Result<Vec<u8>>
 where
     I: IntoIterator<Item = S> + Clone,
     S: AsRef<OsStr>,
 {
-    let (ok, stdout, stderr) = run_status(args.clone())?;
-    if !ok {
-        bail!("`git {}` failed: {}", describe(args), stderr.trim());
-    }
-    Ok(stdout)
+    USER.run(args)
 }
 
-/// Run a git command, returning `(success, stdout, stderr)` without failing
-/// on a non-zero exit.
 pub fn run_status<I, S>(args: I) -> Result<(bool, Vec<u8>, String)>
 where
     I: IntoIterator<Item = S> + Clone,
     S: AsRef<OsStr>,
 {
-    let out = command(args.clone())
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("spawning `git {}`", describe(args)))?;
-    Ok((
-        out.status.success(),
-        out.stdout,
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
+    USER.run_status(args)
 }
 
-/// [`run`] for commands whose output is a single ASCII line.
 pub fn run_line<I, S>(args: I) -> Result<String>
 where
     I: IntoIterator<Item = S> + Clone,
     S: AsRef<OsStr>,
 {
-    ascii_line(&run(args)?)
+    USER.run_line(args)
 }
 
-/// Run with `input` on stdin and return stdout.
 pub fn run_input<I, S>(args: I, input: &[u8]) -> Result<Vec<u8>>
 where
     I: IntoIterator<Item = S> + Clone,
     S: AsRef<OsStr>,
 {
-    let desc = describe(args.clone());
-    let mut child = command(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning `git {desc}`"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("no stdin for `git {desc}`"))?;
-    // Write from another thread while reading output: commands that answer as
-    // they read (`patch-id`, `cat-file --batch`) would otherwise block on a
-    // full stdout pipe while this thread blocks on a full stdin pipe.
-    let (written, out) = std::thread::scope(|s| {
-        let writer = s.spawn(move || stdin.write_all(input));
-        let out = child.wait_with_output();
-        (writer.join(), out)
-    });
-    let out = out?;
-    if out.status.success() {
-        written.map_err(|_| anyhow!("writing to `git {desc}` panicked"))??;
-    } else {
-        bail!(
-            "`git {desc}` failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(out.stdout)
+    USER.run_input(args, input)
+}
+
+pub fn rev_parse(rev: &str) -> Result<Option<Oid>> {
+    USER.rev_parse(rev)
+}
+
+pub fn has_object(oid: &str) -> Result<bool> {
+    USER.has_object(oid)
+}
+
+pub fn have_objects(oids: &[Oid]) -> Result<Vec<Oid>> {
+    USER.have_objects(oids)
+}
+
+pub fn is_ancestor(old: &str, new: &str) -> Result<bool> {
+    USER.is_ancestor(old, new)
+}
+
+pub fn update_ref(name: &str, oid: &str) -> Result<()> {
+    USER.update_ref(name, oid)
+}
+
+pub fn delete_ref(name: &str) -> Result<()> {
+    USER.delete_ref(name)
+}
+
+pub fn object_size(oid: &str) -> Result<u64> {
+    USER.object_size(oid)
+}
+
+pub fn run_status_tee<I, S>(args: I, tee: bool) -> Result<(bool, Vec<u8>, String)>
+where
+    I: IntoIterator<Item = S> + Clone,
+    S: AsRef<OsStr>,
+{
+    USER.run_status_tee(args, tee)
+}
+
+pub fn hash_object_file(path: &Path) -> Result<Oid> {
+    USER.hash_object_file(path)
+}
+
+pub fn hash_object(data: &[u8]) -> Result<Oid> {
+    USER.hash_object(data)
+}
+
+pub fn cat_blob(oid: &str) -> Result<Vec<u8>> {
+    USER.cat_blob(oid)
+}
+
+pub fn ls_tree(treeish: &str) -> Result<Vec<TreeEntry>> {
+    USER.ls_tree(treeish)
+}
+
+pub fn mktree(entries: &[TreeEntry]) -> Result<Oid> {
+    USER.mktree(entries)
+}
+
+/// [`Git::commit_tree`]: anonymous, never signed.
+pub fn commit_tree(tree: &str, parents: &[&str], message: &str) -> Result<Oid> {
+    USER.commit_tree(tree, parents, message)
 }
 
 /// Collects a child's stderr on a thread, so a chatty command (progress
@@ -203,35 +569,6 @@ fn join_stderr(handle: Option<JoinHandle<String>>) -> String {
     handle.and_then(|h| h.join().ok()).unwrap_or_default()
 }
 
-/// [`run_status`], with git's stderr also shown as it arrives when `tee`:
-/// for `fetch`/`push --progress`.
-pub fn run_status_tee<I, S>(args: I, tee: bool) -> Result<(bool, Vec<u8>, String)>
-where
-    I: IntoIterator<Item = S> + Clone,
-    S: AsRef<OsStr>,
-{
-    let desc = describe(args.clone());
-    let mut child = command(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("spawning `git {desc}`"))?;
-    let stderr = drain_stderr(&mut child, tee);
-    let mut stdout = Vec::new();
-    // Reaped and its stderr collected even when the read fails; the dropped
-    // pipe ends git if it is still writing.
-    let read = child
-        .stdout
-        .take()
-        .map_or(Ok(0), |mut o| o.read_to_end(&mut stdout));
-    let status = child.wait();
-    let stderr = join_stderr(stderr);
-    read.with_context(|| format!("reading `git {desc}`"))?;
-    let status = status.with_context(|| format!("waiting for `git {desc}`"))?;
-    Ok((status.success(), stdout, stderr))
-}
-
 /// A spawned git command whose stdout (or stdin) is consumed as a stream by
 /// the caller. [`Streaming::finish`] reaps it and surfaces a non-zero exit.
 pub struct Streaming {
@@ -256,8 +593,18 @@ impl Streaming {
         I: IntoIterator<Item = S> + Clone,
         S: AsRef<OsStr>,
     {
+        Self::reader_in(&USER, args, input, tee)
+    }
+
+    /// [`Streaming::reader_tee`] in repository `git`.
+    pub fn reader_in<I, S>(git: &Git, args: I, input: Option<&[u8]>, tee: bool) -> Result<Self>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
         let desc = describe(args.clone());
-        let mut child = command(args)
+        let mut child = git
+            .command(args)
             .stdin(if input.is_some() {
                 Stdio::piped()
             } else {
@@ -416,39 +763,8 @@ pub fn set_config(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a revision to an object id, `None` if it does not exist locally.
-pub fn rev_parse(rev: &str) -> Result<Option<Oid>> {
-    let spec = format!("{rev}^{{object}}");
-    let (ok, out, _) = run_status(["rev-parse", "-q", "--verify", &spec])?;
-    if ok {
-        Ok(Some(ascii_line(&out)?))
-    } else {
-        Ok(None)
-    }
-}
-
 pub fn object_type(oid: &str) -> Result<String> {
     run_line(["cat-file", "-t", oid])
-}
-
-pub fn has_object(oid: &str) -> Result<bool> {
-    Ok(run_status(["cat-file", "-e", oid])?.0)
-}
-
-/// Filter `oids` down to those present in the local object store.
-pub fn have_objects(oids: &[Oid]) -> Result<Vec<Oid>> {
-    if oids.is_empty() {
-        return Ok(vec![]);
-    }
-    let mut input = oids.join("\n");
-    input.push('\n');
-    let out = run_input(["cat-file", "--batch-check"], input.as_bytes())?;
-    let text = std::str::from_utf8(&out).context("cat-file output is not UTF-8")?;
-    Ok(text
-        .lines()
-        .filter(|l| !l.ends_with(" missing"))
-        .filter_map(|l| l.split(' ').next().map(str::to_owned))
-        .collect())
 }
 
 /// `rev-list --stdin` input for `tips` minus `excludes`.
@@ -581,128 +897,27 @@ pub fn count_objects(tips: &[Oid]) -> Result<u64> {
     Ok(out.iter().filter(|b| **b == b'\n').count() as u64)
 }
 
-pub fn is_ancestor(old: &str, new: &str) -> Result<bool> {
-    Ok(run_status(["merge-base", "--is-ancestor", old, new])?.0)
-}
-
-pub fn update_ref(name: &str, oid: &str) -> Result<()> {
-    run(["update-ref", name, oid])?;
-    Ok(())
-}
-
-pub fn delete_ref(name: &str) -> Result<()> {
-    run(["update-ref", "-d", name])?;
-    Ok(())
-}
-
-/// Store a ciphertext file as an uncompressed blob; deflating it gains
-/// nothing. Set both loose and pack compression levels because files over
-/// `core.bigFileThreshold` go straight into a pack.
-pub fn hash_object_file(path: &Path) -> Result<Oid> {
-    let mut c = command([
-        "-c",
-        "core.looseCompression=0",
-        "-c",
-        "pack.compression=0",
-        "hash-object",
-        "-w",
-        "--no-filters",
-    ]);
-    c.arg(path);
-    let out = c.stdin(Stdio::null()).output()?;
-    if !out.status.success() {
-        bail!(
-            "git hash-object failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    ascii_line(&out.stdout)
-}
-
-pub fn hash_object(data: &[u8]) -> Result<Oid> {
-    ascii_line(&run_input(
-        ["hash-object", "-w", "--stdin", "--no-filters"],
-        data,
-    )?)
-}
-
-pub fn object_size(oid: &str) -> Result<u64> {
-    run_line(["cat-file", "-s", oid])?
-        .parse()
-        .with_context(|| format!("size of object {oid}"))
-}
-
-pub fn cat_blob(oid: &str) -> Result<Vec<u8>> {
-    run(["cat-file", "blob", oid])
-}
-
-pub fn ls_tree(treeish: &str) -> Result<Vec<TreeEntry>> {
-    let out = run(["ls-tree", "-z", treeish])?;
-    let mut entries = Vec::new();
-    for raw in out.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-        let entry = std::str::from_utf8(raw).context("non-UTF-8 name in backend tree")?;
-        let (meta, name) = entry.split_once('\t').context("malformed ls-tree output")?;
-        let mut it = meta.split(' ');
-        let mode = it.next().context("ls-tree mode")?;
-        let ty = it.next().context("ls-tree type")?;
-        let oid = it.next().context("ls-tree oid")?;
-        entries.push((mode.into(), ty.into(), oid.into(), name.into()));
-    }
-    Ok(entries)
-}
-
-pub fn mktree(entries: &[TreeEntry]) -> Result<Oid> {
-    let mut input = Vec::new();
-    for (mode, ty, oid, name) in entries {
-        input.extend_from_slice(format!("{mode} {ty} {oid}\t{name}\0").as_bytes());
-    }
-    ascii_line(&run_input(["mktree", "-z"], &input)?)
-}
-
-/// A deterministic, anonymous commit: fixed author/committer/date so the
-/// backend history leaks nothing about who pushed or when. Never signed,
-/// whatever `commit.gpgSign` says: a signature would name the pusher.
-pub fn commit_tree(tree: &str, parents: &[&str], message: &str) -> Result<Oid> {
-    let mut args = vec!["commit-tree", "--no-gpg-sign", tree];
-    for p in parents {
-        args.push("-p");
-        args.push(p);
-    }
-    let mut c = command(&args);
-    for (k, v) in [
-        ("GIT_AUTHOR_NAME", "enc"),
-        ("GIT_AUTHOR_EMAIL", "enc@localhost"),
-        ("GIT_AUTHOR_DATE", "1000000000 +0000"),
-        ("GIT_COMMITTER_NAME", "enc"),
-        ("GIT_COMMITTER_EMAIL", "enc@localhost"),
-        ("GIT_COMMITTER_DATE", "1000000000 +0000"),
-    ] {
-        c.env(k, v);
-    }
-    let mut child = c
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("spawning git commit-tree")?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("no stdin for git commit-tree"))?
-        .write_all(message.as_bytes())?;
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        bail!(
-            "git commit-tree failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    ascii_line(&out.stdout)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_in_another_repository_drops_the_users_repository_env() {
+        let git = Git::at("/x".into(), vec![("K".into(), "V".into())]);
+        let c = git.command(["status"]);
+        let args: Vec<_> = c.get_args().collect();
+        assert_eq!(args[..2], [OsStr::new("--git-dir"), OsStr::new("/x")]);
+        let envs: std::collections::HashMap<_, _> = c.get_envs().collect();
+        for v in REPO_ENV {
+            assert_eq!(envs.get(OsStr::new(v)), Some(&None), "{v}");
+        }
+        assert_eq!(envs.get(OsStr::new("K")), Some(&Some(OsStr::new("V"))));
+        assert_eq!(envs.get(OsStr::new("LC_ALL")), Some(&Some(OsStr::new("C"))));
+
+        let c = USER.command(["status"]);
+        assert!(c.get_envs().all(|(_, v)| v.is_some()));
+        assert_eq!(c.get_args().next(), Some(OsStr::new("status")));
+    }
 
     #[test]
     fn run_input_survives_output_larger_than_a_pipe() {
