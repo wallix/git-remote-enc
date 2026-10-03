@@ -37,7 +37,7 @@ From a release (`linux-x86_64`, `linux-aarch64`, `macos-x86_64`,
 `macos-aarch64`), verified before it is unpacked:
 
 ```bash
-v=v0.1.0 p=linux-x86_64
+v=v0.2.0 p=linux-x86_64
 gh release download "$v" --repo wallix/git-remote-enc -p "git-remote-enc-$p.*"
 sha256sum -c "git-remote-enc-$p.sha256"
 gh attestation verify "git-remote-enc-$p.tar.gz" --repo wallix/git-remote-enc

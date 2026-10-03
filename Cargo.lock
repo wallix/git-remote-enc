@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "enccore"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "age",
  "anyhow",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-enc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "age",
  "anyhow",

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.2.0 - 2026-10-03
+
 Manifests now use format version 4, which v0.1.0 refuses: every participant
 needs this release once anyone pushes with it. Existing clones migrate to
 the new local layout on their next fetch or push. Downgrading afterwards
