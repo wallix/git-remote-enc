@@ -10,6 +10,8 @@
   after it. Even against a remote nobody has pushed to yet, the identities
   must now be readable, including the default one (`~/.ssh/id_ed25519`, or
   `user.signingkey` with `gpg.format = ssh`) when it exists.
+- A push that loses a race to another one reuses its encrypted pack on retry
+  instead of rebuilding and re-uploading it.
 
 ## v0.1.0 - 2026-10-02
 

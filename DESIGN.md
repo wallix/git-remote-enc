@@ -250,11 +250,15 @@ for-push`.
 7. **Compare-and-swap:** `git push <url> <commit>:<branch>
    --force-with-lease=<branch>:<old tip>` (empty old tip for a new remote:
    "must not exist"). On a stale lease someone pushed in between: go back to
-   step 1 and redo everything (at most 3 attempts). Their pack is still valid;
-   ours is rebuilt against the new manifest. The lease is checked by the
-   client (`stale info`) and enforced again by the server (old value
-   mismatch); any rejection after which the branch tip has moved is treated as
-   a lost race, anything else as a hard error.
+   step 1 and redo everything (at most 3 attempts) except the pack, which is
+   kept when the same tips are pushed again: everything it was built against
+   is still on the remote, in older packs. It is dropped, and step 3 runs
+   again, when the new manifest already lists it (our push landed although
+   git reported a failure; it is recorded as indexed) or already holds every
+   pushed tip. Their pack is still valid too. The lease is checked by the
+   client (`stale info`) and enforced again by the server (old value mismatch);
+   any rejection after which the branch tip has moved is treated as a lost
+   race, anything else as a hard error.
 8. Move the tracking ref to the new commit, record the new pack as indexed
    locally (its objects are ours), report `ok <dst>` per ref.
 

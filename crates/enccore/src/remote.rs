@@ -189,6 +189,8 @@ pub struct Remote {
     manifest_digest: Option<String>,
     identities: Option<Vec<Identity>>,
     trust_keys: Option<Vec<TrustKey>>,
+    /// The pack of a push attempt that lost the race, kept for the retry.
+    staged: Option<Staged>,
 }
 
 impl Remote {
@@ -221,6 +223,7 @@ impl Remote {
             manifest_digest: None,
             identities: None,
             trust_keys: None,
+            staged: None,
         })
     }
 
@@ -915,6 +918,16 @@ impl Remote {
     }
 
     fn push_with(&mut self, specs: &[RefSpec], set_participants: bool) -> Result<Vec<PushStatus>> {
+        let result = self.push_attempts(specs, set_participants);
+        self.staged = None;
+        result
+    }
+
+    fn push_attempts(
+        &mut self,
+        specs: &[RefSpec],
+        set_participants: bool,
+    ) -> Result<Vec<PushStatus>> {
         self.connect()?;
         for attempt in 1..=PUSH_ATTEMPTS {
             if let Some(statuses) = self.try_push(specs, set_participants)? {
@@ -1117,11 +1130,42 @@ impl Remote {
                  push again"
             );
         }
-        let pack = if wants.is_empty() {
-            None
-        } else {
-            self.build_pack(&wants, &excludes)?
+        // Reuse the losing attempt's pack for the same wants: its base
+        // objects remain on the remote in older packs. Drop it if the
+        // manifest already lists it (the push landed although git reported
+        // failure), or every pushed tip is already a ref (someone pushed
+        // the same tips). Listing it again would make the manifest
+        // unreadable or add a redundant pack, respectively.
+        let staged = match self.staged.take() {
+            // Landed: its objects are ours, so no fetch downloads it.
+            Some(s) if m.packs.iter().any(|p| p.id == s.id) => {
+                self.state.add_have(&s.id)?;
+                None
+            }
+            s => s,
         };
+        let mut sorted_wants = wants.clone();
+        sorted_wants.sort_unstable();
+        let reusable =
+            |s: &Staged| s.wants == sorted_wants && wants.iter().any(|w| !known.contains(w));
+        let pack = match staged {
+            Some(s) if reusable(&s) => Some(s),
+            _ => {
+                if wants.is_empty() {
+                    None
+                } else {
+                    self.build_pack(&wants, &excludes)?
+                        .map(|p| self.stage(p, sorted_wants))
+                        .transpose()?
+                }
+            }
+        };
+        // Held by `self` from here on, so a lost race can reuse it.
+        self.staged = pack;
+        let pack = self
+            .staged
+            .as_ref()
+            .map(|p| (p.id.clone(), p.key.clone(), p.blob.clone()));
 
         m.generation = m
             .generation
@@ -1149,10 +1193,10 @@ impl Remote {
         }
         m.participants = participant_texts;
         m.admins = admin_texts;
-        if let Some(p) = &pack {
+        if let Some((id, key, _)) = &pack {
             m.packs.push(Pack {
-                id: p.id.clone(),
-                key: String::clone(&p.key),
+                id: id.clone(),
+                key: String::clone(key),
             });
         }
 
@@ -1161,10 +1205,8 @@ impl Remote {
         let envelope = join_envelope(&text, &sig);
         let manifest_blob = crypto::encrypt_to_participants(&participants, &envelope, Vec::new())?;
         let mut upserts = vec![(MANIFEST_BLOB.to_owned(), git::hash_object(&manifest_blob)?)];
-        if let Some(p) = &pack {
-            upserts.push((format!("{}.age", p.id), git::hash_object_file(&p.path)?));
-            // Best effort: the blob is in the object store now.
-            let _ = std::fs::remove_file(&p.path);
+        if let Some((_, _, blob)) = pack {
+            upserts.push(blob);
         }
         let commit = Backend::build_commit(self.tip.as_deref(), &upserts)?;
 
@@ -1179,7 +1221,7 @@ impl Remote {
                 bail!("pushing to {}: {stderr}", self.backend.url)
             }
             PushOutcome::Done => {
-                if let Some(p) = &pack {
+                if let Some(p) = self.staged.take() {
                     self.state.add_have(&p.id)?;
                 }
                 self.save_trust(&trust_in(&m, &text, Some(&commit)))?;
@@ -1272,6 +1314,22 @@ impl Remote {
             id,
             key: Zeroizing::new(key.to_string().expose_secret().to_owned()),
         }))
+    }
+
+    /// Store a built pack as a blob, for this attempt and a retry.
+    fn stage(&self, built: BuiltPack, wants: Vec<Oid>) -> Result<Staged> {
+        let blob = (
+            format!("{}.age", built.id),
+            git::hash_object_file(&built.path)?,
+        );
+        // Best effort: the blob is in the object store now.
+        let _ = std::fs::remove_file(&built.path);
+        Ok(Staged {
+            wants,
+            id: built.id,
+            key: built.key,
+            blob,
+        })
     }
 }
 
@@ -1467,6 +1525,16 @@ struct BuiltPack {
     path: PathBuf,
     id: String,
     key: Zeroizing<String>,
+}
+
+/// A pack whose blob is in the local object store.
+struct Staged {
+    /// The new tips it was built for, sorted.
+    wants: Vec<Oid>,
+    id: String,
+    key: Zeroizing<String>,
+    /// Tree name and blob.
+    blob: (String, Oid),
 }
 
 #[cfg(test)]

@@ -295,6 +295,26 @@ impl Sandbox {
         run(&["update-ref", "refs/heads/enc", commit.trim()], None);
     }
 
+    /// Install `body` as the host's hook `name`, a shell script run in the
+    /// host repository.
+    fn host_hook(&self, host: &Path, name: &str, body: &str) {
+        let hook = host.join("hooks").join(name);
+        fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        fs::write(&hook, format!("#!/bin/sh\n{body}")).unwrap();
+        let mut perms = fs::metadata(&hook).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&hook, perms).unwrap();
+    }
+
+    /// The pack ids listed in `remote`'s manifest, as seen from `repo`.
+    fn pack_ids(&self, repo: &Path, remote: &str) -> Vec<String> {
+        let m = self.enc_ok(repo, &["manifest", remote]);
+        m.lines()
+            .filter_map(|l| l.strip_prefix("pack "))
+            .map(|l| l.split_whitespace().next().unwrap().to_owned())
+            .collect()
+    }
+
     fn host_pack_sizes(&self, host: &Path) -> Vec<u64> {
         let mut v: Vec<u64> = fs::read_dir(host.join("objects/pack"))
             .unwrap()
@@ -2118,6 +2138,142 @@ fn doctor_reports_what_would_get_in_the_way() {
     assert!(
         !ok && out.contains("FAIL  local state") && out.contains("forget"),
         "{out}"
+    );
+}
+
+/// A host hook script fragment: run the rest of the line without the hook's
+/// repository environment, as an unrelated git command would.
+const NO_HOOK_ENV: &str = "env -u GIT_DIR -u GIT_QUARANTINE_PATH -u GIT_OBJECT_DIRECTORY \
+                           -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_PROTOCOL";
+
+#[test]
+fn a_push_reported_failed_after_it_landed_lists_its_pack_once() {
+    let sb = Sandbox::new("landed");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "base", "0\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    // The next update of the backend branch lands, then is reported as
+    // declined: the host keeps the received objects and moves the branch
+    // itself before refusing.
+    let mark = sb.root.join("landed");
+    sb.host_hook(
+        &host,
+        "pre-receive",
+        &format!(
+            "while read old new ref; do\n\
+             if [ \"$ref\" = refs/heads/enc ] && [ ! -e '{mark}' ]; then\n\
+             touch '{mark}'\n\
+             cp -R \"$GIT_QUARANTINE_PATH\"/. objects/ || exit 2\n\
+             {NO_HOOK_ENV} git update-ref \"$ref\" \"$new\" \"$old\" || exit 2\n\
+             echo 'declined after landing' >&2\n\
+             exit 1\n\
+             fi\n\
+             done\n",
+            mark = mark.display()
+        ),
+    );
+    sb.commit_random(&a, "big", 100_000);
+    let out = sb
+        .cmd(&a, "git")
+        .args(["push", "enc", "main"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(mark.exists() && err.contains("retrying"), "{err}");
+
+    // The retry neither lists the pack again nor builds another one.
+    let ids = sb.pack_ids(&a, "enc");
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(
+        sb.git_ok(&host, &["for-each-ref", "--format=%(refname)"])
+            .trim(),
+        "refs/heads/enc"
+    );
+    // Both are recorded as indexed: no fetch downloads them again.
+    let have: String = fs::read_dir(a.join(".git/enc"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| fs::read_to_string(e.path().join("have")).ok())
+        .collect();
+    assert!(ids.iter().all(|id| have.contains(id.as_str())), "{have}");
+    let b = sb.clone("bob", &url, &alice);
+    assert_eq!(
+        fs::read(b.join("big")).unwrap(),
+        fs::read(a.join("big")).unwrap()
+    );
+}
+
+#[test]
+fn a_lost_race_reuses_the_encrypted_pack() {
+    let sb = Sandbox::new("lost-race");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "base", "0\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+    sb.git_ok(&b, &["checkout", "-q", "-b", "bob"]);
+    sb.commit_text(&b, "bob", "b\n");
+
+    // Alice's first update of the backend branch lets Bob push first, so
+    // the update fails; every update is logged with the pack blobs it adds.
+    let log = sb.root.join("updates");
+    let mark = sb.root.join("raced");
+    sb.host_hook(
+        &host,
+        "pre-receive",
+        &format!(
+            "while read old new ref; do\n\
+             case \"$ref\" in\n\
+             refs/heads/enc)\n\
+             echo \"enc $(git diff-tree --name-only \"$old\" \"$new\" | grep '\\.age' | tr '\\n' ' ')\" >>'{log}'\n\
+             if [ ! -e '{mark}' ]; then\n\
+             touch '{mark}'\n\
+             (cd '{bob}' && {NO_HOOK_ENV} git push -q origin bob) </dev/null >&2 || exit 2\n\
+             fi;;\n\
+             *) echo \"other $ref $new\" >>'{log}';;\n\
+             esac\n\
+             done\n",
+            log = log.display(),
+            mark = mark.display(),
+            bob = b.display()
+        ),
+    );
+    sb.commit_random(&a, "big", 100_000);
+    let out = sb
+        .cmd(&a, "git")
+        .args(["push", "enc", "main"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("retrying"), "{err}");
+
+    // Alice's two attempts added the same pack.
+    let updates = fs::read_to_string(&log).unwrap();
+    let enc: Vec<&str> = updates.lines().filter(|l| l.starts_with("enc ")).collect();
+    assert_eq!(enc.len(), 3, "{updates}");
+    assert!(enc[0].contains(".age"), "{updates}");
+    assert_eq!(enc[0], enc[2], "{updates}");
+    assert_ne!(enc[0], enc[1], "{updates}");
+    assert!(!updates.contains("other "), "{updates}");
+
+    let ids = sb.pack_ids(&a, "enc");
+    assert_eq!(ids.len(), 3, "{ids:?}");
+    let c = sb.clone("carol", &url, &alice);
+    sb.git_ok(&c, &["rev-parse", "--verify", "origin/bob"]);
+    assert_eq!(
+        fs::read(c.join("big")).unwrap(),
+        fs::read(a.join("big")).unwrap()
     );
 }
 
