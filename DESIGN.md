@@ -105,8 +105,9 @@ semantics.
 
 The remote is one branch of a git repository (default `refs/heads/enc`,
 overridable with a URL fragment: `enc::git@gitlab.com:g/r.git#mybranch`). Each
-push appends exactly one commit, whose parent is the previous tip, with a fixed
-anonymous author/committer/date. Its tree is flat:
+push appends exactly one commit, whose first parent is the previous tip (a
+large push's staging commits join as a further parent, section 5.1), with a
+fixed anonymous author/committer/date. Its tree is flat:
 
 ```
 manifest              age file: the encrypted, signed manifest
@@ -211,8 +212,8 @@ name       = hex(sha256(blob)) ‖ ".age"
 A blob larger than the part size (`enc.partSize`, default 1 GiB) is stored
 as parts of that size, `<name>.0000`, `<name>.0001`, … (a decimal index of
 at least four digits), whose concatenation is the ciphertext; the manifest is
-the same either way. Parts bound what one object costs the host. The
-default stays above git's `core.bigFileThreshold` (512 MiB): git
+the same either way. Parts bound what one object and one push (5.1) cost the
+host. The default stays above git's `core.bigFileThreshold` (512 MiB): git
 searches smaller blobs for deltas whenever it packs them (a host's repack, or
 serving loose objects to a fetch), measured at about 3 minutes of CPU per GiB
 of ciphertext, for no gain. A forge with a per-file limit below that (GitHub
@@ -259,12 +260,24 @@ for-push`.
    (thin). An empty pack (object count 0 in the header) is not stored.
 4. **Encrypt + hash** the pack stream into temporary files under
    `<common>/enc/`, cut at the part size, then `git hash-object -w` each.
+   When the parts exceed one upload batch (`enc.uploadBatch`, default
+   1 GiB), they are pushed ahead of the manifest, a batch per push, as a
+   chain of commits on a staging branch `<branch>-upload-<random>`, so a
+   per-push size limit applies to one batch, not the whole pack. The commit
+   of step 6 takes the staging chain's tip as a further parent (its only one
+   on a new remote), so git knows the host has the parts and sends only the
+   manifest; `log` follows first parents and skips staging commits. A lost
+   race (step 7) keeps the staging chain, so the retry sends only its new
+   manifest commit. The staging branch is deleted once the push succeeds or
+   fails, and a failed push uploads the whole pack again next time; a helper
+   killed in between leaves the branch behind, and it can be deleted by
+   hand.
 5. **New manifest:** refs updated, pack line appended, `generation + 1`,
    participants unchanged (from config only when creating the remote, or for
    `git-remote-enc participants --apply`, section 6.3), `head` set if absent.
    Sign with the local signing key, encrypt to the participants.
 6. **Commit:** tree = previous tree + pack blobs + new `manifest`;
-   `commit-tree -p <old tip>`.
+   `commit-tree -p <old tip>`, plus `-p <staging tip>` after step 4 staged.
 7. **Compare-and-swap:** `git push <url> <commit>:<branch>
    --force-with-lease=<branch>:<old tip>` (empty old tip for a new remote:
    "must not exist"). On a stale lease someone pushed in between: go back to
@@ -449,10 +462,13 @@ participants' decision; `enc.refuseForks = false` accepts the one served,
 with a warning, and it becomes the baseline. A pusher always writes
 `previous + 1`; the lease guarantees "previous" is the real tip.
 
-Generations are bounded from above too. Each push adds one backend commit and
-one generation, so a manifest may be at most the accepted generation plus the
-number of commits since the accepted one's (recorded in the local state), or
-on first contact, the number of commits on the branch. Without the bound, a
+Generations are bounded from above too. Each push adds one commit to the
+backend branch's first-parent chain and one generation, so a manifest may be
+at most the accepted generation plus the number of first-parent commits since
+the accepted one's (recorded in the local state), or on first contact, the
+number of first-parent commits on the branch. A new remote's first push may
+start on a staging chain (section 5.1), whose commits then count too: the
+bound is that much looser, never tighter. Without the bound, a
 participant could sign `generation 18446744073709551615`: every reader would
 accept it, no push could follow it, and restoring the branch would read as a
 rollback. A manifest over the bound is refused, never accepted, so the host
@@ -698,6 +714,7 @@ it, is a second flow from the machine to the host that bypasses the helper
 | `remote.<name>.enc-allowLfs`, `enc.allowLfs` | boolean, default false. Push although a pre-push hook runs Git LFS, or the pushed commits hold LFS pointers (section 5.1) |
 | `remote.<name>.enc-refuseForks`, `enc.refuseForks` | boolean, default true. Refuse a manifest that forks from the accepted one; false accepts it with a warning (section 6.2) |
 | `remote.<name>.enc-partSize`, `enc.partSize` | size (`k`, `m`, `g` suffixes), default 1g, at least 16k. Pack blobs larger than this are stored as parts of this size; 0 stores them whole (section 4.4) |
+| `remote.<name>.enc-uploadBatch`, `enc.uploadBatch` | size, default 1g. A push whose parts exceed this uploads them in pushes of at most this size ahead of the manifest; 0 sends everything in one push (section 5.1) |
 | `fetch.fsckObjects`, `transfer.fsckObjects`, `fetch.fsck.*` | git's own keys; received objects are checked unless one of the first two is false (section 5.2) |
 
 URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to

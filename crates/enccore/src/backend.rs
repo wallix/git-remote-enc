@@ -9,6 +9,9 @@ use crate::git::{self, Oid, TreeEntry};
 use crate::progress;
 
 pub const DEFAULT_BRANCH: &str = "enc";
+/// The message of a commit staging pack parts (DESIGN.md §5.1); the
+/// backend branch's own commits say `enc`.
+pub const UPLOAD_MESSAGE: &str = "enc upload\n";
 
 pub struct Backend {
     /// The git URL, exactly as handed to git.
@@ -78,9 +81,28 @@ impl Backend {
             .map(|(_, _, oid, _)| oid.as_str())
     }
 
-    /// Create a commit on `parent`, applying `upserts` (name → blob oid) to the
-    /// parent's tree.
-    pub fn build_commit(parent: Option<&str>, upserts: &[(String, Oid)]) -> Result<Oid> {
+    /// Create a commit on `parent`, applying `upserts` (name → blob oid) to
+    /// its tree. Add the staging tip `upload` as the next parent so git knows
+    /// the host has those parts and does not send them again.
+    pub fn build_commit(
+        parent: Option<&str>,
+        upload: Option<&str>,
+        upserts: &[(String, Oid)],
+    ) -> Result<Oid> {
+        Self::commit(parent, upload, upserts, "enc\n")
+    }
+
+    /// A commit staging parts: `upserts` added to `parent`'s tree.
+    pub fn build_upload(parent: Option<&str>, upserts: &[(String, Oid)]) -> Result<Oid> {
+        Self::commit(parent, None, upserts, UPLOAD_MESSAGE)
+    }
+
+    fn commit(
+        parent: Option<&str>,
+        upload: Option<&str>,
+        upserts: &[(String, Oid)],
+        message: &str,
+    ) -> Result<Oid> {
         let mut entries: Vec<TreeEntry> = match parent {
             Some(p) => Self::tree_entries(p)?
                 .into_iter()
@@ -94,7 +116,8 @@ impl Backend {
             entries.push(("100644".into(), "blob".into(), oid.clone(), name.clone()));
         }
         let tree = git::mktree(&entries)?;
-        git::commit_tree(&tree, parent, "enc\n")
+        let parents: Vec<&str> = parent.into_iter().chain(upload).collect();
+        git::commit_tree(&tree, &parents, message)
     }
 
     /// Compare-and-swap push of `commit` onto the branch, expecting the
@@ -117,6 +140,38 @@ impl Backend {
             return Ok(PushOutcome::StaleLease);
         }
         Ok(PushOutcome::Failed(stderr.trim().to_owned()))
+    }
+
+    /// A branch to stage a large push's parts on, next to the backend
+    /// branch: `<branch>-upload-<random>`.
+    pub fn upload_branch(&self) -> Result<String> {
+        let id = crate::crypto::random_id()?;
+        Ok(format!(
+            "{}-upload-{}",
+            self.branch,
+            id.get(..16).unwrap_or(&id)
+        ))
+    }
+
+    /// Push `commit` to the staging branch `branch`, unconditionally: no
+    /// one else writes to it.
+    pub fn push_upload(&self, commit: &str, branch: &str) -> Result<()> {
+        let refspec = format!("+{commit}:{branch}");
+        let (ok, stderr) = Self::git_push(&["--", &self.url, &refspec])?;
+        if !ok {
+            bail!("uploading to {} on {}: {}", branch, self.url, stderr.trim());
+        }
+        Ok(())
+    }
+
+    /// Delete the staging branch `branch` from the host.
+    pub fn delete_upload(&self, branch: &str) -> Result<()> {
+        let refspec = format!(":{branch}");
+        let (ok, stderr) = Self::git_push(&["--", &self.url, &refspec])?;
+        if !ok {
+            bail!("deleting {} on {}: {}", branch, self.url, stderr.trim());
+        }
+        Ok(())
     }
 
     fn git_push(args: &[&str]) -> Result<(bool, String)> {

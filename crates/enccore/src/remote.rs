@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ssh_key::PrivateKey;
 use zeroize::Zeroizing;
 
-use crate::backend::{Backend, PushOutcome};
+use crate::backend::{self, Backend, PushOutcome};
 use crate::config::Config;
 use crate::crypto::{self, HashReader, HashWriter, Identity, Participant, TrustKey};
 use crate::git::{self, Oid, Streaming, TreeEntry};
@@ -590,18 +590,20 @@ impl Remote {
         Ok(m)
     }
 
-    /// Each push adds one backend commit and one generation, so a
-    /// generation cannot run ahead of the commits: without this bound a
-    /// participant could push generation 2^64 - 1, after which nobody can
-    /// push again and going back is refused as a rollback. Counted from the
-    /// commit of the accepted manifest when the history still descends from
-    /// it, else, on first contact, from the root.
+    /// Each push adds one commit to the backend branch's first-parent chain
+    /// and one generation, so a generation cannot run ahead of those
+    /// commits: without this bound a participant could push generation
+    /// 2^64 - 1, after which nobody can push again and going back is refused
+    /// as a rollback. Counted from the commit of the accepted manifest when
+    /// the history still descends from it, else, on first contact, from the
+    /// root. A new remote's first push may start on a staging chain (DESIGN.md
+    /// §5.1), whose commits then count too: a slightly looser bound.
     fn check_generation_jump(&self, m: &Manifest, trust: Option<&Trust>) -> Result<()> {
         let Some(tip) = self.tip.as_deref() else {
             return Ok(());
         };
         let count = |range: &str| -> Result<u64> {
-            git::run_line(["rev-list", "--count", range])?
+            git::run_line(["rev-list", "--count", "--first-parent", range])?
                 .parse()
                 .context("rev-list --count")
         };
@@ -683,15 +685,38 @@ impl Remote {
         if self.tip.is_none() {
             bail!("no encrypted remote at {}", self.backend.url);
         }
-        let out = git::run(["rev-list", "--reverse", self.backend.tracking_ref.as_str()])?;
-        let commits = String::from_utf8(out).context("rev-list output is not UTF-8")?;
+        // The first parents are the pushes; a second parent is the chain
+        // of commits that staged a large push's parts. On a new remote that
+        // chain is the first push's only parent (DESIGN.md §5.1), so its
+        // commits are on the first-parent walk and skipped below.
+        let out = git::run([
+            "log",
+            "--first-parent",
+            "--reverse",
+            "--format=%H %s",
+            self.backend.tracking_ref.as_str(),
+        ])?;
+        let log = String::from_utf8(out).context("git log output is not UTF-8")?;
+        // A staging commit carries no manifest; one that does is a push,
+        // whatever its message says.
+        let upload = backend::UPLOAD_MESSAGE.trim_end();
+        let mut commits = Vec::new();
+        for (c, subject) in log.lines().filter_map(|l| l.split_once(' ')) {
+            if subject == upload
+                && Backend::blob_oid(&Backend::tree_entries(c)?, MANIFEST_BLOB).is_none()
+            {
+                continue;
+            }
+            commits.push(c.to_owned());
+        }
         let mut entries = Vec::new();
         let mut previous: Option<Manifest> = None;
         // Each push appends one commit and one generation: the commit at
         // index i carries generation i + 1 unless the host rewrote history.
         let mut expected: u64 = 1;
         let mut links: Vec<Option<Link>> = Vec::new();
-        for commit in commits.lines() {
+        for commit in &commits {
+            let commit = commit.as_str();
             let entry = match self.read_historical(commit) {
                 Ok((m, signer, digest)) => {
                     if m.generation != expected {
@@ -916,7 +941,9 @@ impl Remote {
 
     fn push_with(&mut self, specs: &[RefSpec], set_participants: bool) -> Result<Vec<PushStatus>> {
         let result = self.push_attempts(specs, set_participants);
-        self.staged = None;
+        if let Some(staged) = self.staged.take() {
+            self.discard(staged);
+        }
         result
     }
 
@@ -936,6 +963,17 @@ impl Remote {
             self.reconnect()?;
         }
         bail!("the remote kept changing under us; retry the push")
+    }
+
+    /// Delete a staged pack's upload branch from the host, if it has one.
+    fn discard(&self, staged: Staged) {
+        if let Some(branch) = &staged.upload_branch
+            && let Err(e) = self.backend.delete_upload(branch)
+        {
+            info(&format!(
+                "warning: could not delete the upload branch {branch}; delete it by hand: {e:#}"
+            ));
+        }
     }
 
     /// One attempt. `None` means the compare-and-swap lost; the caller
@@ -1136,7 +1174,9 @@ impl Remote {
         let staged = match self.staged.take() {
             // Landed: its objects are ours, so no fetch downloads it.
             Some(s) if m.packs.iter().any(|p| p.id == s.id) => {
-                self.state.add_have(&s.id)?;
+                let added = self.state.add_have(&s.id);
+                self.discard(s);
+                added?;
                 None
             }
             s => s,
@@ -1147,7 +1187,10 @@ impl Remote {
             |s: &Staged| s.wants == sorted_wants && wants.iter().any(|w| !known.contains(w));
         let pack = match staged {
             Some(s) if reusable(&s) => Some(s),
-            _ => {
+            old => {
+                if let Some(old) = old {
+                    self.discard(old);
+                }
                 if wants.is_empty() {
                     None
                 } else {
@@ -1157,7 +1200,8 @@ impl Remote {
                 }
             }
         };
-        // Held by `self` from here on, so a lost race can reuse it.
+        // Held by `self` from here on, so whatever ends this attempt, its
+        // upload branch is deleted (`push_with`) or reused (a lost race).
         self.staged = pack;
         let pack = self
             .staged
@@ -1205,7 +1249,8 @@ impl Remote {
         if let Some((_, _, blobs)) = &pack {
             upserts.extend(blobs.iter().cloned());
         }
-        let commit = Backend::build_commit(self.tip.as_deref(), &upserts)?;
+        let upload = self.staged.as_ref().and_then(|s| s.upload_tip.clone());
+        let commit = Backend::build_commit(self.tip.as_deref(), upload.as_deref(), &upserts)?;
 
         match self.backend.push(&commit, self.tip.as_deref())? {
             PushOutcome::StaleLease => Ok(None),
@@ -1219,7 +1264,9 @@ impl Remote {
             }
             PushOutcome::Done => {
                 if let Some(p) = self.staged.take() {
-                    self.state.add_have(&p.id)?;
+                    let added = self.state.add_have(&p.id);
+                    self.discard(p);
+                    added?;
                 }
                 self.save_trust(&trust_in(&m, &text, Some(&commit)))?;
                 self.manifest_digest = Some(crypto::sha256_hex(text.as_bytes()));
@@ -1309,7 +1356,9 @@ impl Remote {
         Ok(Some(built))
     }
 
-    /// Store a built pack's parts as blobs, for this attempt and a retry.
+    /// Store a built pack's parts as blobs and, when they exceed one upload
+    /// batch, push them ahead of the manifest on a branch of their own, a
+    /// batch at a time: the final push then sends only the manifest.
     fn stage(&self, built: BuiltPack, wants: Vec<Oid>) -> Result<Staged> {
         let names: Vec<String> = if built.paths.len() == 1 {
             vec![format!("{}.age", built.id)]
@@ -1334,12 +1383,58 @@ impl Remote {
         }
         meter.finish();
 
-        Ok(Staged {
+        let mut staged = Staged {
             wants,
             id: built.id.clone(),
             key: built.key.clone(),
             blobs,
-        })
+            upload_branch: None,
+            upload_tip: None,
+        };
+        let batch = self.cfg.upload_batch;
+        if batch == 0 || total <= batch || staged.blobs.len() < 2 {
+            return Ok(staged);
+        }
+        // Batches of whole parts, each at most `batch` bytes or one part.
+        let mut batches: Vec<(Vec<(String, Oid)>, u64)> = Vec::new();
+        for (blob, size) in staged.blobs.iter().zip(&sizes) {
+            match batches.last_mut() {
+                Some((b, len)) if len.saturating_add(*size) <= batch => {
+                    b.push(blob.clone());
+                    *len = len.saturating_add(*size);
+                }
+                _ => batches.push((vec![blob.clone()], *size)),
+            }
+        }
+        let branch = self.backend.upload_branch()?;
+        for (i, (batch, len)) in batches.iter().enumerate() {
+            if progress::enabled() {
+                info(&format!(
+                    "uploading pack {}, batch {}/{} ({})",
+                    progress::human(total),
+                    i.saturating_add(1),
+                    batches.len(),
+                    progress::human(*len)
+                ));
+            }
+            let pushed =
+                Backend::build_upload(staged.upload_tip.as_deref(), batch).and_then(|commit| {
+                    self.backend.push_upload(&commit, &branch)?;
+                    Ok(commit)
+                });
+            match pushed {
+                Ok(commit) => {
+                    // On the host from here on, for `discard` to delete.
+                    staged.upload_branch = Some(branch.clone());
+                    staged.upload_tip = Some(commit);
+                }
+                Err(e) => {
+                    self.discard(staged);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(staged)
     }
 }
 
@@ -1545,7 +1640,8 @@ impl Drop for BuiltPack {
     }
 }
 
-/// A pack whose blobs are in the local object store.
+/// A pack whose blobs are in the local object store and, for a large one,
+/// already uploaded to `upload_branch`.
 struct Staged {
     /// The new tips it was built for, sorted.
     wants: Vec<Oid>,
@@ -1553,6 +1649,9 @@ struct Staged {
     key: Zeroizing<String>,
     /// Tree name and blob of each part.
     blobs: Vec<(String, Oid)>,
+    upload_branch: Option<String>,
+    /// The last commit pushed to `upload_branch`.
+    upload_tip: Option<Oid>,
 }
 
 #[cfg(test)]

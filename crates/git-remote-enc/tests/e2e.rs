@@ -2142,7 +2142,7 @@ fn doctor_reports_what_would_get_in_the_way() {
 }
 
 #[test]
-fn large_packs_are_split_into_parts() {
+fn large_packs_are_split_and_uploaded_in_batches() {
     let sb = Sandbox::new("split");
     let host = sb.host();
     let url = sb.url(&host, None);
@@ -2150,10 +2150,19 @@ fn large_packs_are_split_into_parts() {
     let a = sb.repo("alice");
     sb.add_remote(&a, &url, &alice, &[&alice_pub]);
     sb.git_ok(&a, &["config", "enc.partSize", "64k"]);
+    sb.git_ok(&a, &["config", "enc.uploadBatch", "200k"]);
     sb.commit_random(&a, "big", 600_000);
-    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let out = sb
+        .cmd(&a, "git")
+        .args(["push", "--progress", "enc", "main"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("batch 1/"), "{err}");
 
-    // Parts of at most 64 KiB, and no whole blob.
+    // Parts of at most 64 KiB, in their own pushes, and no staging branch
+    // left behind.
     let tree = sb.git_ok(&host, &["ls-tree", "-l", "refs/heads/enc"]);
     let parts: Vec<u64> = tree
         .lines()
@@ -2163,6 +2172,28 @@ fn large_packs_are_split_into_parts() {
     assert!(parts.len() >= 10, "{tree}");
     assert!(parts.iter().all(|s| *s <= 64 << 10), "{tree}");
     assert!(!tree.contains(".age\t"), "{tree}");
+    assert_eq!(
+        sb.git_ok(&host, &["for-each-ref", "--format=%(refname)"])
+            .trim(),
+        "refs/heads/enc"
+    );
+    // 10 parts of 64 KiB, 3 per 200 KiB batch: 4 staging commits, then the
+    // push that merges them.
+    assert_eq!(
+        sb.git_ok(&host, &["rev-list", "--count", "refs/heads/enc"])
+            .trim(),
+        "5"
+    );
+    // Each batch in its own push, and the parts sent once: the last push
+    // carries the manifest only.
+    let packs = sb.host_pack_sizes(&host);
+    assert_eq!(packs.len(), 5, "{packs:?}");
+    assert!(
+        packs.iter().filter(|s| **s < 10_000).count() == 1,
+        "{packs:?}"
+    );
+    assert!(packs.iter().all(|s| *s < 250_000), "{packs:?}");
+    assert!(packs.iter().sum::<u64>() < 700_000, "{packs:?}");
 
     // A small push afterwards stores one blob.
     sb.commit_text(&a, "small", "x\n");
@@ -2196,6 +2227,15 @@ fn large_packs_are_split_into_parts() {
     assert_eq!(
         fs::read(b.join("big")).unwrap(),
         fs::read(a.join("big")).unwrap()
+    );
+
+    // The staging commits are not generations.
+    sb.git_ok(&b, &["config", "remote.origin.enc-identity", id]);
+    let log = sb.enc_ok(&b, &["log", "origin"]);
+    assert_eq!(log.matches("generation ").count(), 2, "{log}");
+    assert!(
+        !log.contains("not readable") && !log.contains("warning"),
+        "{log}"
     );
 }
 
@@ -2260,6 +2300,56 @@ fn a_missing_or_altered_part_fails_the_fetch() {
     assert!(err.contains("does not match its manifest name"), "{err}");
 }
 
+#[test]
+fn concurrent_batched_pushes_lose_nothing() {
+    let sb = Sandbox::new("concurrent-batched");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "base", "0\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+    for r in [&a, &b] {
+        sb.git_ok(r, &["config", "enc.partSize", "16k"]);
+        sb.git_ok(r, &["config", "enc.uploadBatch", "40k"]);
+    }
+
+    for round in 0..3 {
+        sb.git_ok(&a, &["checkout", "-q", "-B", &format!("a{round}"), "main"]);
+        sb.commit_random(&a, &format!("a{round}.bin"), 100_000);
+        sb.git_ok(&b, &["checkout", "-q", "-B", &format!("b{round}"), "main"]);
+        sb.commit_random(&b, &format!("b{round}.bin"), 100_000);
+        let mut pa = sb
+            .cmd(&a, "git")
+            .args(["push", "-q", "enc", &format!("a{round}")])
+            .spawn()
+            .unwrap();
+        let mut pb = sb
+            .cmd(&b, "git")
+            .args(["push", "-q", "origin", &format!("b{round}")])
+            .spawn()
+            .unwrap();
+        assert!(pa.wait().unwrap().success());
+        assert!(pb.wait().unwrap().success());
+    }
+    assert_eq!(
+        sb.git_ok(&host, &["for-each-ref", "--format=%(refname)"])
+            .trim(),
+        "refs/heads/enc",
+        "staging branches left behind"
+    );
+
+    let c = sb.clone("carol", &url, &alice);
+    for round in 0..3 {
+        for who in ["a", "b"] {
+            let branch = format!("origin/{who}{round}");
+            sb.git_ok(&c, &["rev-list", "--objects", "--missing=error", &branch]);
+        }
+    }
+}
+
 /// A host hook script fragment: run the rest of the line without the hook's
 /// repository environment, as an unrelated git command would.
 const NO_HOOK_ENV: &str = "env -u GIT_DIR -u GIT_QUARANTINE_PATH -u GIT_OBJECT_DIRECTORY \
@@ -2275,6 +2365,8 @@ fn a_push_reported_failed_after_it_landed_lists_its_pack_once() {
     sb.commit_text(&a, "base", "0\n");
     sb.add_remote(&a, &url, &alice, &[&alice_pub]);
     sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.git_ok(&a, &["config", "enc.partSize", "16k"]);
+    sb.git_ok(&a, &["config", "enc.uploadBatch", "40k"]);
 
     // The next update of the backend branch lands, then is reported as
     // declined: the host keeps the received objects and moves the branch
@@ -2330,7 +2422,7 @@ fn a_push_reported_failed_after_it_landed_lists_its_pack_once() {
 }
 
 #[test]
-fn a_lost_race_reuses_the_encrypted_pack() {
+fn a_lost_race_reuses_the_staged_pack() {
     let sb = Sandbox::new("lost-race");
     let host = sb.host();
     let url = sb.url(&host, None);
@@ -2342,6 +2434,8 @@ fn a_lost_race_reuses_the_encrypted_pack() {
     let b = sb.clone("bob", &url, &alice);
     sb.git_ok(&b, &["checkout", "-q", "-b", "bob"]);
     sb.commit_text(&b, "bob", "b\n");
+    sb.git_ok(&a, &["config", "enc.partSize", "16k"]);
+    sb.git_ok(&a, &["config", "enc.uploadBatch", "40k"]);
 
     // Alice's first update of the backend branch lets Bob push first, so
     // the update fails; every update is logged with the pack blobs it adds.
@@ -2377,14 +2471,46 @@ fn a_lost_race_reuses_the_encrypted_pack() {
     assert!(out.status.success(), "{err}");
     assert!(err.contains("retrying"), "{err}");
 
-    // Alice's two attempts added the same pack.
+    // Alice's two attempts added the same pack, uploaded once, on one
+    // staging branch, which is deleted at the end.
     let updates = fs::read_to_string(&log).unwrap();
     let enc: Vec<&str> = updates.lines().filter(|l| l.starts_with("enc ")).collect();
     assert_eq!(enc.len(), 3, "{updates}");
-    assert!(enc[0].contains(".age"), "{updates}");
+    assert!(enc[0].contains(".age.0000"), "{updates}");
     assert_eq!(enc[0], enc[2], "{updates}");
     assert_ne!(enc[0], enc[1], "{updates}");
-    assert!(!updates.contains("other "), "{updates}");
+    let staging: Vec<(&str, &str)> = updates
+        .lines()
+        .filter_map(|l| l.strip_prefix("other "))
+        .map(|l| l.split_once(' ').unwrap())
+        .collect();
+    assert!(
+        staging
+            .iter()
+            .all(|(r, _)| *r == staging[0].0 && r.starts_with("refs/heads/enc-upload-")),
+        "{updates}"
+    );
+    let deleted = |new: &str| new.bytes().all(|c| c == b'0');
+    let (deletions, uploads): (Vec<&(&str, &str)>, Vec<_>) =
+        staging.iter().partition(|(_, n)| deleted(n));
+    assert_eq!(deletions.len(), 1, "{updates}");
+    assert!(deleted(staging.last().unwrap().1), "{updates}");
+    let count = |extra: &[&str]| -> usize {
+        let mut args = vec!["rev-list", "--count"];
+        args.extend_from_slice(extra);
+        args.push("refs/heads/enc");
+        sb.git_ok(&host, &args).trim().parse().unwrap()
+    };
+    assert_eq!(
+        uploads.len(),
+        count(&[]) - count(&["--first-parent"]),
+        "{updates}"
+    );
+    assert_eq!(
+        sb.git_ok(&host, &["for-each-ref", "--format=%(refname)"])
+            .trim(),
+        "refs/heads/enc"
+    );
 
     let ids = sb.pack_ids(&a, "enc");
     assert_eq!(ids.len(), 3, "{ids:?}");
@@ -2394,6 +2520,58 @@ fn a_lost_race_reuses_the_encrypted_pack() {
         fs::read(c.join("big")).unwrap(),
         fs::read(a.join("big")).unwrap()
     );
+}
+
+#[test]
+fn a_failed_staging_push_removes_the_staging_branch() {
+    let sb = Sandbox::new("staging-fails");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "base", "0\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.git_ok(&a, &["config", "enc.partSize", "16k"]);
+    sb.git_ok(&a, &["config", "enc.uploadBatch", "40k"]);
+
+    // Refuse the second batch; allow and log branch deletion.
+    let counter = sb.root.join("uploads");
+    let deletions = sb.root.join("deletions");
+    sb.host_hook(
+        &host,
+        "pre-receive",
+        &format!(
+            "while read old new ref; do\n\
+             case \"$ref\" in refs/heads/enc-upload-*)\n\
+             case \"$new\" in *[!0]*) ;; *) echo x >>'{deletions}'; continue;; esac\n\
+             echo x >>'{counter}'\n\
+             if [ \"$(wc -l <'{counter}')\" -ge 2 ]; then echo 'batch refused' >&2; exit 1; fi;;\n\
+             esac\n\
+             done\n",
+            counter = counter.display(),
+            deletions = deletions.display()
+        ),
+    );
+    sb.commit_random(&a, "big", 100_000);
+    let err = sb.git_fails(&a, &["push", "enc", "main"]);
+    assert!(err.contains("batch refused"), "{err}");
+    assert_eq!(
+        sb.git_ok(&host, &["for-each-ref", "--format=%(refname)"])
+            .trim(),
+        "refs/heads/enc"
+    );
+    assert_eq!(sb.pack_ids(&a, "enc").len(), 1);
+
+    // The first batch refused: there is no branch to delete.
+    let err = sb.git_fails(&a, &["push", "enc", "main"]);
+    assert!(err.contains("batch refused"), "{err}");
+    assert!(!err.contains("upload branch"), "{err}");
+    assert_eq!(fs::read_to_string(&deletions).unwrap().lines().count(), 1);
+
+    fs::remove_file(host.join("hooks/pre-receive")).unwrap();
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    assert_eq!(sb.pack_ids(&a, "enc").len(), 2);
 }
 
 #[test]

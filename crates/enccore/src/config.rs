@@ -38,12 +38,19 @@ pub struct Config {
     /// A pack blob larger than this is stored as parts of this size; 0
     /// stores every pack whole.
     pub part_size: u64,
+    /// Parts are uploaded in pushes of at most this many bytes; 0 sends
+    /// every push at once.
+    pub upload_batch: u64,
 }
 
 /// Above git's default `core.bigFileThreshold` (512 MiB): smaller blobs are
 /// searched for deltas whenever a host packs them, which for ciphertext is
 /// minutes of CPU per GiB for nothing.
 pub const DEFAULT_PART_SIZE: u64 = 1 << 30;
+/// One part per push: under per-push limits (GitHub: 2 GB). Only a retry
+/// after a lost race reuses uploaded batches; a failed push uploads them
+/// all again.
+pub const DEFAULT_UPLOAD_BATCH: u64 = 1 << 30;
 /// The smallest part size accepted: smaller parts create too many tree
 /// entries and objects.
 pub const MIN_PART_SIZE: u64 = 16 << 10;
@@ -111,6 +118,10 @@ impl Config {
             Some((k, v)) => parse_part_size(&k, &v)?,
             None => DEFAULT_PART_SIZE,
         };
+        let upload_batch = match one_keyed("uploadBatch")? {
+            Some((k, v)) => parse_size(&v).with_context(|| format!("{k}: `{v}` is not a size"))?,
+            None => DEFAULT_UPLOAD_BATCH,
+        };
         let participants = key_list(all("participants")?)?;
         let admins = key_list(all("admins")?)?;
 
@@ -127,6 +138,7 @@ impl Config {
             refuse_forks,
             fsck,
             part_size,
+            upload_batch,
         })
     }
 }

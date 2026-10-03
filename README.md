@@ -80,6 +80,7 @@ pinned input, so a release can be re-derived and compared years later.
 | `remote.<name>.enc-installHook` / `enc.installHook` | `false` skips installing, and checking for, the pre-push guard. Default `true` |
 | `remote.<name>.enc-allowLfs` / `enc.allowLfs` | `true` pushes even though Git LFS could upload files on pre-push, or the push carries LFS pointers. Default `false` (see below) |
 | `remote.<name>.enc-partSize` / `enc.partSize` | encrypted packs larger than this are stored as parts of this size. Default `1g`, at least `16k`; `0` stores them whole. A host with a smaller per-file limit (GitHub: 100 MB) needs e.g. `48m`, at a CPU cost to the host (DESIGN.md §4.4) |
+| `remote.<name>.enc-uploadBatch` / `enc.uploadBatch` | a push larger than this uploads its parts in several pushes of at most this size, under push-size limits. Default `1g`; `0` pushes at once (DESIGN.md §5.1) |
 | `remote.<name>.enc-refuseForks` / `enc.refuseForks` | `false` accepts, with a warning, a manifest that forks from the one accepted before, once the participants agree to keep that view. Default `true` |
 
 URL: `enc::<git url>[#<branch>]`; the backend branch defaults to `enc`.

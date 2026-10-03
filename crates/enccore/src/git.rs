@@ -653,9 +653,9 @@ pub fn mktree(entries: &[TreeEntry]) -> Result<Oid> {
 /// A deterministic, anonymous commit: fixed author/committer/date so the
 /// backend history leaks nothing about who pushed or when. Never signed,
 /// whatever `commit.gpgSign` says: a signature would name the pusher.
-pub fn commit_tree(tree: &str, parent: Option<&str>, message: &str) -> Result<Oid> {
+pub fn commit_tree(tree: &str, parents: &[&str], message: &str) -> Result<Oid> {
     let mut args = vec!["commit-tree", "--no-gpg-sign", tree];
-    if let Some(p) = parent {
+    for p in parents {
         args.push("-p");
         args.push(p);
     }
