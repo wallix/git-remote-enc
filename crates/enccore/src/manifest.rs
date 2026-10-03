@@ -48,6 +48,11 @@ pub struct Manifest {
     /// history, so the accepted tip authenticates every manifest before it.
     /// New in version 3; absent on a remote's first manifest.
     pub previous: Option<String>,
+    /// The generation the backend history starts at since a participant
+    /// rewrote it (`git-remote-enc repack --rewrite-history`); earlier
+    /// generations are gone from the host. Carried forward by every push.
+    /// New in version 4.
+    pub epoch: Option<u64>,
     pub repo_id: String,
     pub head: Option<String>,
     /// Public keys as written by the user (`ssh-ed25519 AAAA… comment`,
@@ -104,6 +109,7 @@ impl Manifest {
 
         let mut m = Manifest::default();
         let mut have_generation = false;
+        let mut epoch_line = None;
         let mut seen: Vec<&str> = Vec::new();
         for (idx, line) in lines {
             let lineno = idx.saturating_add(1);
@@ -114,7 +120,10 @@ impl Manifest {
             let malformed = || ParseError::Malformed(lineno, line.to_owned());
             let (item, rest) = line.split_once(' ').unwrap_or((line, ""));
             // Single-value items may appear only once.
-            if matches!(item, "generation" | "time" | "previous" | "repo" | "head") {
+            if matches!(
+                item,
+                "generation" | "time" | "previous" | "epoch" | "repo" | "head"
+            ) {
                 if seen.contains(&item) {
                     return Err(ParseError::Duplicate(lineno, item.to_owned()));
                 }
@@ -132,6 +141,10 @@ impl Manifest {
                         return Err(malformed());
                     }
                     m.previous = Some(d.to_owned());
+                }
+                "epoch" => {
+                    m.epoch = Some(rest.trim().parse().map_err(|_| malformed())?);
+                    epoch_line = Some(malformed());
                 }
                 "repo" => m.repo_id = nonempty(rest).ok_or_else(malformed)?.to_owned(),
                 "head" => {
@@ -179,6 +192,11 @@ impl Manifest {
         if m.repo_id.is_empty() {
             return Err(ParseError::Missing("repo"));
         }
+        if m.epoch.is_some_and(|e| e > m.generation)
+            && let Some(e) = epoch_line
+        {
+            return Err(e);
+        }
         Ok(m)
     }
 
@@ -203,6 +221,9 @@ impl Manifest {
         }
         if let Some(p) = &self.previous {
             out.push_str(&format!("previous {p}\n"));
+        }
+        if let Some(e) = self.epoch {
+            out.push_str(&format!("epoch {e}\n"));
         }
         if let Some(h) = &self.head {
             out.push_str(&format!("head {h}\n"));
@@ -306,7 +327,7 @@ pub fn join_envelope(manifest: &str, signature_pem: &str) -> Zeroizing<Vec<u8>> 
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "enc-manifest 4\ngeneration 3\nrepo abcdef0123\ntime 1790000000\nprevious 1111111111111111111111111111111111111111111111111111111111111111\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nadmin ssh-ed25519 AAAAC3 alice\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nextn future stuff\n";
+    const SAMPLE: &str = "enc-manifest 4\ngeneration 3\nrepo abcdef0123\ntime 1790000000\nprevious 1111111111111111111111111111111111111111111111111111111111111111\nepoch 2\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nadmin ssh-ed25519 AAAAC3 alice\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nextn future stuff\n";
 
     #[test]
     fn roundtrip() {
@@ -315,6 +336,7 @@ mod tests {
         assert_eq!(m.repo_id, "abcdef0123");
         assert_eq!(m.time, Some(1_790_000_000));
         assert_eq!(m.previous.as_deref(), Some(&*"1".repeat(64)));
+        assert_eq!(m.epoch, Some(2));
         assert_eq!(m.head.as_deref(), Some("refs/heads/main"));
         assert_eq!(m.participants.len(), 2);
         assert_eq!(m.participants[0], "ssh-ed25519 AAAAC3 alice");
@@ -354,6 +376,19 @@ mod tests {
             Manifest::parse("enc-manifest 1\nrepo x\n"),
             Err(ParseError::Missing("generation"))
         );
+        // History cannot start after the manifest's own generation.
+        assert_eq!(
+            Manifest::parse("enc-manifest 4\nepoch 3\ngeneration 2\nrepo x\n"),
+            Err(ParseError::Malformed(2, "epoch 3".to_owned()))
+        );
+        assert_eq!(
+            Manifest::parse("enc-manifest 4\nepoch 2\ngeneration 2\nrepo x\n").map(|m| m.epoch),
+            Ok(Some(2))
+        );
+        assert_eq!(
+            Manifest::parse("enc-manifest 4\ngeneration 2\nepoch x\nrepo x\n"),
+            Err(ParseError::Malformed(3, "epoch x".to_owned()))
+        );
         assert!(matches!(
             Manifest::parse("enc-manifest 1\ngeneration 1\nrepo x\nref nothex refs/heads/x\n"),
             Err(ParseError::Malformed(4, _))
@@ -363,6 +398,7 @@ mod tests {
         for (text, want) in [
             ("generation 1\ngeneration 2\nrepo x\n", "generation"),
             ("generation 1\nrepo x\nrepo y\n", "repo"),
+            ("generation 1\nepoch 1\nepoch 1\nrepo x\n", "epoch"),
             (
                 &*format!("generation 1\nrepo x\nref {oid} refs/heads/a\nref {oid} refs/heads/a\n"),
                 "ref refs/heads/a",

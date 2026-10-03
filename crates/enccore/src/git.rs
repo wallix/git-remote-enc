@@ -572,6 +572,15 @@ pub fn lfs_pointers(tips: &[Oid], excludes: &[Oid]) -> Result<Vec<String>> {
     Ok(pointers)
 }
 
+/// How many objects `tips` reach.
+pub fn count_objects(tips: &[Oid]) -> Result<u64> {
+    let out = run_input(
+        ["rev-list", "--objects", "--no-object-names", "--stdin"],
+        rev_list_input(tips, &[]).as_bytes(),
+    )?;
+    Ok(out.iter().filter(|b| **b == b'\n').count() as u64)
+}
+
 pub fn is_ancestor(old: &str, new: &str) -> Result<bool> {
     Ok(run_status(["merge-base", "--is-ancestor", old, new])?.0)
 }

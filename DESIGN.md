@@ -107,7 +107,8 @@ The remote is one branch of a git repository (default `refs/heads/enc`,
 overridable with a URL fragment: `enc::git@gitlab.com:g/r.git#mybranch`). Each
 push appends exactly one commit, whose first parent is the previous tip (a
 large push's staging commits join as a further parent, section 5.1), with a
-fixed anonymous author/committer/date. Its tree is flat:
+fixed anonymous author/committer/date and the message `enc` (`enc epoch <n>`
+for a rewrite's first commit, section 6.2). Its tree is flat:
 
 ```
 manifest              age file: the encrypted, signed manifest
@@ -120,7 +121,7 @@ manifest              age file: the encrypted, signed manifest
 Blob names are the SHA-256 of the age ciphertext, so the manifest can bind a
 pack line to exactly one ciphertext, stored whole or as parts (section 4.4).
 The tree only ever grows (a deleted ref keeps its objects in earlier packs);
-section 7 discusses compaction.
+section 7 discusses repacking.
 
 Chained commits make both fetches and pushes of the branch incremental. No
 object is ever transferred twice in either direction.
@@ -153,6 +154,7 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 | `generation <n>` | strictly increasing per push; anti-rollback (section 6.2) |
 | `time <unix seconds>` | when the pusher wrote it, by the pusher's clock; for the audit trail only, never for trust decisions. New in version 2 |
 | `previous <sha256>` | hex SHA-256 of the previous generation's manifest text; absent on a remote's first manifest. Chains the history so the accepted manifest authenticates every one before it (section 6.6). New in version 3 |
+| `epoch <generation>` | the generation the backend history starts at since a participant rewrote it (section 7); at most `generation`, carried forward by every push. New in version 4 |
 | `repo <hex>` | random id chosen at creation; detects a recreated remote |
 | `head <ref>` | what `HEAD` points to on clone (first pushed branch by default) |
 | `participant <key>` | an `ssh-ed25519` public key (may read, may push) or an `age1…` recipient (read-only, cannot sign) |
@@ -282,14 +284,18 @@ for-push`.
    --force-with-lease=<branch>:<old tip>` (empty old tip for a new remote:
    "must not exist"). On a stale lease someone pushed in between: go back to
    step 1 and redo everything (at most 3 attempts) except the pack, which is
-   kept when the same tips are pushed again: everything it was built against
-   is still on the remote, in older packs. It is dropped, and step 3 runs
-   again, when the new manifest already lists it (our push landed although
-   git reported a failure; it is recorded as indexed) or already holds every
-   pushed tip. Their pack is still valid too. The lease is checked by the
-   client (`stale info`) and enforced again by the server (old value mismatch);
-   any rejection after which the branch tip has moved is treated as a lost
-   race, anything else as a hard error.
+   kept when the same tips are pushed again and every pack listed when it was
+   built still is: everything it was built against is then still on the
+   remote. It is dropped, and step 3 runs again, when the new manifest
+   already lists it (our push landed although git reported a failure; it is
+   recorded as indexed), already holds every pushed tip, or a repack has
+   dropped a pack it was built against. Their pack is still valid too. A
+   repack's pack (section 7) is not thin: it is kept whenever the refs are
+   unchanged, and a repack whose pack the new manifest lists alone has
+   landed and is done. The lease is checked by the client (`stale info`)
+   and enforced again by the server (old value mismatch); any rejection
+   after which the branch tip has moved is treated as a lost race, anything
+   else as a hard error.
 8. Move the tracking ref to the new commit, record the new pack as indexed
    locally (its objects are ours), report `ok <dst>` per ref.
 
@@ -462,17 +468,33 @@ participants' decision; `enc.refuseForks = false` accepts the one served,
 with a warning, and it becomes the baseline. A pusher always writes
 `previous + 1`; the lease guarantees "previous" is the real tip.
 
-Generations are bounded from above too. Each push adds one commit to the
-backend branch's first-parent chain and one generation, so a manifest may be
-at most the accepted generation plus the number of first-parent commits since
-the accepted one's (recorded in the local state), or on first contact, the
-number of first-parent commits on the branch. A new remote's first push may
-start on a staging chain (section 5.1), whose commits then count too: the
-bound is that much looser, never tighter. Without the bound, a
+Generations are bounded from above too. Each push adds one commit to the backend
+branch's first-parent chain and one generation, so a manifest may be at most the
+accepted generation plus the number of first-parent commits since the accepted
+one's (recorded in the local state), or on first contact, the number of
+first-parent commits on the branch, plus `epoch - 1` when the branch starts at
+the manifest's `epoch` (a participant rewrote it, section 7). It does when its
+oldest commit carrying a manifest (staging commits skipped) has the message
+`enc epoch <epoch>`, and every commit carrying a manifest is on the
+first-parent chain; otherwise `epoch` is ignored. The message is not signed,
+but placing it under the history takes a forced update, or creating the branch
+(a new remote, or after deleting it): an ordinary push can only add commits on
+top, and a fast-forward that hides the history behind a second parent fails the
+second condition. A new remote's first push, or a rewrite, may start on a
+staging chain (section 5.1), whose commits then count too: the bound is that much looser, never tighter. Without the bound, a
 participant could sign `generation 18446744073709551615`: every reader would
 accept it, no push could follow it, and restoring the branch would read as a
 rollback. A manifest over the bound is refused, never accepted, so the host
-restoring the branch recovers.
+restoring the branch recovers. A participant whom the host lets force-update
+the branch can still lift the first-contact bound, by a rewrite with a large
+`epoch`, and so can the remote's creator, whose first push may be a single
+`enc epoch 18446744073709551615` commit; nothing local tells either from a real
+rewrite. A client whose accepted manifest's commit is no longer in the history
+bounds the generation the same way when the manifest's `epoch` is above the
+generation it accepted and the history starts there, so it accepts the same;
+otherwise (older local state, or the host's rewrite, which it reports) it is
+unbounded. The host can forge the message too, but not a signed `epoch` to
+match it.
 
 ### 6.3 Adding and removing participants
 
@@ -499,6 +521,9 @@ revocation means a fresh remote and a re-push (`git push --mirror`).
   reader of the host what is being worked on and since when. Use a neutral
   name, or one opaque remote per audience with the default name.
 - Number and size of packs, timing, pushing account (transport layer).
+- After `repack --rewrite-history`, the generation it was made at (its
+  commit's message, section 6.2): the number of pushes before it, which the
+  host saw happen.
 - Number of participants (age recipient stanzas), and for `ssh-*` recipients a
   4-byte tag derived from the public key. That tag identifies the key to
   anyone who holds the public key, and public keys are not secret: forges
@@ -550,7 +575,11 @@ connect warns when the new tip does not descend from the tip fetched before
 every place where the generations stop following the commits one for one
 (each push adds one commit and one generation), printing which generation a
 manifest's changes are relative to when that is not the one just before. Both
-detect a rewrite; neither restores what it removed.
+detect a rewrite; neither restores what it removed. A participant's rewrite
+(`repack --rewrite-history`, section 7) is signed via `epoch` and reported as
+a participant's, not the host's. A host squashing the history after such a
+rewrite is still reported as a participant's repack, but `log` flags the
+discontinuity.
 
 A signature alone does not make a past manifest authentic: the host can
 insert manifests signed by a key of its own, encrypted to a participant, whose
@@ -665,7 +694,7 @@ it, is a second flow from the machine to the host that bypasses the helper
 | A participant changes who participates | only admins change the lists; a push never does it implicitly (6.1, 6.3) | a remote from before format 2 has no admins until appointed; admins are fully trusted |
 | A participant rewrites or deletes refs | every change is signed and kept in the backend history (`log`, 6.6) | no per-ref permission: one remote per audience (section 1) |
 | The host inserts forged manifests into the history `log` reads | the `previous` hash chain from the accepted manifest; unchained manifests are marked not verified and do not name their signer (6.6) | manifests from before `previous` existed cannot be verified |
-| The host rewrites the backend history, erasing the audit trail | a tip that does not descend from the last one seen is reported; `log` flags missing generations (6.6) | the removed manifests are gone unless the branch is protected on the host or mirrored; a first contact after the rewrite gets no warning, only `log`'s |
+| The host rewrites the backend history, erasing the audit trail | a tip that does not descend from the last one seen is reported, as a participant's repack when a signed `epoch` above the accepted generation says so; `log` flags missing generations (6.6) | the removed manifests are gone unless the branch is protected on the host or mirrored; a first contact after the rewrite gets no warning, only `log`'s |
 | A removed participant reads the past | future pack keys are unknown to them (6.3) | they keep the past history; full revocation is a new remote |
 | A participant's private key is compromised | passphrase on the key; admins remove the key | the whole readable history is exposed, permanently; no hardware or agent-held keys (6.5) |
 | A local attacker rewrites the trust state | HMAC keyed from the user's identity; a file with a wrong or missing tag, or missing while the tracking ref exists, is refused (5.4, section 9) | stops tampering without code execution (a restored backup, a synced or shared directory); whoever can write `.git` can run code through hooks instead |
@@ -686,12 +715,25 @@ it, is a second flow from the machine to the host that bypasses the helper
   incremental `git push`. Fetch cost symmetric. Independent of history length.
 - The backend tree grows by one blob per push; git handles trees with tens of
   thousands of entries fine, but a very active repository may want
-  **compaction**: download all packs, `git pack-objects` the union into one,
-  encrypt, write a new manifest listing only that pack, and drop the old blobs
-  from the tree. Old blobs remain in the host's history (branch history is
-  never rewritten) — a `git push --force` of an orphaned commit plus host-side
-  GC would reclaim them. Compaction is an explicit subcommand, never
-  automatic, so a push never surprises the user with a full re-upload.
+  **repacking**, `git-remote-enc repack <remote>`: index every pack, pack
+  exactly what the manifest refs reach (objects only deleted refs reached are
+  dropped; the object count is checked against `rev-list --objects`), encrypt
+  it, and push a new generation listing only that pack, in a tree holding only
+  it and the manifest. Participants see an ordinary push, but its pack id is
+  in no other clone's `have`: every other participant's next fetch downloads
+  the whole repacked repository. It is explicit, never automatic, so a push
+  never surprises anyone with a full re-upload.
+- The old blobs stay reachable from the backend history. `repack
+  --rewrite-history` makes the new commit descend from none of the old
+  history instead (a root, or on top of its own staging chain; a forced update
+  the host must allow), sets `epoch` to its generation, and the host reclaims the
+  old blobs when it prunes unreachable objects. A client that sees the history
+  no longer descend from its last backend commit warns that the host rewrote
+  it, unless the new manifest's `epoch` is above the generation it had
+  accepted: then a participant did, and says so in a signed manifest. `log`
+  starts at the epoch, from which the generation bound counts (section 6.2).
+  A participant could already push a rewrite; `epoch` only lets it be told
+  apart from the host's.
 - Local 2× storage: `git fetch --filter=blob:none` of the backend branch and
   fetching pack blobs on demand would remove it on hosts that support partial
   clone (GitLab does). Deferred until the simple design has been used in

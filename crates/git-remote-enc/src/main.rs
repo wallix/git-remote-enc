@@ -94,6 +94,13 @@ fn run() -> Result<()> {
         }
         [cmd, target] if cmd == "doctor" => doctor(target),
         [cmd, target] if cmd == "log" => log(&mut open_by_name_or_url(target)?),
+        [cmd, rest @ ..] if cmd == "repack" => {
+            let o = Opts::parse(rest, &[], &["--rewrite-history"])?;
+            let [target] = o.positional.as_slice() else {
+                usage()
+            };
+            repack(target, o.flag("--rewrite-history"))
+        }
         [cmd, target] if cmd == "forget" => {
             let dir = open_by_name_or_url(target)?.forget()?;
             eprintln!(
@@ -119,6 +126,7 @@ fn usage() -> ! {
          \x20      git-remote-enc participants [--apply] <remote|url>\n\
          \x20      git-remote-enc participants [--add <key>]... [--remove <key|fingerprint>]... [--yes] <remote>\n\
          \x20      git-remote-enc log <remote|url>\n\
+         \x20      git-remote-enc repack [--rewrite-history] <remote|url>\n\
          \x20      git-remote-enc forget <remote|url>\n\
          \x20      git-remote-enc install-hook [--chain]\n\
          \x20      git-remote-enc pre-push <remote> <url>   (as a pre-push hook)\n\
@@ -178,6 +186,34 @@ fn show_access(out: &mut dyn Write, access: &enccore::remote::Access) -> Result<
         .any(|d| d.as_ref().is_some_and(|d| !d.is_empty())))
 }
 
+/// Merge every pack of the remote into one; with `rewrite_history`, also
+/// drop the backend history so the host can reclaim the old blobs.
+fn repack(target: &str, rewrite_history: bool) -> Result<()> {
+    let mut remote = open_by_name_or_url(target)?;
+    let c = remote.repack(rewrite_history)?;
+    let human = enccore::progress::human;
+    eprintln!(
+        "enc: repacked {target}: {} packs ({}) into {} ({})",
+        c.before.0,
+        human(c.before.1),
+        c.after.0,
+        human(c.after.1)
+    );
+    if rewrite_history {
+        eprintln!(
+            "enc: the backend history now starts at this generation. The host keeps the old blobs \
+             until it prunes unreachable objects (GitLab: Settings > General > Advanced > \
+             Housekeeping, \"Prune unreachable objects\")"
+        );
+    } else {
+        eprintln!(
+            "enc: the old blobs stay in the backend history; `repack --rewrite-history` lets the \
+             host drop them"
+        );
+    }
+    Ok(())
+}
+
 /// Print the backend history as an audit trail, newest first.
 fn log(remote: &mut Remote) -> Result<()> {
     for entry in remote.history()? {
@@ -194,6 +230,8 @@ fn log(remote: &mut Remote) -> Result<()> {
                 verified,
                 base_verified,
                 time_regressed,
+                repacked,
+                history_start,
             } => {
                 let time = time.map_or_else(|| "time unknown".to_owned(), |t| format!("time {t}"));
                 println!("generation {generation} ({time}, backend commit {commit})");
@@ -218,8 +256,14 @@ fn log(remote: &mut Remote) -> Result<()> {
                     Some(b) if Some(b) != generation.checked_sub(1) => {
                         println!("  changes relative to generation {b}");
                     }
+                    None if history_start => println!(
+                        "  repacked, dropping the history before it: changes relative to an empty remote"
+                    ),
                     None if generation != 1 => println!("  changes relative to an empty remote"),
                     _ => {}
+                }
+                if repacked && !history_start {
+                    println!("  repacked: its pack replaces all earlier ones");
                 }
                 for r in refs {
                     println!("  ref {r}");

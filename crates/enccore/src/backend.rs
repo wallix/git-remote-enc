@@ -10,8 +10,11 @@ use crate::progress;
 
 pub const DEFAULT_BRANCH: &str = "enc";
 /// The message of a commit staging pack parts (DESIGN.md §5.1); the
-/// backend branch's own commits say `enc`.
+/// backend branch's own commits say `enc`, or [`EPOCH_SUBJECT`].
 pub const UPLOAD_MESSAGE: &str = "enc upload\n";
+/// Subject of a commit that starts a rewritten history, followed by its
+/// manifest's `epoch` (DESIGN.md §6.2).
+pub const EPOCH_SUBJECT: &str = "enc epoch ";
 
 pub struct Backend {
     /// The git URL, exactly as handed to git.
@@ -89,21 +92,50 @@ impl Backend {
         upload: Option<&str>,
         upserts: &[(String, Oid)],
     ) -> Result<Oid> {
-        Self::commit(parent, upload, upserts, "enc\n")
+        Self::commit(parent, parent, upload, upserts, "enc\n")
+    }
+
+    /// [`Backend::build_commit`] whose tree holds `entries` only: a
+    /// repack, which drops the blobs it replaces.
+    pub fn build_replacing(
+        parent: Option<&str>,
+        upload: Option<&str>,
+        entries: &[(String, Oid)],
+    ) -> Result<Oid> {
+        Self::commit(None, parent, upload, entries, "enc\n")
+    }
+
+    /// [`Backend::build_replacing`] that descends from none of the
+    /// history (only from the staging tip `upload`), at `epoch`.
+    pub fn build_rewrite(
+        upload: Option<&str>,
+        entries: &[(String, Oid)],
+        epoch: u64,
+    ) -> Result<Oid> {
+        Self::commit(
+            None,
+            None,
+            upload,
+            entries,
+            &format!("{EPOCH_SUBJECT}{epoch}\n"),
+        )
     }
 
     /// A commit staging parts: `upserts` added to `parent`'s tree.
     pub fn build_upload(parent: Option<&str>, upserts: &[(String, Oid)]) -> Result<Oid> {
-        Self::commit(parent, None, upserts, UPLOAD_MESSAGE)
+        Self::commit(parent, parent, None, upserts, UPLOAD_MESSAGE)
     }
 
+    /// A commit on `parent` (then `upload`) whose tree is `base`'s with
+    /// `upserts` applied.
     fn commit(
+        base: Option<&str>,
         parent: Option<&str>,
         upload: Option<&str>,
         upserts: &[(String, Oid)],
         message: &str,
     ) -> Result<Oid> {
-        let mut entries: Vec<TreeEntry> = match parent {
+        let mut entries: Vec<TreeEntry> = match base {
             Some(p) => Self::tree_entries(p)?
                 .into_iter()
                 .filter(|(_, ty, _, _)| ty == "blob")

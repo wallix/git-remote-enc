@@ -1870,6 +1870,129 @@ fn a_generation_jump_past_the_history_is_refused() {
 }
 
 #[test]
+fn a_forged_epoch_does_not_lift_the_first_contact_bound() {
+    let sb = Sandbox::new("forged-epoch");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+    let good = sb.git_ok(&host, &["rev-parse", "refs/heads/enc"]);
+    let good = good.trim();
+    let first_contact = |name: &str| {
+        let out = sb.git(
+            &sb.root,
+            &[
+                "-c",
+                &format!("enc.identity={}", alice.display()),
+                "-c",
+                &format!("enc.participants={alice_pub}"),
+                "clone",
+                "-q",
+                &url,
+                name,
+            ],
+        );
+        assert!(!out.status.success(), "{name} accepted the forged epoch");
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            err.contains("more than the backend history allows"),
+            "{err}"
+        );
+    };
+
+    // A participant pushes an ordinary commit whose manifest claims the
+    // history restarted at the maximum generation.
+    let max = u64::MAX;
+    sb.forge_manifest(&host, &alice, &[&alice_pub], |text| {
+        text.replace(
+            "generation 1\n",
+            &format!("generation {max}\nepoch {max}\n"),
+        )
+    });
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(
+        err.contains("more than the backend history allows"),
+        "{err}"
+    );
+    first_contact("fresh");
+
+    // Or puts a forged start under it as its first parent, keeping a fast
+    // forward with the real history as the second.
+    let forged = sb.git_ok(&host, &["rev-parse", "refs/heads/enc^{tree}"]);
+    let root = sb.git_ok(
+        &host,
+        &[
+            "commit-tree",
+            forged.trim(),
+            "-m",
+            &format!("enc epoch {max}"),
+        ],
+    );
+    let tip = sb.git_ok(
+        &host,
+        &[
+            "commit-tree",
+            forged.trim(),
+            "-p",
+            root.trim(),
+            "-p",
+            good,
+            "-m",
+            "enc",
+        ],
+    );
+    sb.git_ok(&host, &["update-ref", "refs/heads/enc", tip.trim()]);
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(
+        err.contains("more than the backend history allows"),
+        "{err}"
+    );
+    first_contact("fresh2");
+}
+
+#[test]
+fn a_rewrite_bounds_a_known_clients_generation_by_its_epoch() {
+    let sb = Sandbox::new("rewrite-bound");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+    let good = sb.git_ok(&host, &["rev-parse", "refs/heads/enc"]);
+    let good = good.trim();
+    // A participant's rewrite: a single root commit starting at `epoch`, so
+    // the generation may be `epoch` at most.
+    let rewrite = |generation: u64| {
+        sb.git_ok(&host, &["update-ref", "refs/heads/enc", good]);
+        sb.forge_manifest(&host, &alice, &[&alice_pub], |text| {
+            text.replace(
+                "generation 1\n",
+                &format!("generation {generation}\nepoch 5\n"),
+            )
+        });
+        let tree = sb.git_ok(&host, &["rev-parse", "refs/heads/enc^{tree}"]);
+        let root = sb.git_ok(&host, &["commit-tree", tree.trim(), "-m", "enc epoch 5"]);
+        sb.git_ok(&host, &["update-ref", "refs/heads/enc", root.trim()]);
+    };
+
+    rewrite(6);
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(
+        err.contains("more than the backend history allows"),
+        "{err}"
+    );
+    rewrite(5);
+    sb.git_ok(&b, &["fetch", "-q", "origin"]);
+}
+
+#[test]
 fn an_oversized_manifest_is_not_read() {
     let sb = Sandbox::new("bigmanifest");
     let host = sb.host();
@@ -2634,4 +2757,342 @@ fn progress_follows_git() {
         !err.contains("decrypting") && !err.contains("objects"),
         "{err}"
     );
+}
+
+#[test]
+fn repack_merges_the_packs_in_place() {
+    let sb = Sandbox::new("repack");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for i in 0..3 {
+        sb.commit_random(&a, &format!("f{i}"), 20_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    // A branch pushed then deleted: its objects are reachable from no ref.
+    sb.git_ok(&a, &["checkout", "-q", "-b", "tmp"]);
+    sb.commit_random(&a, "gone", 20_000);
+    let gone = sb.git_ok(&a, &["rev-parse", "HEAD"]);
+    sb.git_ok(&a, &["push", "-q", "enc", "tmp"]);
+    sb.git_ok(&a, &["push", "-q", "enc", ":tmp"]);
+    sb.git_ok(&a, &["checkout", "-q", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+    let commits = |host: &Path| -> u32 {
+        sb.git_ok(host, &["rev-list", "--count", "refs/heads/enc"])
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let before = commits(&host);
+
+    let (ok, _, err) = sb.enc(&a, &["repack", "enc"]);
+    assert!(ok, "{err}");
+    assert!(err.contains("4 packs") && err.contains("into 1"), "{err}");
+    let tree = sb.git_ok(&host, &["ls-tree", "refs/heads/enc"]);
+    assert_eq!(tree.lines().count(), 2, "{tree}");
+    assert_eq!(commits(&host), before + 1);
+
+    // Existing clones carry on, in both directions.
+    sb.commit_text(&b, "b", "b\n");
+    sb.git_ok(&b, &["push", "-q", "origin", "main"]);
+    let out = sb.git(&a, &["pull", "-q", "enc", "main"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("warning"));
+
+    let c = sb.clone("carol", &url, &alice);
+    assert_eq!(
+        fs::read(c.join("f0")).unwrap(),
+        fs::read(a.join("f0")).unwrap()
+    );
+    assert_eq!(fs::read_to_string(c.join("b")).unwrap(), "b\n");
+    assert!(
+        !sb.git(&c, &["cat-file", "-e", gone.trim()])
+            .status
+            .success()
+    );
+    let log = sb.enc_ok(&c, &["log", "origin"]);
+    assert!(
+        log.contains("repacked: its pack replaces all earlier ones"),
+        "{log}"
+    );
+    assert!(!log.contains("warning"), "{log}");
+}
+
+#[test]
+fn repack_can_rewrite_the_backend_history() {
+    let sb = Sandbox::new("repack-rewrite");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for i in 0..3 {
+        sb.commit_random(&a, &format!("f{i}"), 20_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    let b = sb.clone("bob", &url, &alice);
+    let old_blobs: Vec<String> = sb
+        .git_ok(&host, &["ls-tree", "refs/heads/enc"])
+        .lines()
+        .filter(|l| l.ends_with(".age"))
+        .map(|l| l.split_whitespace().nth(2).unwrap().to_owned())
+        .collect();
+    assert_eq!(old_blobs.len(), 3);
+
+    let (ok, _, err) = sb.enc(&a, &["repack", "--rewrite-history", "enc"]);
+    assert!(ok, "{err}");
+    assert_eq!(
+        sb.git_ok(&host, &["rev-list", "--count", "refs/heads/enc"])
+            .trim(),
+        "1"
+    );
+
+    // A participant's rewrite is announced, not reported as the host's.
+    let out = sb.git(&b, &["pull", "-q", "origin", "main"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("was repacked at generation 4"), "{err}");
+    assert!(!err.contains("warning"), "{err}");
+    sb.commit_text(&b, "b", "b\n");
+    sb.git_ok(&b, &["push", "-q", "origin", "main"]);
+    sb.git_ok(&a, &["pull", "-q", "enc", "main"]);
+    assert_eq!(fs::read_to_string(a.join("b")).unwrap(), "b\n");
+
+    // A first contact accepts generation 5 on a history of two commits.
+    let c = sb.clone("carol", &url, &alice);
+    assert_eq!(
+        fs::read(c.join("f2")).unwrap(),
+        fs::read(a.join("f2")).unwrap()
+    );
+    let log = sb.enc_ok(&c, &["log", "origin"]);
+    assert_eq!(log.matches("generation ").count(), 2, "{log}");
+    assert!(log.contains("dropping the history before it"), "{log}");
+    assert!(
+        !log.contains("warning") && !log.contains("missing"),
+        "{log}"
+    );
+
+    // Once the host prunes, the old blobs are gone.
+    sb.git_ok(&host, &["reflog", "expire", "--expire=now", "--all"]);
+    sb.git_ok(&host, &["gc", "-q", "--prune=now"]);
+    for blob in &old_blobs {
+        assert!(!sb.git(&host, &["cat-file", "-e", blob]).status.success());
+    }
+}
+
+/// Install a pre-receive hook on `host` that logs every update of the
+/// backend branch with the pack blobs it changes, and runs `racer` in
+/// `dir` before the first one is applied, so that one loses a race.
+fn race_first_update(sb: &Sandbox, host: &Path, dir: &Path, racer: &str) -> PathBuf {
+    let log = sb.root.join("updates");
+    let mark = sb.root.join("raced");
+    sb.host_hook(
+        host,
+        "pre-receive",
+        &format!(
+            "while read old new ref; do\n\
+             case \"$ref\" in\n\
+             refs/heads/enc)\n\
+             echo \"enc $(git diff-tree --name-only \"$old\" \"$new\" | grep '\\.age' | tr '\\n' ' ')\" >>'{log}'\n\
+             if [ ! -e '{mark}' ]; then\n\
+             touch '{mark}'\n\
+             (cd '{dir}' && {NO_HOOK_ENV} {racer}) </dev/null >&2 || exit 2\n\
+             fi;;\n\
+             esac\n\
+             done\n",
+            log = log.display(),
+            mark = mark.display(),
+            dir = dir.display()
+        ),
+    );
+    log
+}
+
+/// The backend branch updates `race_first_update` logged.
+fn enc_updates(log: &Path) -> Vec<String> {
+    fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .filter(|l| l.starts_with("enc "))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn a_push_that_lost_a_race_to_a_repack_rebuilds_its_pack() {
+    let sb = Sandbox::new("lost-race-repack");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "base", "0\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.git_ok(&a, &["checkout", "-q", "-b", "tmp"]);
+    sb.commit_random(&a, "gone", 20_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "tmp"]);
+    let b = sb.clone("bob", &url, &alice);
+
+    // Alice's first attempt leaves out what tmp reaches; Bob deletes tmp
+    // and repacks, so no pack holds it any more.
+    sb.git_ok(&a, &["checkout", "-q", "-b", "feat"]);
+    sb.commit_random(&a, "feat", 20_000);
+    let log = race_first_update(
+        &sb,
+        &host,
+        &b,
+        "sh -c 'git push -q origin :tmp && git-remote-enc repack origin'",
+    );
+    let out = sb
+        .cmd(&a, "git")
+        .args(["push", "enc", "feat"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("retrying"), "{err}");
+
+    // Alice's attempts, Bob's deletion and repack.
+    let enc = enc_updates(&log);
+    assert_eq!(enc.len(), 4, "{enc:?}");
+    assert_ne!(enc[0], enc[3], "{enc:?}");
+    let ids = sb.pack_ids(&a, "enc");
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(
+        ids.iter().all(|id| !enc[0].contains(id.as_str())),
+        "{enc:?}"
+    );
+    let c = sb.clone("carol", &url, &alice);
+    sb.git_ok(&c, &["checkout", "-q", "feat"]);
+    for f in ["feat", "gone"] {
+        assert_eq!(fs::read(c.join(f)).unwrap(), fs::read(a.join(f)).unwrap());
+    }
+}
+
+#[test]
+fn a_repack_that_lost_a_race_reuses_its_pack_for_the_same_refs() {
+    let sb = Sandbox::new("repack-lost-race");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let (_, carol_pub) = sb.keypair("carol");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for i in 0..2 {
+        sb.commit_random(&a, &format!("f{i}"), 20_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    let b = sb.clone("bob", &url, &alice);
+
+    // Bob changes the participants, not the refs.
+    let log = race_first_update(
+        &sb,
+        &host,
+        &b,
+        &format!("git-remote-enc participants --add '{carol_pub}' --yes origin"),
+    );
+    let (ok, _, err) = sb.enc(&a, &["repack", "enc"]);
+    assert!(ok, "{err}");
+    assert!(err.contains("retrying"), "{err}");
+
+    let enc = enc_updates(&log);
+    assert_eq!(enc.len(), 3, "{enc:?}");
+    assert_eq!(enc[0], enc[2], "{enc:?}");
+    let ids = sb.pack_ids(&a, "enc");
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert!(enc[0].contains(&format!("{}.age", ids[0])), "{enc:?}");
+    assert!(
+        sb.enc_ok(&a, &["manifest", "enc"]).contains(&carol_pub),
+        "the racer's participant change is kept"
+    );
+    let c = sb.clone("carol", &url, &alice);
+    assert_eq!(
+        fs::read(c.join("f1")).unwrap(),
+        fs::read(a.join("f1")).unwrap()
+    );
+}
+
+#[test]
+fn a_repack_reported_failed_after_it_landed_is_done() {
+    let sb = Sandbox::new("repack-landed");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for i in 0..2 {
+        sb.commit_random(&a, &format!("f{i}"), 20_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    let commits = || -> u32 {
+        sb.git_ok(&host, &["rev-list", "--count", "refs/heads/enc"])
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let before = commits();
+
+    // The repack lands, then is reported as declined.
+    let mark = sb.root.join("landed");
+    sb.host_hook(
+        &host,
+        "pre-receive",
+        &format!(
+            "while read old new ref; do\n\
+             if [ \"$ref\" = refs/heads/enc ] && [ ! -e '{mark}' ]; then\n\
+             touch '{mark}'\n\
+             cp -R \"$GIT_QUARANTINE_PATH\"/. objects/ || exit 2\n\
+             {NO_HOOK_ENV} git update-ref \"$ref\" \"$new\" \"$old\" || exit 2\n\
+             echo 'declined after landing' >&2\n\
+             exit 1\n\
+             fi\n\
+             done\n",
+            mark = mark.display()
+        ),
+    );
+    let (ok, _, err) = sb.enc(&a, &["repack", "enc"]);
+    assert!(ok, "{err}");
+    assert!(mark.exists() && err.contains("retrying"), "{err}");
+    assert!(err.contains("into 1"), "{err}");
+    // Not repacked a second time.
+    assert_eq!(commits(), before + 1);
+    assert_eq!(sb.pack_ids(&a, "enc").len(), 1);
+    let c = sb.clone("carol", &url, &alice);
+    assert_eq!(
+        fs::read(c.join("f1")).unwrap(),
+        fs::read(a.join("f1")).unwrap()
+    );
+}
+
+#[test]
+fn a_host_refusing_the_rewrite_leaves_the_remote_unchanged() {
+    let sb = Sandbox::new("repack-rewrite-refused");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for i in 0..2 {
+        sb.commit_random(&a, &format!("f{i}"), 20_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    sb.git_ok(&host, &["config", "receive.denyNonFastForwards", "true"]);
+    let tip = sb.git_ok(&host, &["rev-parse", "refs/heads/enc"]);
+
+    let (ok, _, err) = sb.enc(&a, &["repack", "--rewrite-history", "enc"]);
+    assert!(!ok, "{err}");
+    assert!(err.contains("Allowed to force push"), "{err}");
+    assert_eq!(sb.git_ok(&host, &["rev-parse", "refs/heads/enc"]), tip);
+    assert_eq!(
+        sb.git_ok(&host, &["for-each-ref", "--format=%(refname)"])
+            .trim(),
+        "refs/heads/enc"
+    );
+    assert_eq!(sb.pack_ids(&a, "enc").len(), 2);
 }

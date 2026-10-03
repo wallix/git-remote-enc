@@ -107,6 +107,10 @@ pub enum HistoryEntry {
         /// The generation the changes are relative to: the previous readable
         /// manifest's, `None` for an empty remote.
         base: Option<u64>,
+        /// Its packs replace earlier ones (`git-remote-enc repack`).
+        repacked: bool,
+        /// A participant's repack dropped the history before it.
+        history_start: bool,
         /// Chained by `previous` digests to the accepted manifest, hence
         /// authentic. Otherwise anyone with write access to the host may
         /// have written it, and `signer` is a bare fingerprint.
@@ -192,6 +196,8 @@ pub struct Remote {
     trust_keys: Option<Vec<TrustKey>>,
     /// The pack of a push attempt that lost the race, kept for the retry.
     staged: Option<Staged>,
+    /// `pack_usage` before the current repack's first attempt.
+    repack_before: Option<(usize, u64)>,
 }
 
 impl Remote {
@@ -225,6 +231,7 @@ impl Remote {
             identities: None,
             trust_keys: None,
             staged: None,
+            repack_before: None,
         })
     }
 
@@ -330,23 +337,38 @@ impl Remote {
         // descend from the one seen before means the host rewrote it, and
         // the audit trail `log` reads from it is incomplete. The fetch is
         // forced, so the old tip is still in the object store to compare.
-        if let (Some(old), Some(new)) = (&previous_tip, &self.tip)
-            && old != new
-            && !git::is_ancestor(old, new)?
-        {
-            info(&format!(
-                "warning: the history of branch {} on {} was rewritten (backend commit {old} is no \
-                 longer an ancestor of {new}): the host removed or replaced past manifests, so \
-                 `git-remote-enc log` cannot show them. Check with the other participants",
-                self.backend.branch, self.backend.url
-            ));
-        }
+        let rewritten = match (&previous_tip, &self.tip.clone()) {
+            (Some(old), Some(new)) if old != new && !git::is_ancestor(old, new)? => {
+                // The tracking ref has already moved, so an error here must
+                // not lose the report: `None` reports the host's rewrite, and
+                // `load_manifest` reads the trust state again and fails.
+                let accepted = self
+                    .trust_keys()
+                    .and_then(|k| self.state.trust(&k))
+                    .ok()
+                    .flatten()
+                    .map(|t| t.generation);
+                Some((old.clone(), new.clone(), accepted))
+            }
+            _ => None,
+        };
         match self.tip.clone() {
             Some(tip) => {
                 self.tree = Backend::tree_entries(&tip)?;
                 match self.load_manifest(known) {
-                    Ok(m) => self.manifest = Some(m),
+                    Ok(m) => {
+                        if let Some((old, new, accepted)) = rewritten {
+                            self.report_rewrite(&m, &old, &new, accepted);
+                        }
+                        self.manifest = Some(m);
+                    }
                     Err(e) => {
+                        // The tracking ref has moved to the new tip, so no
+                        // later connect sees the rewrite: report it now,
+                        // without a manifest to attribute it by.
+                        if let Some((old, new, _)) = &rewritten {
+                            self.warn_host_rewrite(old, new);
+                        }
                         // A refused first contact leaves nothing that could
                         // later appear accepted.
                         if !known {
@@ -378,6 +400,29 @@ impl Remote {
         }
         self.connected = true;
         Ok(())
+    }
+
+    /// The backend history no longer descends from `old`. A participant's
+    /// `repack --rewrite-history` since generation `accepted` says so in
+    /// the signed manifest (`epoch`); anything else is the host's doing.
+    fn report_rewrite(&self, m: &Manifest, old: &str, new: &str, accepted: Option<u64>) {
+        match (m.epoch, accepted) {
+            (Some(e), Some(a)) if e > a => info(&format!(
+                "the history of branch {} on {} was repacked at generation {e} by a participant: \
+                 `git-remote-enc log` shows it from there",
+                self.backend.branch, self.backend.url
+            )),
+            _ => self.warn_host_rewrite(old, new),
+        }
+    }
+
+    fn warn_host_rewrite(&self, old: &str, new: &str) {
+        info(&format!(
+            "warning: the history of branch {} on {} was rewritten (backend commit {old} is no \
+             longer an ancestor of {new}): the host removed or replaced past manifests, so \
+             `git-remote-enc log` cannot show them. Check with the other participants",
+            self.backend.branch, self.backend.url
+        ));
     }
 
     fn reconnect(&mut self) -> Result<()> {
@@ -595,9 +640,12 @@ impl Remote {
     /// commits: without this bound a participant could push generation
     /// 2^64 - 1, after which nobody can push again and going back is refused
     /// as a rollback. Counted from the commit of the accepted manifest when
-    /// the history still descends from it, else, on first contact, from the
-    /// root. A new remote's first push may start on a staging chain (DESIGN.md
-    /// §5.1), whose commits then count too: a slightly looser bound.
+    /// the history still descends from it, else, on first contact or after
+    /// a participant's rewrite (`epoch` above the accepted generation), from
+    /// the root, or from the manifest's `epoch` where the history really
+    /// starts there ([`rewrite_epoch`]). A new remote's first push may start
+    /// on a staging chain (DESIGN.md §5.1), whose commits then count too: a
+    /// slightly looser bound.
     fn check_generation_jump(&self, m: &Manifest, trust: Option<&Trust>) -> Result<()> {
         let Some(tip) = self.tip.as_deref() else {
             return Ok(());
@@ -607,16 +655,27 @@ impl Remote {
                 .parse()
                 .context("rev-list --count")
         };
+        // Since a rewrite, the history starts at its epoch.
+        let from_epoch = |epoch: u64| -> Result<(u64, u64)> {
+            Ok((epoch, epoch.saturating_sub(1).saturating_add(count(tip)?)))
+        };
         let (base, limit) = match trust {
             Some(t) => match &t.commit {
                 Some(c) if git::has_object(c)? && git::is_ancestor(c, tip)? => (
                     t.generation,
                     t.generation.saturating_add(count(&format!("{c}..{tip}"))?),
                 ),
-                // Older state, or a rewritten history (reported by connect).
-                _ => return Ok(()),
+                // A participant's rewrite (connect reports it as such).
+                _ => match m.epoch {
+                    Some(e) if e > t.generation && rewrite_epoch(tip)? == Some(e) => from_epoch(e)?,
+                    // Older state, or the host's rewrite (reported by connect).
+                    _ => return Ok(()),
+                },
             },
-            None => (0, count(tip)?),
+            None => match m.epoch {
+                Some(e) if rewrite_epoch(tip)? == Some(e) => from_epoch(e)?,
+                _ => from_epoch(0)?,
+            },
         };
         if m.generation > limit {
             bail!(
@@ -685,30 +744,10 @@ impl Remote {
         if self.tip.is_none() {
             bail!("no encrypted remote at {}", self.backend.url);
         }
-        // The first parents are the pushes; a second parent is the chain
-        // of commits that staged a large push's parts. On a new remote that
-        // chain is the first push's only parent (DESIGN.md §5.1), so its
-        // commits are on the first-parent walk and skipped below.
-        let out = git::run([
-            "log",
-            "--first-parent",
-            "--reverse",
-            "--format=%H %s",
-            self.backend.tracking_ref.as_str(),
-        ])?;
-        let log = String::from_utf8(out).context("git log output is not UTF-8")?;
-        // A staging commit carries no manifest; one that does is a push,
-        // whatever its message says.
-        let upload = backend::UPLOAD_MESSAGE.trim_end();
-        let mut commits = Vec::new();
-        for (c, subject) in log.lines().filter_map(|l| l.split_once(' ')) {
-            if subject == upload
-                && Backend::blob_oid(&Backend::tree_entries(c)?, MANIFEST_BLOB).is_none()
-            {
-                continue;
-            }
-            commits.push(c.to_owned());
-        }
+        let commits: Vec<String> = pushes(&self.backend.tracking_ref)?
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
         let mut entries = Vec::new();
         let mut previous: Option<Manifest> = None;
         // Each push appends one commit and one generation: the commit at
@@ -719,6 +758,11 @@ impl Remote {
             let commit = commit.as_str();
             let entry = match self.read_historical(commit) {
                 Ok((m, signer, digest)) => {
+                    // A participant's rewrite starts the history over.
+                    let history_start = m.epoch == Some(m.generation);
+                    if history_start {
+                        expected = m.generation;
+                    }
                     if m.generation != expected {
                         entries.push(HistoryEntry::Discontinuity {
                             expected,
@@ -754,6 +798,11 @@ impl Remote {
                             &m.admins,
                         )?,
                         base: previous.as_ref().map(|p| p.generation),
+                        repacked: history_start
+                            || previous
+                                .as_ref()
+                                .is_some_and(|p| p.packs.iter().any(|old| !m.packs.contains(old))),
+                        history_start,
                         verified: false,
                         base_verified: true,
                         time_regressed: matches!(
@@ -904,7 +953,41 @@ impl Remote {
     // ---- push -------------------------------------------------------------
 
     pub fn push(&mut self, specs: &[RefSpec]) -> Result<Vec<PushStatus>> {
-        self.push_with(specs, false)
+        self.push_with(specs, Op::Push)
+    }
+
+    /// Replace every pack with one holding exactly what the refs reach, as a
+    /// new generation; with `rewrite_history`, as a commit descending from
+    /// none of the backend history, so the host can drop the old blobs.
+    /// DESIGN.md §7.
+    pub fn repack(&mut self, rewrite_history: bool) -> Result<Repacked> {
+        self.connect()?;
+        if self.manifest.is_none() {
+            bail!("no encrypted remote at {}", self.backend.url);
+        }
+        self.repack_before = None;
+        self.push_with(
+            &[],
+            Op::Repack {
+                rewrite: rewrite_history,
+            },
+        )?;
+        Ok(Repacked {
+            before: self.repack_before.unwrap_or_default(),
+            after: self.pack_usage()?,
+        })
+    }
+
+    /// `(packs, bytes of pack blobs)` in the current backend tree.
+    fn pack_usage(&self) -> Result<(usize, u64)> {
+        let packs = self.manifest.as_ref().map_or(0, |m| m.packs.len());
+        let mut bytes = 0u64;
+        for (_, ty, oid, name) in &self.tree {
+            if ty == "blob" && name != MANIFEST_BLOB {
+                bytes = bytes.saturating_add(git::object_size(oid)?);
+            }
+        }
+        Ok((packs, bytes))
     }
 
     /// The remote's participant and admin lists, and how the configured
@@ -936,25 +1019,21 @@ impl Remote {
         if self.manifest.is_none() {
             bail!("no encrypted remote at {}", self.backend.url);
         }
-        self.push_with(&[], true).map(drop)
+        self.push_with(&[], Op::SetParticipants).map(drop)
     }
 
-    fn push_with(&mut self, specs: &[RefSpec], set_participants: bool) -> Result<Vec<PushStatus>> {
-        let result = self.push_attempts(specs, set_participants);
+    fn push_with(&mut self, specs: &[RefSpec], op: Op) -> Result<Vec<PushStatus>> {
+        let result = self.push_attempts(specs, op);
         if let Some(staged) = self.staged.take() {
             self.discard(staged);
         }
         result
     }
 
-    fn push_attempts(
-        &mut self,
-        specs: &[RefSpec],
-        set_participants: bool,
-    ) -> Result<Vec<PushStatus>> {
+    fn push_attempts(&mut self, specs: &[RefSpec], op: Op) -> Result<Vec<PushStatus>> {
         self.connect()?;
         for attempt in 1..=PUSH_ATTEMPTS {
-            if let Some(statuses) = self.try_push(specs, set_participants)? {
+            if let Some(statuses) = self.try_push(specs, op)? {
                 return Ok(statuses);
             }
             info(&format!(
@@ -977,14 +1056,17 @@ impl Remote {
     }
 
     /// One attempt. `None` means the compare-and-swap lost; the caller
-    /// reconnects and calls again. `set_participants` replaces the list with
-    /// the configured one; otherwise an existing remote keeps its own.
-    fn try_push(
-        &mut self,
-        specs: &[RefSpec],
-        set_participants: bool,
-    ) -> Result<Option<Vec<PushStatus>>> {
+    /// reconnects and calls again. `Op::SetParticipants` replaces the list
+    /// with the configured one; otherwise an existing remote keeps its own.
+    fn try_push(&mut self, specs: &[RefSpec], op: Op) -> Result<Option<Vec<PushStatus>>> {
+        let set_participants = op == Op::SetParticipants;
+        let repack = match op {
+            Op::Repack { rewrite } => Some(rewrite),
+            _ => None,
+        };
         let is_new = self.manifest.is_none();
+        // What this attempt repacks.
+        let usage = repack.map(|_| self.pack_usage()).transpose()?;
         let mut m = match &self.manifest {
             Some(m) => m.clone(),
             None => Manifest {
@@ -1133,18 +1215,62 @@ impl Remote {
             }
             accepted.push((spec, Some(new)));
         }
-        if accepted.is_empty() && !set_participants {
+        if accepted.is_empty() && !set_participants && repack.is_none() {
             return Ok(Some(statuses));
         }
 
-        // Everything reachable from a manifest ref is already on the remote.
-        let wants: Vec<Oid> = accepted.iter().filter_map(|(_, o)| o.clone()).collect();
+        // A losing attempt's pack. Landed (the manifest lists it although
+        // git reported a failure): its objects are ours, so no fetch
+        // downloads it, and listing it again would make the manifest
+        // unreadable; a landed repack is done. Otherwise it is reused below
+        // for the same wants unless every pushed tip is already a ref
+        // (someone pushed the same tips: it would be redundant) or a repack
+        // has since dropped a pack it is thin against. A repack's pack is
+        // not thin: the same refs are enough.
+        let staged = match self.staged.take() {
+            Some(s) if m.packs.iter().any(|p| p.id == s.id) => {
+                let done = repack.is_some() && matches!(m.packs.as_slice(), [p] if p.id == s.id);
+                let added = self.state.add_have(&s.id);
+                self.discard(s);
+                added?;
+                if done {
+                    return Ok(Some(statuses));
+                }
+                None
+            }
+            s => s,
+        };
+        // Keep the first attempt's usage: a retry may start from our own
+        // repack after another push landed on top of it.
+        if let Some(u) = usage {
+            self.repack_before.get_or_insert(u);
+        }
+        // The new pack is built from local objects: every pack must be
+        // indexed here first.
+        if repack.is_some() {
+            self.fetch()?;
+        }
+
         let known: Vec<Oid> = m.refs.iter().map(|(oid, _)| oid.clone()).collect();
-        let excludes = git::have_objects(&known)?;
+        let (wants, excludes) = if repack.is_some() {
+            // Everything the refs reach, and nothing else.
+            let have = git::have_objects(&known)?;
+            if let Some(missing) = known.iter().find(|k| !have.contains(k)) {
+                bail!("{missing}, named by a ref of {}, is not here", self.label);
+            }
+            (known.clone(), Vec::new())
+        } else {
+            // Everything reachable from a manifest ref is already on the
+            // remote.
+            let wants: Vec<Oid> = accepted.iter().filter_map(|(_, o)| o.clone()).collect();
+            let excludes = git::have_objects(&known)?;
+            (wants, excludes)
+        };
         // LFS uploads a file's content from its own pre-push hook, which an
         // encrypted push refuses (`list`) or does not run: the other
         // participants would get the pointer and nothing to resolve it.
-        if !self.cfg.allow_lfs
+        if repack.is_none()
+            && !self.cfg.allow_lfs
             && !wants.is_empty()
             && let Some(path) = git::lfs_pointers(&wants, &excludes)?.first()
         {
@@ -1165,26 +1291,14 @@ impl Remote {
                  push again"
             );
         }
-        // Reuse the losing attempt's pack for the same wants: its base
-        // objects remain on the remote in older packs. Drop it if the
-        // manifest already lists it (the push landed although git reported
-        // failure), or every pushed tip is already a ref (someone pushed
-        // the same tips). Listing it again would make the manifest
-        // unreadable or add a redundant pack, respectively.
-        let staged = match self.staged.take() {
-            // Landed: its objects are ours, so no fetch downloads it.
-            Some(s) if m.packs.iter().any(|p| p.id == s.id) => {
-                let added = self.state.add_have(&s.id);
-                self.discard(s);
-                added?;
-                None
-            }
-            s => s,
-        };
         let mut sorted_wants = wants.clone();
         sorted_wants.sort_unstable();
-        let reusable =
-            |s: &Staged| s.wants == sorted_wants && wants.iter().any(|w| !known.contains(w));
+        let reusable = |s: &Staged| {
+            s.wants == sorted_wants
+                && (repack.is_some()
+                    || (wants.iter().any(|w| !known.contains(w))
+                        && s.bases.iter().all(|b| m.packs.iter().any(|p| &p.id == b))))
+        };
         let pack = match staged {
             Some(s) if reusable(&s) => Some(s),
             old => {
@@ -1194,8 +1308,24 @@ impl Remote {
                 if wants.is_empty() {
                     None
                 } else {
-                    self.build_pack(&wants, &excludes)?
-                        .map(|p| self.stage(p, sorted_wants))
+                    let bases = m.packs.iter().map(|p| p.id.clone()).collect();
+                    let built = self.build_pack(&wants, &excludes, repack.is_none())?;
+                    // The old packs are about to be dropped: the new one
+                    // must hold every object the refs reach.
+                    if repack.is_some()
+                        && let Some(b) = &built
+                    {
+                        let reachable = git::count_objects(&wants)?;
+                        if u64::from(b.count) != reachable {
+                            bail!(
+                                "the new pack holds {} objects but the refs reach {reachable}; \
+                                 nothing was changed",
+                                b.count
+                            );
+                        }
+                    }
+                    built
+                        .map(|p| self.stage(p, sorted_wants, bases))
                         .transpose()?
                 }
             }
@@ -1234,6 +1364,12 @@ impl Remote {
         }
         m.participants = participant_texts;
         m.admins = admin_texts;
+        if repack.is_some() {
+            m.packs.clear();
+        }
+        if repack == Some(true) {
+            m.epoch = Some(m.generation);
+        }
         if let Some((id, key, _)) = &pack {
             m.packs.push(Pack {
                 id: id.clone(),
@@ -1250,7 +1386,13 @@ impl Remote {
             upserts.extend(blobs.iter().cloned());
         }
         let upload = self.staged.as_ref().and_then(|s| s.upload_tip.clone());
-        let commit = Backend::build_commit(self.tip.as_deref(), upload.as_deref(), &upserts)?;
+        let commit = match repack {
+            None => Backend::build_commit(self.tip.as_deref(), upload.as_deref(), &upserts)?,
+            Some(false) => {
+                Backend::build_replacing(self.tip.as_deref(), upload.as_deref(), &upserts)?
+            }
+            Some(true) => Backend::build_rewrite(upload.as_deref(), &upserts, m.generation)?,
+        };
 
         match self.backend.push(&commit, self.tip.as_deref())? {
             PushOutcome::StaleLease => Ok(None),
@@ -1259,6 +1401,16 @@ impl Remote {
                 // moved since we read it, this was a lost race, not a failure.
                 if self.backend.fetch_tip()? != self.tip {
                     return Ok(None);
+                }
+                if repack == Some(true) {
+                    bail!(
+                        "pushing to {}: {stderr}\nRewriting the history replaces branch {} by a \
+                         commit that does not descend from it: the host must allow a forced \
+                         update of that branch (GitLab: Settings > Repository > Protected \
+                         branches, \"Allowed to force push\")",
+                        self.backend.url,
+                        self.backend.branch
+                    );
                 }
                 bail!("pushing to {}: {stderr}", self.backend.url)
             }
@@ -1299,10 +1451,10 @@ impl Remote {
             })
     }
 
-    /// `pack-objects --thin` over `wants` minus `excludes`, encrypted to a
-    /// fresh key into temp files of at most `part_size` bytes. `None` when
-    /// there is nothing to send.
-    fn build_pack(&self, wants: &[Oid], excludes: &[Oid]) -> Result<Option<BuiltPack>> {
+    /// `pack-objects` over `wants` minus `excludes` (thin against them when
+    /// `thin`), encrypted to a fresh key into temp files of at most
+    /// `part_size` bytes. `None` when there is nothing to send.
+    fn build_pack(&self, wants: &[Oid], excludes: &[Oid], thin: bool) -> Result<Option<BuiltPack>> {
         let mut revs = String::new();
         for w in wants {
             revs.push_str(w);
@@ -1314,18 +1466,17 @@ impl Remote {
             revs.push('\n');
         }
         let progress = progress::enabled();
-        let mut po = Streaming::reader_tee(
-            [
-                "pack-objects",
-                "--revs",
-                "--thin",
-                "--stdout",
-                if progress { "--all-progress" } else { "-q" },
-                "--delta-base-offset",
-            ],
-            Some(revs.as_bytes()),
-            progress,
-        )?;
+        let mut args = vec![
+            "pack-objects",
+            "--revs",
+            "--stdout",
+            if progress { "--all-progress" } else { "-q" },
+            "--delta-base-offset",
+        ];
+        if thin {
+            args.push("--thin");
+        }
+        let mut po = Streaming::reader_tee(args, Some(revs.as_bytes()), progress)?;
         let mut out = po.stdout()?;
         let mut header = [0u8; 12];
         out.read_exact(&mut header)
@@ -1349,6 +1500,7 @@ impl Remote {
         let paths = writer.finish()?;
         let built = BuiltPack {
             paths,
+            count,
             id,
             key: Zeroizing::new(key.to_string().expose_secret().to_owned()),
         };
@@ -1359,7 +1511,7 @@ impl Remote {
     /// Store a built pack's parts as blobs and, when they exceed one upload
     /// batch, push them ahead of the manifest on a branch of their own, a
     /// batch at a time: the final push then sends only the manifest.
-    fn stage(&self, built: BuiltPack, wants: Vec<Oid>) -> Result<Staged> {
+    fn stage(&self, built: BuiltPack, wants: Vec<Oid>, bases: Vec<String>) -> Result<Staged> {
         let names: Vec<String> = if built.paths.len() == 1 {
             vec![format!("{}.age", built.id)]
         } else {
@@ -1385,6 +1537,7 @@ impl Remote {
 
         let mut staged = Staged {
             wants,
+            bases,
             id: built.id.clone(),
             key: built.key.clone(),
             blobs,
@@ -1436,6 +1589,63 @@ impl Remote {
         }
         Ok(staged)
     }
+}
+
+/// The backend commits on `rev`'s first-parent walk that carry a manifest,
+/// oldest first, with their subjects. The first parents are the pushes; a
+/// second parent is the chain of commits that staged a large push's parts.
+/// On a new remote, or since a rewrite, that chain is the first push's only
+/// parent (DESIGN.md §5.1), so its commits are on the walk and skipped.
+fn pushes(rev: &str) -> Result<Vec<(String, String)>> {
+    let out = git::run(["log", "--first-parent", "--reverse", "--format=%H %s", rev])?;
+    let log = String::from_utf8(out).context("git log output is not UTF-8")?;
+    let mut commits = Vec::new();
+    for (c, subject) in log.lines().filter_map(|l| l.split_once(' ')) {
+        // A staging commit carries no manifest; one that does is a push,
+        // whatever its message says.
+        if subject == backend::UPLOAD_MESSAGE.trim_end() && !has_manifest(c)? {
+            continue;
+        }
+        commits.push((c.to_owned(), subject.to_owned()));
+    }
+    Ok(commits)
+}
+
+fn has_manifest(commit: &str) -> Result<bool> {
+    Ok(Backend::blob_oid(&Backend::tree_entries(commit)?, MANIFEST_BLOB).is_some())
+}
+
+/// The epoch `tip`'s history starts at, if a participant's rewrite started
+/// it: its oldest push says so in its subject ([`backend::EPOCH_SUBJECT`])
+/// and every push is on the first-parent walk, so nothing older is
+/// reachable. Without the last condition, a fast-forward could put a forged
+/// start under a new first parent and the real history under a second one.
+/// The subject is not signed: only a forced update of the branch, i.e. a
+/// rewrite, or creating the branch (a new remote, or after deleting it) can
+/// place it under the history, so the remote's creator can set any epoch.
+/// DESIGN.md §6.2.
+fn rewrite_epoch(tip: &str) -> Result<Option<u64>> {
+    let pushes = pushes(tip)?;
+    let Some(epoch) = pushes.first().and_then(|(_, s)| {
+        s.strip_prefix(backend::EPOCH_SUBJECT)
+            .and_then(|e| e.parse::<u64>().ok())
+    }) else {
+        return Ok(None);
+    };
+    let list = |first_parent: bool| -> Result<String> {
+        let mut args = vec!["rev-list"];
+        args.extend(first_parent.then_some("--first-parent"));
+        args.push(tip);
+        String::from_utf8(git::run(args)?).context("rev-list output is not UTF-8")
+    };
+    let walk = list(true)?;
+    let walk: std::collections::HashSet<&str> = walk.lines().collect();
+    for c in list(false)?.lines() {
+        if !walk.contains(c) && has_manifest(c)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(epoch))
 }
 
 /// git picks the transport from the push URL, so a `pushurl` or a
@@ -1629,6 +1839,8 @@ fn trust_in(m: &Manifest, text: &str, commit: Option<&str>) -> Trust {
 struct BuiltPack {
     /// Its parts, in order.
     paths: Vec<PathBuf>,
+    /// Objects in the pack, from its header.
+    count: u32,
     id: String,
     key: Zeroizing<String>,
 }
@@ -1640,11 +1852,31 @@ impl Drop for BuiltPack {
     }
 }
 
+/// What a push writes besides the refs it updates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Push,
+    /// The configured participant and admin lists.
+    SetParticipants,
+    /// One pack for everything the refs reach, replacing all others.
+    Repack {
+        rewrite: bool,
+    },
+}
+
+/// Pack count and bytes of pack blobs before and after a repack.
+pub struct Repacked {
+    pub before: (usize, u64),
+    pub after: (usize, u64),
+}
+
 /// A pack whose blobs are in the local object store and, for a large one,
 /// already uploaded to `upload_branch`.
 struct Staged {
     /// The new tips it was built for, sorted.
     wants: Vec<Oid>,
+    /// The ids of the packs listed when it was built.
+    bases: Vec<String>,
     id: String,
     key: Zeroizing<String>,
     /// Tree name and blob of each part.
