@@ -35,20 +35,40 @@ pub struct Config {
     /// `index-pack` fsck option for received packs (`--fsck-objects[=…]`),
     /// `None` when disabled.
     pub fsck: Option<String>,
+    /// A pack blob larger than this is stored as parts of this size; 0
+    /// stores every pack whole.
+    pub part_size: u64,
 }
+
+/// Above git's default `core.bigFileThreshold` (512 MiB): smaller blobs are
+/// searched for deltas whenever a host packs them, which for ciphertext is
+/// minutes of CPU per GiB for nothing.
+pub const DEFAULT_PART_SIZE: u64 = 1 << 30;
+/// The smallest part size accepted: smaller parts create too many tree
+/// entries and objects.
+pub const MIN_PART_SIZE: u64 = 16 << 10;
 
 impl Config {
     pub fn load(remote_name: Option<&str>) -> Result<Self> {
-        let all = |key: &str| -> Result<Vec<String>> {
+        // The values of `key`, and the config key they were read from.
+        let keyed = |key: &str| -> Result<(String, Vec<String>)> {
             if let Some(name) = remote_name {
-                let v = git::config_all(&format!("remote.{name}.enc-{key}"))?;
+                let k = format!("remote.{name}.enc-{key}");
+                let v = git::config_all(&k)?;
                 if !v.is_empty() {
-                    return Ok(v);
+                    return Ok((k, v));
                 }
             }
-            git::config_all(&format!("enc.{key}"))
+            let k = format!("enc.{key}");
+            let v = git::config_all(&k)?;
+            Ok((k, v))
         };
+        let all = |key: &str| -> Result<Vec<String>> { Ok(keyed(key)?.1) };
         let one = |key: &str| -> Result<Option<String>> { Ok(all(key)?.into_iter().last()) };
+        let one_keyed = |key: &str| -> Result<Option<(String, String)>> {
+            let (k, v) = keyed(key)?;
+            Ok(v.into_iter().last().map(|v| (k, v)))
+        };
 
         let mut identity_paths: Vec<PathBuf> =
             all("identity")?.iter().map(|s| expand_home(s)).collect();
@@ -87,6 +107,10 @@ impl Config {
             })
             .transpose()?;
         let fsck = fsck_option()?;
+        let part_size = match one_keyed("partSize")? {
+            Some((k, v)) => parse_part_size(&k, &v)?,
+            None => DEFAULT_PART_SIZE,
+        };
         let participants = key_list(all("participants")?)?;
         let admins = key_list(all("admins")?)?;
 
@@ -102,6 +126,7 @@ impl Config {
             allow_lfs,
             refuse_forks,
             fsck,
+            part_size,
         })
     }
 }
@@ -177,6 +202,29 @@ fn key_list(raw: Vec<String>) -> Result<Option<Vec<String>>> {
     Ok(Some(list))
 }
 
+/// `enc.partSize`, read from config key `key`: 0, or a size of at least
+/// [`MIN_PART_SIZE`].
+fn parse_part_size(key: &str, v: &str) -> Result<u64> {
+    let n = parse_size(v).with_context(|| format!("{key}: `{v}` is not a size"))?;
+    if n != 0 && n < MIN_PART_SIZE {
+        bail!("{key}: `{v}` is below the minimum part size, 16k (0 stores packs whole)");
+    }
+    Ok(n)
+}
+
+/// git's integer spellings: a number with an optional `k`, `m` or `g`
+/// (binary) suffix.
+fn parse_size(v: &str) -> Option<u64> {
+    let v = v.trim();
+    let (num, shift) = match v.char_indices().last()? {
+        (i, 'k' | 'K') => (v.get(..i)?, 10),
+        (i, 'm' | 'M') => (v.get(..i)?, 20),
+        (i, 'g' | 'G') => (v.get(..i)?, 30),
+        _ => (v, 0),
+    };
+    num.parse::<u64>().ok()?.checked_mul(1u64 << shift)
+}
+
 /// git's boolean spellings.
 fn parse_bool(v: &str) -> Option<bool> {
     match v.to_ascii_lowercase().as_str() {
@@ -193,4 +241,35 @@ fn expand_home(s: &str) -> PathBuf {
         return Path::new(&home).join(rest);
     }
     PathBuf::from(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_parse_like_git() {
+        assert_eq!(parse_size("0"), Some(0));
+        assert_eq!(parse_size("1000"), Some(1000));
+        assert_eq!(parse_size("48m"), Some(48 << 20));
+        assert_eq!(parse_size(" 1G "), Some(1 << 30));
+        assert_eq!(parse_size("2k"), Some(2048));
+        assert_eq!(parse_size("m"), None);
+        assert_eq!(parse_size("-1"), None);
+        assert_eq!(parse_size("99999999999g"), None);
+    }
+
+    #[test]
+    fn part_size_has_a_lower_bound() {
+        assert_eq!(parse_part_size("enc.partSize", "0").unwrap(), 0);
+        assert_eq!(parse_part_size("enc.partSize", "16k").unwrap(), 16 << 10);
+        assert_eq!(parse_part_size("enc.partSize", "1g").unwrap(), 1 << 30);
+        let err = parse_part_size("remote.o.enc-partSize", "16383")
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("remote.o.enc-partSize: "), "{err}");
+        assert!(err.contains("minimum part size"), "{err}");
+        assert!(parse_part_size("enc.partSize", "1").is_err());
+        assert!(parse_part_size("enc.partSize", "x").is_err());
+    }
 }

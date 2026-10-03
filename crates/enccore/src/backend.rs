@@ -1,6 +1,8 @@
 //! The git-hosted store: one branch whose chained commits carry a flat tree of
 //! age blobs. DESIGN.md §4.1, §5.1 steps 6–7.
 
+use std::collections::HashSet;
+
 use anyhow::{Result, bail};
 
 use crate::git::{self, Oid, TreeEntry};
@@ -86,8 +88,9 @@ impl Backend {
                 .collect(),
             None => vec![],
         };
+        let names: HashSet<&str> = upserts.iter().map(|(n, _)| n.as_str()).collect();
+        entries.retain(|(_, _, _, n)| !names.contains(n.as_str()));
         for (name, oid) in upserts {
-            entries.retain(|(_, _, _, n)| n != name);
             entries.push(("100644".into(), "blob".into(), oid.clone(), name.clone()));
         }
         let tree = git::mktree(&entries)?;
@@ -118,8 +121,9 @@ impl Backend {
 
     fn git_push(args: &[&str]) -> Result<(bool, String)> {
         let progress = progress::enabled();
-        // Backend objects are ciphertext: deflating them, or searching them
-        // for deltas, only costs time.
+        // Backend objects are ciphertext: deflating them, or searching
+        // them for deltas, only costs time (a lot of it for pack parts,
+        // which are under core.bigFileThreshold).
         let mut all = vec![
             "-c",
             "pack.compression=0",

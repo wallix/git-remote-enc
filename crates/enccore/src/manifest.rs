@@ -5,9 +5,9 @@ use std::fmt;
 
 use zeroize::{Zeroize, Zeroizing};
 
-/// The version written. Versions 1 (no `admin` item) and 2 (no `previous`
-/// item) are still read.
-pub const FORMAT_VERSION: u32 = 3;
+/// The version written. Versions 1 (no `admin` item), 2 (no `previous`
+/// item) and 3 (no packs stored as parts) are still read.
+pub const FORMAT_VERSION: u32 = 4;
 const OLDEST_VERSION: u32 = 1;
 const HEADER: &str = "enc-manifest";
 /// Stands in for a pack key in a displayed manifest.
@@ -20,12 +20,6 @@ pub struct Pack {
     pub id: String,
     /// `AGE-SECRET-KEY-1…`
     pub key: String,
-}
-
-impl Pack {
-    pub fn blob_name(&self) -> String {
-        format!("{}.age", self.id)
-    }
 }
 
 /// The key stays out of debug output, and so out of logs and panics.
@@ -312,7 +306,7 @@ pub fn join_envelope(manifest: &str, signature_pem: &str) -> Zeroizing<Vec<u8>> 
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "enc-manifest 3\ngeneration 3\nrepo abcdef0123\ntime 1790000000\nprevious 1111111111111111111111111111111111111111111111111111111111111111\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nadmin ssh-ed25519 AAAAC3 alice\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nextn future stuff\n";
+    const SAMPLE: &str = "enc-manifest 4\ngeneration 3\nrepo abcdef0123\ntime 1790000000\nprevious 1111111111111111111111111111111111111111111111111111111111111111\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nadmin ssh-ed25519 AAAAC3 alice\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nextn future stuff\n";
 
     #[test]
     fn roundtrip() {
@@ -340,20 +334,22 @@ mod tests {
     fn rejects_garbage_and_future_versions() {
         assert_eq!(Manifest::parse("hello"), Err(ParseError::NotAManifest));
         assert_eq!(
-            Manifest::parse("enc-manifest 4\ngeneration 1\nrepo x\n"),
-            Err(ParseError::UnsupportedVersion(4))
+            Manifest::parse("enc-manifest 5\ngeneration 1\nrepo x\n"),
+            Err(ParseError::UnsupportedVersion(5))
         );
         assert_eq!(
             Manifest::parse("enc-manifest 0\ngeneration 1\nrepo x\n"),
             Err(ParseError::UnsupportedVersion(0))
         );
-        // Versions 1 and 2 are read, and written back as the current version.
+        // Versions 1 to 3 are read, and written back as the current version.
         let v1 = Manifest::parse("enc-manifest 1\ngeneration 1\nrepo x\n").unwrap();
         assert!(v1.admins.is_empty());
-        assert!(v1.serialize().starts_with("enc-manifest 3\n"));
+        assert!(v1.serialize().starts_with("enc-manifest 4\n"));
         let v2 = Manifest::parse("enc-manifest 2\ngeneration 1\nrepo x\n").unwrap();
         assert!(v2.previous.is_none());
-        assert!(v2.serialize().starts_with("enc-manifest 3\n"));
+        assert!(v2.serialize().starts_with("enc-manifest 4\n"));
+        let v3 = Manifest::parse("enc-manifest 3\ngeneration 1\nrepo x\n").unwrap();
+        assert!(v3.serialize().starts_with("enc-manifest 4\n"));
         assert_eq!(
             Manifest::parse("enc-manifest 1\nrepo x\n"),
             Err(ParseError::Missing("generation"))

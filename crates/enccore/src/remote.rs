@@ -15,6 +15,7 @@ use crate::crypto::{self, HashReader, HashWriter, Identity, Participant, TrustKe
 use crate::git::{self, Oid, Streaming, TreeEntry};
 use crate::info;
 use crate::manifest::{Manifest, Pack, join_envelope, split_envelope};
+use crate::parts::{self, BlobChain, PartWriter};
 use crate::progress::{self, Meter, MeterReader};
 use crate::state::{State, Trust};
 
@@ -819,36 +820,34 @@ impl Remote {
         let have = self.state.have()?;
         let todo: Vec<&Pack> = m.packs.iter().filter(|p| !have.contains(&p.id)).collect();
         for (i, pack) in todo.iter().enumerate() {
-            let blob = Backend::blob_oid(&self.tree, &pack.blob_name())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "pack {} listed in manifest is missing on the remote",
-                        pack.id
-                    )
-                })?
-                .to_owned();
+            let blobs = parts::find(&self.tree, &pack.id).ok_or_else(|| {
+                anyhow!(
+                    "pack {} listed in manifest is missing on the remote",
+                    pack.id
+                )
+            })?;
             let label = format!("pack {}/{}", i.saturating_add(1), todo.len());
-            self.index_pack(pack, &blob, &label)?;
+            self.index_pack(pack, blobs, &label)?;
             self.state.add_have(&pack.id)?;
         }
         Ok(())
     }
 
-    fn index_pack(&self, pack: &Pack, blob_oid: &str, label: &str) -> Result<()> {
+    /// Decrypt the pack held by `blobs` (its parts, in order) into the object
+    /// store.
+    fn index_pack(&self, pack: &Pack, blobs: Vec<Oid>, label: &str) -> Result<()> {
         let key = age::x25519::Identity::from_str(&pack.key)
             .map_err(|e| anyhow!("pack {}: bad key in manifest: {e}", pack.id))?;
         // Check the blob against its name before anything reaches the
         // object store: one extra read of a local object.
-        let size = git::object_size(blob_oid)?;
-        let mut cat = Streaming::reader(["cat-file", "blob", blob_oid], None)?;
+        let size = parts::total_size(&blobs)?;
         let (mut hashed, digest) = HashReader::new(MeterReader::new(
-            cat.stdout()?,
+            BlobChain::new(blobs.clone()),
             Meter::new(format!("verifying {label}"), Some(size)),
         ));
         io::copy(&mut hashed, &mut io::sink())
             .with_context(|| format!("reading pack blob {}", pack.id))?;
         drop(hashed);
-        cat.finish()?;
         let got = crypto::finalize_shared(&digest);
         if got != pack.id {
             bail!(
@@ -857,8 +856,7 @@ impl Remote {
             );
         }
 
-        let mut cat = Streaming::reader(["cat-file", "blob", blob_oid], None)?;
-        let mut plain = crypto::decrypt_stream(&key, BufReader::new(cat.stdout()?))?;
+        let mut plain = crypto::decrypt_stream(&key, BufReader::new(BlobChain::new(blobs)))?;
         let progress = progress::enabled();
         if progress {
             info(&format!("decrypting {label} ({})", progress::human(size)));
@@ -875,7 +873,6 @@ impl Remote {
                 .with_context(|| format!("decrypting pack {}", pack.id))?;
         }
         index.finish()?;
-        cat.finish()?;
         Ok(())
     }
 
@@ -1165,7 +1162,7 @@ impl Remote {
         let pack = self
             .staged
             .as_ref()
-            .map(|p| (p.id.clone(), p.key.clone(), p.blob.clone()));
+            .map(|p| (p.id.clone(), p.key.clone(), p.blobs.clone()));
 
         m.generation = m
             .generation
@@ -1205,8 +1202,8 @@ impl Remote {
         let envelope = join_envelope(&text, &sig);
         let manifest_blob = crypto::encrypt_to_participants(&participants, &envelope, Vec::new())?;
         let mut upserts = vec![(MANIFEST_BLOB.to_owned(), git::hash_object(&manifest_blob)?)];
-        if let Some((_, _, blob)) = pack {
-            upserts.push(blob);
+        if let Some((_, _, blobs)) = &pack {
+            upserts.extend(blobs.iter().cloned());
         }
         let commit = Backend::build_commit(self.tip.as_deref(), &upserts)?;
 
@@ -1256,7 +1253,8 @@ impl Remote {
     }
 
     /// `pack-objects --thin` over `wants` minus `excludes`, encrypted to a
-    /// fresh key into a temp file. `None` when there is nothing to send.
+    /// fresh key into temp files of at most `part_size` bytes. `None` when
+    /// there is nothing to send.
     fn build_pack(&self, wants: &[Oid], excludes: &[Oid]) -> Result<Option<BuiltPack>> {
         let mut revs = String::new();
         for w in wants {
@@ -1296,39 +1294,51 @@ impl Remote {
         }
 
         let key = age::x25519::Identity::generate();
-        let path = self.state.temp_path("pack");
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        let mut enc = crypto::encrypt_stream(&key.to_public(), HashWriter::new(file))?;
+        let writer = PartWriter::new(&self.state.temp_path("pack"), self.cfg.part_size);
+        let mut enc = crypto::encrypt_stream(&key.to_public(), HashWriter::new(writer))?;
         enc.write_all(&header)?;
         io::copy(&mut out, &mut enc).context("encrypting pack")?;
-        let (file, id) = enc.finish()?.finish();
-        file.sync_all()?;
-        drop(file);
-        po.finish()?;
-        Ok(Some(BuiltPack {
-            path,
+        let (writer, id) = enc.finish()?.finish();
+        let paths = writer.finish()?;
+        let built = BuiltPack {
+            paths,
             id,
             key: Zeroizing::new(key.to_string().expose_secret().to_owned()),
-        }))
+        };
+        po.finish()?;
+        Ok(Some(built))
     }
 
-    /// Store a built pack as a blob, for this attempt and a retry.
+    /// Store a built pack's parts as blobs, for this attempt and a retry.
     fn stage(&self, built: BuiltPack, wants: Vec<Oid>) -> Result<Staged> {
-        let blob = (
-            format!("{}.age", built.id),
-            git::hash_object_file(&built.path)?,
-        );
-        // Best effort: the blob is in the object store now.
-        let _ = std::fs::remove_file(&built.path);
+        let names: Vec<String> = if built.paths.len() == 1 {
+            vec![format!("{}.age", built.id)]
+        } else {
+            (0..built.paths.len())
+                .map(|n| parts::part_name(&built.id, n))
+                .collect()
+        };
+        let sizes = built
+            .paths
+            .iter()
+            .map(|p| Ok(std::fs::metadata(p)?.len()))
+            .collect::<Result<Vec<u64>>>()?;
+        let total = sizes.iter().fold(0u64, |a, s| a.saturating_add(*s));
+        let mut meter = Meter::new("storing pack", Some(total));
+        let mut blobs = Vec::new();
+        for ((name, path), size) in names.into_iter().zip(&built.paths).zip(&sizes) {
+            blobs.push((name, git::hash_object_file(path)?));
+            // Best effort: the blob is in the object store now.
+            let _ = std::fs::remove_file(path);
+            meter.add(*size);
+        }
+        meter.finish();
+
         Ok(Staged {
             wants,
-            id: built.id,
-            key: built.key,
-            blob,
+            id: built.id.clone(),
+            key: built.key.clone(),
+            blobs,
         })
     }
 }
@@ -1522,19 +1532,27 @@ fn trust_in(m: &Manifest, text: &str, commit: Option<&str>) -> Trust {
 }
 
 struct BuiltPack {
-    path: PathBuf,
+    /// Its parts, in order.
+    paths: Vec<PathBuf>,
     id: String,
     key: Zeroizing<String>,
 }
 
-/// A pack whose blob is in the local object store.
+impl Drop for BuiltPack {
+    fn drop(&mut self) {
+        // Best effort: stored or abandoned, the files are not needed.
+        PartWriter::discard(&self.paths);
+    }
+}
+
+/// A pack whose blobs are in the local object store.
 struct Staged {
     /// The new tips it was built for, sorted.
     wants: Vec<Oid>,
     id: String,
     key: Zeroizing<String>,
-    /// Tree name and blob.
-    blob: (String, Oid),
+    /// Tree name and blob of each part.
+    blobs: Vec<(String, Oid)>,
 }
 
 #[cfg(test)]

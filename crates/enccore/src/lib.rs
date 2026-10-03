@@ -17,6 +17,7 @@ pub mod crypto;
 pub mod git;
 pub mod guard;
 pub mod manifest;
+pub mod parts;
 pub mod progress;
 pub mod remote;
 pub mod setup;

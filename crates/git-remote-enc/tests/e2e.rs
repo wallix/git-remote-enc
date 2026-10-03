@@ -430,7 +430,7 @@ fn push_clone_fetch_roundtrip() {
         String::from_utf8(out.stdout).unwrap()
     };
     let m = manifest(&["manifest", "enc"]);
-    assert!(m.starts_with("enc-manifest 3\n"), "{m}");
+    assert!(m.starts_with("enc-manifest 4\n"), "{m}");
     assert!(m.contains("participant ssh-ed25519"));
     // Three pushes carried objects; the tag, branch and deletion pushes
     // only moved refs and stored no pack.
@@ -746,7 +746,7 @@ fn only_admins_change_the_participant_list() {
     sb.add_remote(&a, &url, &alice, &[&alice_pub, &bob_pub]);
     sb.git_ok(&a, &["push", "-q", "enc", "main"]);
     let (ok, m) = enc(&a, &["manifest", "enc"]);
-    assert!(ok && m.starts_with("enc-manifest 3\n"), "{m}");
+    assert!(ok && m.starts_with("enc-manifest 4\n"), "{m}");
     assert!(m.contains(&format!("admin {alice_pub}\n")), "{m}");
 
     // Bob pushes, but may not add Carol.
@@ -813,7 +813,7 @@ fn only_admins_change_the_participant_list() {
             .unwrap()
             .parse()
             .unwrap();
-        text.replace("enc-manifest 3\n", "enc-manifest 1\n")
+        text.replace("enc-manifest 4\n", "enc-manifest 1\n")
             .replace(&format!("admin {alice_pub}\n"), "")
             .replace(
                 &format!("generation {generation}\n"),
@@ -2139,6 +2139,125 @@ fn doctor_reports_what_would_get_in_the_way() {
         !ok && out.contains("FAIL  local state") && out.contains("forget"),
         "{out}"
     );
+}
+
+#[test]
+fn large_packs_are_split_into_parts() {
+    let sb = Sandbox::new("split");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["config", "enc.partSize", "64k"]);
+    sb.commit_random(&a, "big", 600_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    // Parts of at most 64 KiB, and no whole blob.
+    let tree = sb.git_ok(&host, &["ls-tree", "-l", "refs/heads/enc"]);
+    let parts: Vec<u64> = tree
+        .lines()
+        .filter(|l| l.contains(".age."))
+        .map(|l| l.split_whitespace().nth(3).unwrap().parse().unwrap())
+        .collect();
+    assert!(parts.len() >= 10, "{tree}");
+    assert!(parts.iter().all(|s| *s <= 64 << 10), "{tree}");
+    assert!(!tree.contains(".age\t"), "{tree}");
+
+    // A small push afterwards stores one blob.
+    sb.commit_text(&a, "small", "x\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let tree = sb.git_ok(&host, &["ls-tree", "refs/heads/enc"]);
+    assert_eq!(
+        tree.lines().filter(|l| l.ends_with(".age")).count(),
+        1,
+        "{tree}"
+    );
+
+    let id = alice.to_str().unwrap();
+    let out = sb
+        .cmd(&sb.root, "git")
+        .args([
+            "-c",
+            &format!("enc.identity={id}"),
+            "-c",
+            "enc.trustOnFirstUse=true",
+            "clone",
+            "--progress",
+            &url,
+            "bob",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("decrypting pack 1/2"), "{err}");
+    let b = sb.root.join("bob");
+    assert_eq!(
+        fs::read(b.join("big")).unwrap(),
+        fs::read(a.join("big")).unwrap()
+    );
+}
+
+#[test]
+fn a_missing_or_altered_part_fails_the_fetch() {
+    let sb = Sandbox::new("bad-part");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.git_ok(&a, &["config", "enc.partSize", "64k"]);
+    sb.commit_random(&a, "big", 300_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    let tree = sb.git_ok(&host, &["ls-tree", "refs/heads/enc"]);
+    let first = tree.lines().find(|l| l.ends_with(".age.0000")).unwrap();
+    let second = tree.lines().find(|l| l.ends_with(".age.0001")).unwrap();
+    let second_oid = second.split_whitespace().nth(2).unwrap();
+    let rewrite = |edit: &dyn Fn(&str) -> Option<String>| {
+        let lines: String = tree.lines().filter_map(edit).map(|l| l + "\n").collect();
+        let dir = sb.dir("forge");
+        fs::write(dir.join("tree"), lines).unwrap();
+        let mut c = sb.cmd(&host, "git");
+        c.args(["mktree"])
+            .stdin(fs::File::open(dir.join("tree")).unwrap());
+        let t = String::from_utf8(c.output().unwrap().stdout).unwrap();
+        let commit = sb.git_ok(&host, &["commit-tree", t.trim(), "-m", "enc"]);
+        sb.git_ok(&host, &["update-ref", "refs/heads/enc", commit.trim()]);
+    };
+
+    // Part 0 replaced by part 1: same count, wrong content.
+    rewrite(&|l: &str| {
+        Some(if l == first {
+            l.replace(first.split_whitespace().nth(2).unwrap(), second_oid)
+        } else {
+            l.to_owned()
+        })
+    });
+    let id = alice.to_str().unwrap();
+    let clone = |name: &str| {
+        sb.git_fails(
+            &sb.root,
+            &[
+                "-c",
+                &format!("enc.identity={id}"),
+                "-c",
+                "enc.trustOnFirstUse=true",
+                "clone",
+                "-q",
+                &url,
+                name,
+            ],
+        )
+    };
+    let err = clone("bob");
+    assert!(err.contains("does not match its manifest name"), "{err}");
+
+    // Part 1 gone: the rest is a truncated pack.
+    rewrite(&|l: &str| (l != second).then(|| l.to_owned()));
+    let err = clone("carol");
+    assert!(err.contains("does not match its manifest name"), "{err}");
 }
 
 /// A host hook script fragment: run the rest of the line without the hook's

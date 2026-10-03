@@ -111,12 +111,15 @@ anonymous author/committer/date. Its tree is flat:
 ```
 manifest              age file: the encrypted, signed manifest
 <sha256-hex>.age      age file: one encrypted git pack, per push
+<sha256-hex>.age.0000 a pack over the part size, as consecutive parts
+<sha256-hex>.age.0001 (at least four digits: .9999 is followed by .10000)
 ...
 ```
 
 Blob names are the SHA-256 of the age ciphertext, so the manifest can bind a
-pack line to exactly one blob. The tree only ever grows (a deleted ref keeps
-its objects in earlier packs); section 7 discusses compaction.
+pack line to exactly one ciphertext, stored whole or as parts (section 4.4).
+The tree only ever grows (a deleted ref keeps its objects in earlier packs);
+section 7 discusses compaction.
 
 Chained commits make both fetches and pushes of the branch incremental. No
 object is ever transferred twice in either direction.
@@ -124,10 +127,10 @@ object is ever transferred twice in either direction.
 ### 4.2 Manifest
 
 The manifest plaintext is UTF-8 text, one item per line, `\n`-terminated. Its
-first line is the format tag. Version 3:
+first line is the format tag. Version 4:
 
 ```
-enc-manifest 3
+enc-manifest 4
 generation 42
 time 1790000000
 previous 9a4c...e1
@@ -145,7 +148,7 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 
 | item | meaning |
 |---|---|
-| `enc-manifest <n>` | format version; a reader refuses an unknown `n`. Readers accept 1 to 3 and write 3 |
+| `enc-manifest <n>` | format version; a reader refuses an unknown `n`. Readers accept 1 to 4 and write 4 |
 | `generation <n>` | strictly increasing per push; anti-rollback (section 6.2) |
 | `time <unix seconds>` | when the pusher wrote it, by the pusher's clock; for the audit trail only, never for trust decisions. New in version 2 |
 | `previous <sha256>` | hex SHA-256 of the previous generation's manifest text; absent on a remote's first manifest. Chains the history so the accepted manifest authenticates every one before it (section 6.6). New in version 3 |
@@ -170,9 +173,11 @@ can tell who wrote it, so it refuses a manifest blob over 64 MiB (about
 450,000 pushes' worth of pack lines) without reading it.
 
 Versions 1 and 2 come from pre-release builds: version 1 had no `admin`
-item, version 2 no `previous` item. Readers still accept both, and the first
-push rewrites either as version 3 (a version 1 manifest with an empty admin
-list).
+item, version 2 no `previous` item. Version 3 (v0.1.0) has the same grammar
+as version 4, but its packs are always stored whole: version 4 tells an
+older reader that a pack may be stored as parts (section 4.4), which it
+could not read. Readers accept all four, and the first push rewrites any as
+version 4 (a version 1 manifest with an empty admin list).
 
 ### 4.3 Manifest envelope
 
@@ -203,11 +208,24 @@ blob       = age.Encrypt(recipients = [key.public], pack)
 name       = hex(sha256(blob)) ‖ ".age"
 ```
 
+A blob larger than the part size (`enc.partSize`, default 1 GiB) is stored
+as parts of that size, `<name>.0000`, `<name>.0001`, … (a decimal index of
+at least four digits), whose concatenation is the ciphertext; the manifest is
+the same either way. Parts bound what one object costs the host. The
+default stays above git's `core.bigFileThreshold` (512 MiB): git
+searches smaller blobs for deltas whenever it packs them (a host's repack, or
+serving loose objects to a fetch), measured at about 3 minutes of CPU per GiB
+of ciphertext, for no gain. A forge with a per-file limit below that (GitHub
+refuses files over 100 MB) needs a smaller part size and pays that cost. A
+reader takes `<name>` if present, else the parts from `.0000` up to the first
+gap; the SHA-256 check of section 5.2 covers the concatenation, so a
+missing or reordered part, or an extra one right after the last, fails the
+fetch (parts past a gap are never read). Parts are new in manifest version 4.
+
 The helper stores backend blobs uncompressed and pushes them without
 compression or delta search (`core.looseCompression=0`, `pack.compression=0`,
 `pack.window=0` on its own git commands): ciphertext gains nothing from
-either. The host's own storage and fetch responses follow
-its configuration.
+either. The host's own storage and fetch responses follow its configuration.
 
 The per-pack identity goes in the manifest's `pack` line. Encrypting to a
 throwaway X25519 key rather than using a raw symmetric key keeps every
@@ -239,14 +257,14 @@ for-push`.
    locally. Everything reachable from a manifest ref is on the remote, so the
    pack contains only new objects and may use deltas against remote objects
    (thin). An empty pack (object count 0 in the header) is not stored.
-4. **Encrypt + hash** the pack stream into a temporary file under
-   `<common>/enc/`, then `git hash-object -w` it.
+4. **Encrypt + hash** the pack stream into temporary files under
+   `<common>/enc/`, cut at the part size, then `git hash-object -w` each.
 5. **New manifest:** refs updated, pack line appended, `generation + 1`,
    participants unchanged (from config only when creating the remote, or for
    `git-remote-enc participants --apply`, section 6.3), `head` set if absent.
    Sign with the local signing key, encrypt to the participants.
-6. **Commit:** tree = previous tree + pack blob + new `manifest`; `commit-tree
-   -p <old tip>`.
+6. **Commit:** tree = previous tree + pack blobs + new `manifest`;
+   `commit-tree -p <old tip>`.
 7. **Compare-and-swap:** `git push <url> <commit>:<branch>
    --force-with-lease=<branch>:<old tip>` (empty old tip for a new remote:
    "must not exist"). On a stale lease someone pushed in between: go back to
@@ -300,9 +318,9 @@ After `list`, git sends the `fetch <oid> <name>` lines it wants. The helper
 ignores the individual wants and downloads every pack it has not indexed yet:
 
 1. For each `pack` line in manifest order not present in the local `have`
-   list: `git cat-file blob <blob oid>` (already in the local object store
-   from the branch fetch) → age decrypt with the pack key → `git index-pack
-   --stdin --fix-thin --fsck-objects` → append to `have`.
+   list: `git cat-file blob` of the blob or each part in turn (already in the
+   local object store from the branch fetch) → age decrypt with the pack key →
+   `git index-pack --stdin --fix-thin --fsck-objects` → append to `have`.
 2. The SHA-256 of the ciphertext is checked against the pack name first, in
    a separate read of the blob, so nothing from a mismatching blob reaches
    the object store; a mismatch fails the fetch.
@@ -313,8 +331,8 @@ that must already be present.
 **Progress.** The helper advertises the `option` capability and follows
 git's `option progress`: on for a terminal unless `-q`, or with `--progress`.
 It then shows git's own progress for the backend fetch and push, for
-`pack-objects` and for `index-pack`, and its own meter for verifying pack
-blobs.
+`pack-objects` and for `index-pack`, and its own meters for storing and
+verifying pack blobs.
 
 Configured identities are loaded, and a key passphrase asked for, before the
 branch fetch, which on a first clone downloads every pack.
@@ -679,6 +697,7 @@ it, is a second flow from the machine to the host that bypasses the helper
 | `remote.<name>.enc-installHook`, `enc.installHook` | boolean, default true. Install the pre-push guard where no pre-push hook exists, and report one that does not run it, on every contact (section 6.7) |
 | `remote.<name>.enc-allowLfs`, `enc.allowLfs` | boolean, default false. Push although a pre-push hook runs Git LFS, or the pushed commits hold LFS pointers (section 5.1) |
 | `remote.<name>.enc-refuseForks`, `enc.refuseForks` | boolean, default true. Refuse a manifest that forks from the accepted one; false accepts it with a warning (section 6.2) |
+| `remote.<name>.enc-partSize`, `enc.partSize` | size (`k`, `m`, `g` suffixes), default 1g, at least 16k. Pack blobs larger than this are stored as parts of this size; 0 stores them whole (section 4.4) |
 | `fetch.fsckObjects`, `transfer.fsckObjects`, `fetch.fsck.*` | git's own keys; received objects are checked unless one of the first two is false (section 5.2) |
 
 URL: `enc::<any git url>[#<branch>]`. Everything after `enc::` is handed to

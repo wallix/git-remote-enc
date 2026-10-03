@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+Manifests now use format version 4, which v0.1.0 refuses: every participant
+needs this release once anyone pushes with it.
+
+- Encrypted packs over 1 GiB (`enc.partSize`) are stored as parts.
 - Faster clone, fetch and push of large repositories: encrypted data is no
   longer compressed or delta-searched locally.
 - Progress for the slow steps (backend download and upload, packing,
