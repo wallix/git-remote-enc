@@ -19,8 +19,9 @@ pub struct State {
     /// `<common>/enc`, holding one directory per remote.
     root: PathBuf,
     dir: PathBuf,
-    /// Local ref tracking the backend branch; keeps transfers incremental.
-    pub tracking_ref: String,
+    /// Ref in the user's repository used to track the backend branch before
+    /// `backend.git` was introduced.
+    pub legacy_ref: String,
 }
 
 /// What the last accepted manifest said about who may sign the next one.
@@ -62,15 +63,21 @@ impl State {
                     .and_then(|t| t.elapsed().ok())
                     .is_some_and(|age| age > STALE_TEMP);
                 if stale {
-                    // Best effort: a stale temp file is harmless.
-                    let _ = fs::remove_file(e.path());
+                    // Best effort: a stale temp file is harmless. A
+                    // directory is a backend repository being created.
+                    let path = e.path();
+                    let _ = if path.is_dir() {
+                        fs::remove_dir_all(&path)
+                    } else {
+                        fs::remove_file(&path)
+                    };
                 }
             }
         }
         Ok(Self {
             root,
             dir,
-            tracking_ref: format!("refs/enc/{key}"),
+            legacy_ref: format!("refs/enc/{key}"),
         })
     }
 
@@ -121,7 +128,7 @@ impl State {
         let mut best: Option<(Trust, PathBuf)> = None;
         for e in fs::read_dir(&self.root).context("listing local enc state")? {
             let dir = e?.path();
-            if dir == self.dir {
+            if dir == self.dir || !dir.is_dir() {
                 continue;
             }
             let Ok(Some(t)) = read_trust(&dir.join("trust"), keys) else {
@@ -162,9 +169,35 @@ impl State {
     }
 
     /// Delete everything kept for this remote. The caller removes the
-    /// tracking ref.
+    /// legacy ref.
     pub fn forget(&self) -> Result<()> {
-        fs::remove_dir_all(&self.dir).with_context(|| format!("removing {}", self.dir.display()))
+        fs::remove_dir_all(&self.dir)
+            .with_context(|| format!("removing {}", self.dir.display()))?;
+        match fs::remove_file(self.known_path()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).context("removing the contact marker")
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// `<common>/enc/<key>.known`: a manifest from this remote was accepted.
+    /// Kept outside `<key>/`, so losing that directory is not mistaken for
+    /// never having contacted the remote.
+    fn known_path(&self) -> PathBuf {
+        self.dir.with_extension("known")
+    }
+
+    pub fn is_known(&self) -> bool {
+        self.known_path().exists()
+    }
+
+    pub fn mark_known(&self) -> Result<()> {
+        let path = self.known_path();
+        if !path.exists() {
+            fs::write(&path, "").with_context(|| format!("writing {}", path.display()))?;
+        }
+        Ok(())
     }
 
     pub fn has_trust(&self) -> bool {
@@ -246,12 +279,18 @@ mod tests {
         let s = State::open(&root, "url", "refs/heads/enc").unwrap();
         let fresh = s.temp_path("fresh");
         let old = s.temp_path("old");
+        let old_dir = s.temp_path("backend.git");
         fs::write(&fresh, "x").unwrap();
         fs::write(&old, "x").unwrap();
+        fs::create_dir_all(old_dir.join("objects")).unwrap();
         let two_days_ago = SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60);
         fs::File::options()
             .write(true)
             .open(&old)
+            .unwrap()
+            .set_modified(two_days_ago)
+            .unwrap();
+        fs::File::open(&old_dir)
             .unwrap()
             .set_modified(two_days_ago)
             .unwrap();
@@ -264,6 +303,7 @@ mod tests {
             "a concurrent helper's temp file was removed"
         );
         assert!(!old.exists());
+        assert!(!old_dir.exists());
         fs::remove_dir_all(&root).unwrap();
     }
 

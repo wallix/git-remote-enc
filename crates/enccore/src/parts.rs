@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::backend::Backend;
 use crate::git::{Oid, Streaming, TreeEntry};
 
 /// The tree name of part `n` of pack `id`.
@@ -128,16 +129,18 @@ impl Drop for PartWriter {
     }
 }
 
-/// Reads blobs back to back, one `git cat-file` at a time; a failing
-/// `cat-file` is a read error.
-pub struct BlobChain {
+/// Reads blobs of the backend repository back to back, one `git cat-file`
+/// at a time; a failing `cat-file` is a read error.
+pub struct BlobChain<'a> {
+    backend: &'a Backend,
     oids: std::vec::IntoIter<Oid>,
     current: Option<(Streaming, std::process::ChildStdout)>,
 }
 
-impl BlobChain {
-    pub fn new(oids: Vec<Oid>) -> Self {
+impl<'a> BlobChain<'a> {
+    pub fn new(backend: &'a Backend, oids: Vec<Oid>) -> Self {
         Self {
+            backend,
             oids: oids.into_iter(),
             current: None,
         }
@@ -147,14 +150,14 @@ impl BlobChain {
         let Some(oid) = self.oids.next() else {
             return Ok(false);
         };
-        let mut cat = Streaming::reader(["cat-file", "blob", oid.as_str()], None)?;
+        let mut cat = self.backend.blob_reader(&oid)?;
         let out = cat.stdout()?;
         self.current = Some((cat, out));
         Ok(true)
     }
 }
 
-impl Read for BlobChain {
+impl Read for BlobChain<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             if self.current.is_none() && !self.open_next().map_err(io::Error::other)? {
@@ -174,10 +177,10 @@ impl Read for BlobChain {
     }
 }
 
-/// Total size of `oids`.
-pub fn total_size(oids: &[Oid]) -> Result<u64> {
+/// Total size of the backend blobs `oids`.
+pub fn total_size(backend: &Backend, oids: &[Oid]) -> Result<u64> {
     oids.iter().try_fold(0u64, |acc, oid| {
-        acc.checked_add(crate::git::object_size(oid)?)
+        acc.checked_add(backend.object_size(oid)?)
             .ok_or_else(|| anyhow!("pack size overflow"))
     })
 }

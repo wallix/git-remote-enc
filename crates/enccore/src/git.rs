@@ -210,9 +210,14 @@ impl Git {
         Ok(out.stdout)
     }
 
-    /// [`Self::run_status`], with git's stderr also shown as it arrives when `tee`:
-    /// for `fetch`/`push --progress`.
-    pub fn run_status_tee<I, S>(&self, args: I, tee: bool) -> Result<(bool, Vec<u8>, String)>
+    /// [`Self::run_status`], with `input`, if any, on stdin, and git's stderr
+    /// also shown as it arrives when `tee`: for `fetch`/`push --progress`.
+    pub fn run_status_tee<I, S>(
+        &self,
+        args: I,
+        input: Option<&[u8]>,
+        tee: bool,
+    ) -> Result<(bool, Vec<u8>, String)>
     where
         I: IntoIterator<Item = S> + Clone,
         S: AsRef<OsStr>,
@@ -220,19 +225,33 @@ impl Git {
         let desc = describe(args.clone());
         let mut child = self
             .command(args)
-            .stdin(Stdio::null())
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawning `git {desc}`"))?;
         let stderr = drain_stderr(&mut child, tee);
+        let stdin = child.stdin.take();
         let mut stdout = Vec::new();
         // Reaped and its stderr collected even when the read fails; the dropped
-        // pipe ends git if it is still writing.
-        let read = child
-            .stdout
-            .take()
-            .map_or(Ok(0), |mut o| o.read_to_end(&mut stdout));
+        // pipe ends git if it is still writing. Input is written from another
+        // thread, as in `run_input`.
+        let read = std::thread::scope(|s| {
+            if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                // A write error is git exiting early, which its status reports.
+                s.spawn(move || {
+                    let _ = stdin.write_all(input);
+                });
+            }
+            child
+                .stdout
+                .take()
+                .map_or(Ok(0), |mut o| o.read_to_end(&mut stdout))
+        });
         let status = child.wait();
         let stderr = join_stderr(stderr);
         read.with_context(|| format!("reading `git {desc}`"))?;
@@ -340,12 +359,14 @@ impl Git {
         Ok(entries)
     }
 
+    /// Entries may name objects that are not here: in the backend
+    /// repository, pack blobs stay on the host until needed.
     pub fn mktree(&self, entries: &[TreeEntry]) -> Result<Oid> {
         let mut input = Vec::new();
         for (mode, ty, oid, name) in entries {
             input.extend_from_slice(format!("{mode} {ty} {oid}\t{name}\0").as_bytes());
         }
-        ascii_line(&self.run_input(["mktree", "-z"], &input)?)
+        ascii_line(&self.run_input(["mktree", "-z", "--missing"], &input)?)
     }
 
     /// A deterministic, anonymous commit: fixed author/committer/date so the
@@ -451,39 +472,6 @@ pub fn delete_ref(name: &str) -> Result<()> {
 
 pub fn object_size(oid: &str) -> Result<u64> {
     USER.object_size(oid)
-}
-
-pub fn run_status_tee<I, S>(args: I, tee: bool) -> Result<(bool, Vec<u8>, String)>
-where
-    I: IntoIterator<Item = S> + Clone,
-    S: AsRef<OsStr>,
-{
-    USER.run_status_tee(args, tee)
-}
-
-pub fn hash_object_file(path: &Path) -> Result<Oid> {
-    USER.hash_object_file(path)
-}
-
-pub fn hash_object(data: &[u8]) -> Result<Oid> {
-    USER.hash_object(data)
-}
-
-pub fn cat_blob(oid: &str) -> Result<Vec<u8>> {
-    USER.cat_blob(oid)
-}
-
-pub fn ls_tree(treeish: &str) -> Result<Vec<TreeEntry>> {
-    USER.ls_tree(treeish)
-}
-
-pub fn mktree(entries: &[TreeEntry]) -> Result<Oid> {
-    USER.mktree(entries)
-}
-
-/// [`Git::commit_tree`]: anonymous, never signed.
-pub fn commit_tree(tree: &str, parents: &[&str], message: &str) -> Result<Oid> {
-    USER.commit_tree(tree, parents, message)
 }
 
 /// Collects a child's stderr on a thread, so a chatty command (progress

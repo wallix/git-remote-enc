@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ssh_key::PrivateKey;
 use zeroize::Zeroizing;
 
-use crate::backend::{self, Backend, PushOutcome};
+use crate::backend::{self, Backend, MANIFEST_BLOB, PushOutcome};
 use crate::config::Config;
 use crate::crypto::{self, HashReader, HashWriter, Identity, Participant, TrustKey};
 use crate::git::{self, Oid, Streaming, TreeEntry};
@@ -19,7 +19,6 @@ use crate::parts::{self, BlobChain, PartWriter};
 use crate::progress::{self, Meter, MeterReader};
 use crate::state::{State, Trust};
 
-const MANIFEST_BLOB: &str = "manifest";
 /// The manifest is read into memory before it can be authenticated, and the
 /// host chooses its size. A pack line is ~140 bytes: this is ~450,000 pushes.
 const MAX_MANIFEST_BYTES: u64 = 64 << 20;
@@ -196,8 +195,8 @@ pub struct Remote {
     trust_keys: Option<Vec<TrustKey>>,
     /// The pack of a push attempt that lost the race, kept for the retry.
     staged: Option<Staged>,
-    /// `pack_usage` before the current repack's first attempt.
-    repack_before: Option<(usize, u64)>,
+    /// Packs in the manifest before the current repack's first attempt.
+    repack_before: Option<usize>,
 }
 
 impl Remote {
@@ -209,11 +208,7 @@ impl Remote {
         // Per repository, not per worktree: trust accepted in one worktree
         // must hold in all of them.
         let state = State::open(&git::common_dir()?, url, &branch)?;
-        let backend = Backend {
-            url: url.to_owned(),
-            branch,
-            tracking_ref: state.tracking_ref.clone(),
-        };
+        let backend = Backend::open(backend::repo_dir(state.dir()), url, &branch)?;
         let name = name.filter(|n| *n != url && !n.starts_with("enc::"));
         if let Some(n) = name {
             refuse_plain_push_url(n)?;
@@ -306,11 +301,11 @@ impl Remote {
     }
 
     /// Drop the local state kept for this remote: accepted trust, indexed
-    /// packs and the tracking ref. Returns the directory removed.
+    /// packs and the backend repository. Returns the directory removed.
     pub fn forget(&mut self) -> Result<PathBuf> {
         self.state.forget()?;
-        if git::rev_parse(&self.backend.tracking_ref)?.is_some() {
-            git::delete_ref(&self.backend.tracking_ref)?;
+        if git::rev_parse(&self.state.legacy_ref)?.is_some() {
+            git::delete_ref(&self.state.legacy_ref)?;
         }
         Ok(self.state.dir().to_owned())
     }
@@ -321,10 +316,21 @@ impl Remote {
         if self.connected {
             return Ok(());
         }
-        // The tracking ref is set once a manifest has been accepted; with it
-        // present, missing trust state was lost, not never written.
-        let previous_tip = git::rev_parse(&self.backend.tracking_ref)?;
-        let known = previous_tip.is_some();
+        // Created on contact, so that `forget` leaves none behind.
+        self.backend
+            .create_if_missing(&self.state.temp_path("backend.git"))?;
+        // The contact marker is written once a manifest has been accepted:
+        // with it present, missing trust state was lost, not never written.
+        // The backend's tracking ref is not proof, as it moves before the
+        // manifest is checked. Before the backend had a repository of its
+        // own, the tracking ref was a ref of the user's, set only on
+        // acceptance: it then stands in once, and goes.
+        let legacy = git::rev_parse(&self.state.legacy_ref)?;
+        let previous_tip = match self.backend.tip()? {
+            Some(t) => Some(t),
+            None => legacy.clone(),
+        };
+        let known = legacy.is_some() || self.state.is_known();
         if self.cfg.install_hook {
             crate::guard::ensure_hook()?;
         }
@@ -338,7 +344,7 @@ impl Remote {
         // the audit trail `log` reads from it is incomplete. The fetch is
         // forced, so the old tip is still in the object store to compare.
         let rewritten = match (&previous_tip, &self.tip.clone()) {
-            (Some(old), Some(new)) if old != new && !git::is_ancestor(old, new)? => {
+            (Some(old), Some(new)) if old != new && !self.backend.is_ancestor(old, new)? => {
                 // The tracking ref has already moved, so an error here must
                 // not lose the report: `None` reports the host's rewrite, and
                 // `load_manifest` reads the trust state again and fails.
@@ -354,13 +360,14 @@ impl Remote {
         };
         match self.tip.clone() {
             Some(tip) => {
-                self.tree = Backend::tree_entries(&tip)?;
+                self.tree = self.backend.tree_entries(&tip)?;
                 match self.load_manifest(known) {
                     Ok(m) => {
                         if let Some((old, new, accepted)) = rewritten {
                             self.report_rewrite(&m, &old, &new, accepted);
                         }
                         self.manifest = Some(m);
+                        self.state.mark_known()?;
                     }
                     Err(e) => {
                         // The tracking ref has moved to the new tip, so no
@@ -373,7 +380,7 @@ impl Remote {
                         // later appear accepted.
                         if !known {
                             // Best effort: the refusal is the error to report.
-                            let _ = git::delete_ref(&self.backend.tracking_ref);
+                            let _ = self.backend.drop_tip();
                         }
                         return Err(e);
                     }
@@ -397,6 +404,11 @@ impl Remote {
                 self.manifest = None;
                 self.manifest_digest = None;
             }
+        }
+        if legacy.is_some() {
+            // Best effort: its objects go with the user repository's next
+            // gc, and a later run retries.
+            let _ = git::delete_ref(&self.state.legacy_ref);
         }
         self.connected = true;
         Ok(())
@@ -442,7 +454,7 @@ impl Remote {
                 )
             })?
             .to_owned();
-        let blob = read_manifest_blob(&oid)?;
+        let blob = read_manifest_blob(&self.backend, &oid)?;
         let identities = self.identities()?;
         let envelope = crypto::decrypt_to_vec(identities, &blob)?;
         let (text, sig) =
@@ -643,37 +655,35 @@ impl Remote {
     /// the history still descends from it, else, on first contact or after
     /// a participant's rewrite (`epoch` above the accepted generation), from
     /// the root, or from the manifest's `epoch` where the history really
-    /// starts there ([`rewrite_epoch`]). A new remote's first push may start
+    /// starts there ([`Backend::rewrite_epoch`]). A new remote's first push may start
     /// on a staging chain (DESIGN.md §5.1), whose commits then count too: a
     /// slightly looser bound.
     fn check_generation_jump(&self, m: &Manifest, trust: Option<&Trust>) -> Result<()> {
         let Some(tip) = self.tip.as_deref() else {
             return Ok(());
         };
-        let count = |range: &str| -> Result<u64> {
-            git::run_line(["rev-list", "--count", "--first-parent", range])?
-                .parse()
-                .context("rev-list --count")
-        };
+        let count = |range: &str| self.backend.count_first_parents(range);
         // Since a rewrite, the history starts at its epoch.
         let from_epoch = |epoch: u64| -> Result<(u64, u64)> {
             Ok((epoch, epoch.saturating_sub(1).saturating_add(count(tip)?)))
         };
         let (base, limit) = match trust {
             Some(t) => match &t.commit {
-                Some(c) if git::has_object(c)? && git::is_ancestor(c, tip)? => (
+                Some(c) if self.backend.is_ancestor(c, tip)? => (
                     t.generation,
                     t.generation.saturating_add(count(&format!("{c}..{tip}"))?),
                 ),
                 // A participant's rewrite (connect reports it as such).
                 _ => match m.epoch {
-                    Some(e) if e > t.generation && rewrite_epoch(tip)? == Some(e) => from_epoch(e)?,
+                    Some(e) if e > t.generation && self.backend.rewrite_epoch(tip)? == Some(e) => {
+                        from_epoch(e)?
+                    }
                     // Older state, or the host's rewrite (reported by connect).
                     _ => return Ok(()),
                 },
             },
             None => match m.epoch {
-                Some(e) if rewrite_epoch(tip)? == Some(e) => from_epoch(e)?,
+                Some(e) if self.backend.rewrite_epoch(tip)? == Some(e) => from_epoch(e)?,
                 _ => from_epoch(0)?,
             },
         };
@@ -741,10 +751,12 @@ impl Remote {
     /// backend commits do not give.
     pub fn history(&mut self) -> Result<Vec<HistoryEntry>> {
         self.connect()?;
-        if self.tip.is_none() {
+        let Some(tip) = self.tip.clone() else {
             bail!("no encrypted remote at {}", self.backend.url);
-        }
-        let commits: Vec<String> = pushes(&self.backend.tracking_ref)?
+        };
+        let commits: Vec<String> = self
+            .backend
+            .pushes(&tip)?
             .into_iter()
             .map(|(c, _)| c)
             .collect();
@@ -867,11 +879,11 @@ impl Remote {
     /// The manifest at backend `commit`, the fingerprint of its signer and
     /// the SHA-256 of its text.
     fn read_historical(&mut self, commit: &str) -> Result<(Manifest, String, String)> {
-        let tree = Backend::tree_entries(commit)?;
+        let tree = self.backend.tree_entries(commit)?;
         let oid = Backend::blob_oid(&tree, MANIFEST_BLOB)
             .ok_or_else(|| anyhow!("no manifest"))?
             .to_owned();
-        let blob = read_manifest_blob(&oid)?;
+        let blob = read_manifest_blob(&self.backend, &oid)?;
         let envelope = crypto::decrypt_to_vec(self.identities()?, &blob)?;
         let (text, sig) =
             split_envelope(&envelope).ok_or_else(|| anyhow!("manifest is not signed"))?;
@@ -893,13 +905,20 @@ impl Remote {
         };
         let have = self.state.have()?;
         let todo: Vec<&Pack> = m.packs.iter().filter(|p| !have.contains(&p.id)).collect();
-        for (i, pack) in todo.iter().enumerate() {
-            let blobs = parts::find(&self.tree, &pack.id).ok_or_else(|| {
-                anyhow!(
-                    "pack {} listed in manifest is missing on the remote",
-                    pack.id
-                )
-            })?;
+        let blobs = todo
+            .iter()
+            .map(|pack| {
+                parts::find(&self.tree, &pack.id).ok_or_else(|| {
+                    anyhow!(
+                        "pack {} listed in manifest is missing on the remote",
+                        pack.id
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // One download for every pack still needed.
+        self.backend.ensure_blobs(&blobs.concat())?;
+        for (i, (pack, blobs)) in todo.iter().zip(blobs).enumerate() {
             let label = format!("pack {}/{}", i.saturating_add(1), todo.len());
             self.index_pack(pack, blobs, &label)?;
             self.state.add_have(&pack.id)?;
@@ -914,9 +933,9 @@ impl Remote {
             .map_err(|e| anyhow!("pack {}: bad key in manifest: {e}", pack.id))?;
         // Check the blob against its name before anything reaches the
         // object store: one extra read of a local object.
-        let size = parts::total_size(&blobs)?;
+        let size = parts::total_size(&self.backend, &blobs)?;
         let (mut hashed, digest) = HashReader::new(MeterReader::new(
-            BlobChain::new(blobs.clone()),
+            BlobChain::new(&self.backend, blobs.clone()),
             Meter::new(format!("verifying {label}"), Some(size)),
         ));
         io::copy(&mut hashed, &mut io::sink())
@@ -930,7 +949,8 @@ impl Remote {
             );
         }
 
-        let mut plain = crypto::decrypt_stream(&key, BufReader::new(BlobChain::new(blobs)))?;
+        let mut plain =
+            crypto::decrypt_stream(&key, BufReader::new(BlobChain::new(&self.backend, blobs)))?;
         let progress = progress::enabled();
         if progress {
             info(&format!("decrypting {label} ({})", progress::human(size)));
@@ -972,22 +992,18 @@ impl Remote {
                 rewrite: rewrite_history,
             },
         )?;
-        Ok(Repacked {
-            before: self.repack_before.unwrap_or_default(),
-            after: self.pack_usage()?,
-        })
-    }
-
-    /// `(packs, bytes of pack blobs)` in the current backend tree.
-    fn pack_usage(&self) -> Result<(usize, u64)> {
-        let packs = self.manifest.as_ref().map_or(0, |m| m.packs.len());
+        // The new pack's blobs are local; the old ones may not be, so only
+        // their count is reported.
         let mut bytes = 0u64;
         for (_, ty, oid, name) in &self.tree {
             if ty == "blob" && name != MANIFEST_BLOB {
-                bytes = bytes.saturating_add(git::object_size(oid)?);
+                bytes = bytes.saturating_add(self.backend.object_size(oid)?);
             }
         }
-        Ok((packs, bytes))
+        Ok(Repacked {
+            before: self.repack_before.unwrap_or_default(),
+            after: (self.manifest.as_ref().map_or(0, |m| m.packs.len()), bytes),
+        })
     }
 
     /// The remote's participant and admin lists, and how the configured
@@ -1066,7 +1082,7 @@ impl Remote {
         };
         let is_new = self.manifest.is_none();
         // What this attempt repacks.
-        let usage = repack.map(|_| self.pack_usage()).transpose()?;
+        let usage = repack.map(|_| self.manifest.as_ref().map_or(0, |m| m.packs.len()));
         let mut m = match &self.manifest {
             Some(m) => m.clone(),
             None => Manifest {
@@ -1381,17 +1397,25 @@ impl Remote {
         let sig = crypto::sign(&signer, text.as_bytes())?;
         let envelope = join_envelope(&text, &sig);
         let manifest_blob = crypto::encrypt_to_participants(&participants, &envelope, Vec::new())?;
-        let mut upserts = vec![(MANIFEST_BLOB.to_owned(), git::hash_object(&manifest_blob)?)];
+        let mut upserts = vec![(
+            MANIFEST_BLOB.to_owned(),
+            self.backend.hash_object(&manifest_blob)?,
+        )];
         if let Some((_, _, blobs)) = &pack {
             upserts.extend(blobs.iter().cloned());
         }
         let upload = self.staged.as_ref().and_then(|s| s.upload_tip.clone());
         let commit = match repack {
-            None => Backend::build_commit(self.tip.as_deref(), upload.as_deref(), &upserts)?,
+            None => self
+                .backend
+                .build_commit(self.tip.as_deref(), upload.as_deref(), &upserts)?,
             Some(false) => {
-                Backend::build_replacing(self.tip.as_deref(), upload.as_deref(), &upserts)?
+                self.backend
+                    .build_replacing(self.tip.as_deref(), upload.as_deref(), &upserts)?
             }
-            Some(true) => Backend::build_rewrite(upload.as_deref(), &upserts, m.generation)?,
+            Some(true) => self
+                .backend
+                .build_rewrite(upload.as_deref(), &upserts, m.generation)?,
         };
 
         match self.backend.push(&commit, self.tip.as_deref())? {
@@ -1421,9 +1445,10 @@ impl Remote {
                     added?;
                 }
                 self.save_trust(&trust_in(&m, &text, Some(&commit)))?;
+                self.state.mark_known()?;
                 self.manifest_digest = Some(crypto::sha256_hex(text.as_bytes()));
                 self.tip = Some(commit.clone());
-                self.tree = Backend::tree_entries(&commit)?;
+                self.tree = self.backend.tree_entries(&commit)?;
                 self.manifest = Some(m);
                 for (spec, _) in &accepted {
                     statuses.push(PushStatus::Ok(spec.dst.clone()));
@@ -1528,7 +1553,7 @@ impl Remote {
         let mut meter = Meter::new("storing pack", Some(total));
         let mut blobs = Vec::new();
         for ((name, path), size) in names.into_iter().zip(&built.paths).zip(&sizes) {
-            blobs.push((name, git::hash_object_file(path)?));
+            blobs.push((name, self.backend.hash_object_file(path)?));
             // Best effort: the blob is in the object store now.
             let _ = std::fs::remove_file(path);
             meter.add(*size);
@@ -1570,8 +1595,10 @@ impl Remote {
                     progress::human(*len)
                 ));
             }
-            let pushed =
-                Backend::build_upload(staged.upload_tip.as_deref(), batch).and_then(|commit| {
+            let pushed = self
+                .backend
+                .build_upload(staged.upload_tip.as_deref(), batch)
+                .and_then(|commit| {
                     self.backend.push_upload(&commit, &branch)?;
                     Ok(commit)
                 });
@@ -1589,63 +1616,6 @@ impl Remote {
         }
         Ok(staged)
     }
-}
-
-/// The backend commits on `rev`'s first-parent walk that carry a manifest,
-/// oldest first, with their subjects. The first parents are the pushes; a
-/// second parent is the chain of commits that staged a large push's parts.
-/// On a new remote, or since a rewrite, that chain is the first push's only
-/// parent (DESIGN.md §5.1), so its commits are on the walk and skipped.
-fn pushes(rev: &str) -> Result<Vec<(String, String)>> {
-    let out = git::run(["log", "--first-parent", "--reverse", "--format=%H %s", rev])?;
-    let log = String::from_utf8(out).context("git log output is not UTF-8")?;
-    let mut commits = Vec::new();
-    for (c, subject) in log.lines().filter_map(|l| l.split_once(' ')) {
-        // A staging commit carries no manifest; one that does is a push,
-        // whatever its message says.
-        if subject == backend::UPLOAD_MESSAGE.trim_end() && !has_manifest(c)? {
-            continue;
-        }
-        commits.push((c.to_owned(), subject.to_owned()));
-    }
-    Ok(commits)
-}
-
-fn has_manifest(commit: &str) -> Result<bool> {
-    Ok(Backend::blob_oid(&Backend::tree_entries(commit)?, MANIFEST_BLOB).is_some())
-}
-
-/// The epoch `tip`'s history starts at, if a participant's rewrite started
-/// it: its oldest push says so in its subject ([`backend::EPOCH_SUBJECT`])
-/// and every push is on the first-parent walk, so nothing older is
-/// reachable. Without the last condition, a fast-forward could put a forged
-/// start under a new first parent and the real history under a second one.
-/// The subject is not signed: only a forced update of the branch, i.e. a
-/// rewrite, or creating the branch (a new remote, or after deleting it) can
-/// place it under the history, so the remote's creator can set any epoch.
-/// DESIGN.md §6.2.
-fn rewrite_epoch(tip: &str) -> Result<Option<u64>> {
-    let pushes = pushes(tip)?;
-    let Some(epoch) = pushes.first().and_then(|(_, s)| {
-        s.strip_prefix(backend::EPOCH_SUBJECT)
-            .and_then(|e| e.parse::<u64>().ok())
-    }) else {
-        return Ok(None);
-    };
-    let list = |first_parent: bool| -> Result<String> {
-        let mut args = vec!["rev-list"];
-        args.extend(first_parent.then_some("--first-parent"));
-        args.push(tip);
-        String::from_utf8(git::run(args)?).context("rev-list output is not UTF-8")
-    };
-    let walk = list(true)?;
-    let walk: std::collections::HashSet<&str> = walk.lines().collect();
-    for c in list(false)?.lines() {
-        if !walk.contains(c) && has_manifest(c)? {
-            return Ok(None);
-        }
-    }
-    Ok(Some(epoch))
 }
 
 /// git picks the transport from the push URL, so a `pushurl` or a
@@ -1785,14 +1755,15 @@ fn unpinned_hint(cfg: &Config) -> &'static str {
     }
 }
 
-fn read_manifest_blob(oid: &str) -> Result<Vec<u8>> {
-    let size = git::object_size(oid)?;
+fn read_manifest_blob(backend: &Backend, oid: &str) -> Result<Vec<u8>> {
+    backend.ensure_blobs(&[oid.to_owned()])?;
+    let size = backend.object_size(oid)?;
     if size > MAX_MANIFEST_BYTES {
         bail!(
             "the remote's manifest is {size} bytes, over the {MAX_MANIFEST_BYTES}-byte limit; refusing to read it"
         );
     }
-    git::cat_blob(oid)
+    backend.cat_blob(oid)
 }
 
 /// Do two key lists name the same keys, comments and order aside?
@@ -1864,9 +1835,9 @@ enum Op {
     },
 }
 
-/// Pack count and bytes of pack blobs before and after a repack.
+/// Packs before a repack, and packs and bytes of pack blobs after it.
 pub struct Repacked {
-    pub before: (usize, u64),
+    pub before: usize,
     pub after: (usize, u64),
 }
 

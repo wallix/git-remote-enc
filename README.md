@@ -47,8 +47,9 @@ tar -xzf "git-remote-enc-$p.tar.gz" git-remote-enc && install -m 755 git-remote-
 From source: `cargo install --git https://github.com/wallix/git-remote-enc git-remote-enc`.
 
 The binary must be on `PATH` as `git-remote-enc`; git invokes it for every
-`enc::` URL. It needs `git`, and `ssh-keygen` for `init` and `join` to create
-a key. Windows is not supported.
+`enc::` URL. It needs `git` (2.45 or later; an older one may download
+encrypted data the helper did not ask for), and `ssh-keygen` for `init` and
+`join` to create a key. Windows is not supported.
 
 Every release archive carries Sigstore-signed SLSA build provenance and a
 CycloneDX SBOM (`git-remote-enc-<platform>.cdx.json`), both attested by the

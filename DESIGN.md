@@ -227,8 +227,9 @@ fetch (parts past a gap are never read). Parts are new in manifest version 4.
 
 The helper stores backend blobs uncompressed and pushes them without
 compression or delta search (`core.looseCompression=0`, `pack.compression=0`,
-`pack.window=0` on its own git commands): ciphertext gains nothing from
-either. The host's own storage and fetch responses follow its configuration.
+`pack.window=0` in the backend repository's config, section 5.4): ciphertext
+gains nothing from either. The host's own storage and fetch responses follow
+its configuration.
 
 The per-pack identity goes in the manifest's `pack` line. Encrypting to a
 throwaway X25519 key rather than using a raw symmetric key keeps every
@@ -243,10 +244,13 @@ operation per pack.
 Invoked by git as a batch of `push [+]<src>:<dst>` lines after `list
 for-push`.
 
-1. **Connect** (once per helper process): `git fetch -f <url>
-   +<branch>:refs/enc/<state-key>`; a missing branch means a new remote. Read
-   `manifest` from the tip's tree, decrypt with the local identities, split the
-   envelope, verify the signature (section 6), parse.
+1. **Connect** (once per helper process): in the backend repository (5.4),
+   `git fetch origin +<branch>:refs/enc/tip`, which brings commits, trees and
+   blobs up to 1 MiB (the manifests, and pack blobs that small) and leaves
+   larger blobs on the host; a manifest over 1 MiB is then fetched by id. A
+   missing branch means a new remote. Read `manifest` from the tip's tree,
+   decrypt with the local identities, split the envelope, verify the
+   signature (section 6), parse.
 2. **Ref checks**, for each refspec, in the helper (git does not do it reliably
    for helpers, section 2):
    - deletion (`:<dst>`): allowed;
@@ -336,10 +340,12 @@ remote the clone came from, and the download can be the whole history.
 After `list`, git sends the `fetch <oid> <name>` lines it wants. The helper
 ignores the individual wants and downloads every pack it has not indexed yet:
 
-1. For each `pack` line in manifest order not present in the local `have`
-   list: `git cat-file blob` of the blob or each part in turn (already in the
-   local object store from the branch fetch) → age decrypt with the pack key →
-   `git index-pack --stdin --fix-thin --fsck-objects` → append to `have`.
+1. Fetch the blobs of every `pack` line not in the local `have` list into
+   the backend repository, in one `git fetch --stdin origin` given their
+   ids. Then for each, in manifest order: `git cat-file blob` of the blob or
+   each part in turn → age decrypt with the pack key → `git index-pack
+   --stdin --fix-thin --fsck-objects` in the user's repository → append to
+   `have`.
 2. The SHA-256 of the ciphertext is checked against the pack name first, in
    a separate read of the blob, so nothing from a mismatching blob reaches
    the object store; a mismatch fails the fetch.
@@ -354,7 +360,7 @@ It then shows git's own progress for the backend fetch and push, for
 verifying pack blobs.
 
 Configured identities are loaded, and a key passphrase asked for, before the
-branch fetch, which on a first clone downloads every pack.
+backend fetch.
 
 The packs reach the object store through `index-pack` run by the helper, not
 through `git fetch`, which would otherwise check them. The helper therefore
@@ -375,8 +381,35 @@ Per remote, keyed by `sha256(url ‖ branch)[..16]`, under the repository's
 common directory (`git rev-parse --git-common-dir`: the main `.git`, shared by
 every linked worktree, so trust accepted in one worktree holds in all):
 
-- `refs/enc/<key>` — tracking ref for the backend branch. It makes the next
-  fetch/push incremental; it must not be deleted after a run.
+- `<common>/enc/<key>/backend.git` — the backend repository: a bare partial
+  clone of the backend branch (`remote.origin.partialclonefilter
+  blob:limit=1m`), owned by the helper, tracking it as `refs/enc/tip`. Every
+  command in it runs with `GIT_NO_LAZY_FETCH=1`, so a stray read of a missing
+  pack blob fails instead of downloading it, and blobs are fetched
+  explicitly by id. It does not read the user repository's config; the
+  transport settings there (`url.*.insteadOf`, `core.sshCommand`, `http.*`,
+  `credential.*`, `ssh.*`, `protocol.*`) are passed on as `GIT_CONFIG_*`
+  variables, which, unlike `-c` arguments, other local users cannot read.
+  Global and system config apply as usual, but their conditional includes
+  are evaluated for `backend.git`: `gitdir:<dir>/` still matches (the
+  repository is inside the user's `.git`), `gitdir:` naming the user's git
+  directory exactly does not, and `hasconfig:remote.*.url:` sees the host
+  URL. `GIT_NO_LAZY_FETCH` needs git 2.45 or later; older versions ignore
+  it and download such a blob silently. The repository is created on
+  contact, in `tmp/` then renamed into place, with the user repository's
+  object format. A host that does not support filters
+  (`uploadpack.allowFilter` unset on a plain bare repository) sends
+  everything, as before. Pack blobs are then fetched by id, which needs
+  protocol v2 or `uploadpack.allowAnySHA1InWant` on the host: a host that
+  filters but serves protocol v0 only (ssh to an sshd without `AcceptEnv
+  GIT_PROTOCOL`) fails every pack fetch. Versions before it kept the branch as
+  `refs/enc/<key>` in the user's repository: on the next contact that ref
+  stands in for the backend repository's once (trust and rewrite checks),
+  then is deleted, and its objects go when the repository's gc prunes them
+  (`gc.pruneExpire`).
+- `<common>/enc/<key>.known` — an empty file: a manifest from this remote was
+  accepted. It is outside `<key>/` so that losing that directory, trust state
+  and backend repository together, is not taken for a first contact.
 - `<common>/enc/<key>/have` — pack names already indexed.
 - `<common>/enc/<key>/trust` — the last accepted manifest's `generation`,
   `repo` id, participant list, the SHA-256 of its text and the backend commit
@@ -397,10 +430,10 @@ repository. Once an embargo ends, the clone is deleted (on an encrypted disk,
 that is the whole cleanup), and the backend branch and any mirror of it are
 deleted on the host once the audit trail (`log`) has been exported.
 
-The encrypted blobs live in the local object store (reachable from the
-tracking ref) next to the decrypted objects, so a repository costs roughly
-twice its size locally. This is the price of using git's transfer negotiation
-and is accepted (section 7 lists a mitigation).
+The pack blobs fetched for indexing stay in the backend repository, so a
+clone still costs roughly twice its size locally. They are only needed again
+to index a pack anew, and could be dropped once indexed; that is not done
+yet.
 
 ## 6. Trust model
 
@@ -697,7 +730,7 @@ it, is a second flow from the machine to the host that bypasses the helper
 | The host rewrites the backend history, erasing the audit trail | a tip that does not descend from the last one seen is reported, as a participant's repack when a signed `epoch` above the accepted generation says so; `log` flags missing generations (6.6) | the removed manifests are gone unless the branch is protected on the host or mirrored; a first contact after the rewrite gets no warning, only `log`'s |
 | A removed participant reads the past | future pack keys are unknown to them (6.3) | they keep the past history; full revocation is a new remote |
 | A participant's private key is compromised | passphrase on the key; admins remove the key | the whole readable history is exposed, permanently; no hardware or agent-held keys (6.5) |
-| A local attacker rewrites the trust state | HMAC keyed from the user's identity; a file with a wrong or missing tag, or missing while the tracking ref exists, is refused (5.4, section 9) | stops tampering without code execution (a restored backup, a synced or shared directory); whoever can write `.git` can run code through hooks instead |
+| A local attacker rewrites the trust state | HMAC keyed from the user's identity; a file with a wrong or missing tag, or missing while the tracking ref or `<key>.known` exists, is refused (5.4, section 9) | stops tampering without code execution (a restored backup, a synced or shared directory); whoever can write `.git` can run code through hooks instead |
 | A participant pushes a hostile git object (a `.git` tree entry) | received objects are fsck-checked by default (5.2) | none with the default; `fetch.fsckObjects = false` disables it |
 | A crafted `enc::` URL runs a command | the URL goes to git after `--`, and a leading `-` is refused | none known |
 | Secrets leak through tooling | pack keys redacted by default; no passphrase from the environment; secrets wiped from memory (6.5) | swap and core dumps while a secret is live |
@@ -734,10 +767,9 @@ it, is a second flow from the machine to the host that bypasses the helper
   starts at the epoch, from which the generation bound counts (section 6.2).
   A participant could already push a rewrite; `epoch` only lets it be told
   apart from the host's.
-- Local 2× storage: `git fetch --filter=blob:none` of the backend branch and
-  fetching pack blobs on demand would remove it on hosts that support partial
-  clone (GitLab does). Deferred until the simple design has been used in
-  anger.
+- Local 2× storage: the backend repository fetches pack blobs on demand
+  (5.4) but keeps them once indexed. Dropping them after indexing would
+  remove the second copy.
 - Thin packs give cross-push deltas for modified files. Unlike gcrypt, a
   100-byte change to a 1 MB file costs roughly the delta, not 1 MB.
 
@@ -802,13 +834,14 @@ push or fetch, earlier and in one place:
 - **Repo id changed, or the backend branch vanished:** the remote was recreated
   or deleted, or the host is replacing it. The helper refuses: silently
   accepting would defeat the anti-rollback and trust chain. Participants decide
-  on recovery out of band: once they confirm the change, `git-remote-enc forget
-  <remote>` removes the local state and the tracking ref, and the next contact
-  is a first contact, which needs a pinned participant list (section 6.1).
+  on recovery out of band: once they confirm the change, `git-remote-enc
+  forget <remote>` removes the local state and the backend repository, and
+  the next contact is a first contact, which needs a pinned participant list
+  (section 6.1).
 - **Local trust state missing or altered:** the trust file is gone while the
-  tracking ref shows a manifest was accepted, or its tag is missing or does
-  not verify. The helper refuses rather than falling back to a first contact;
-  recovery is the same `forget`.
+  tracking ref or `<key>.known` shows a manifest was accepted, or its tag is
+  missing or does not verify. The helper refuses rather than falling back to
+  a first contact; recovery is the same `forget`.
 - **Not a participant:** age reports no matching key; the helper says so and
   names the identities it tried.
 - **Stale lease three times:** give up with a clear message; the user retries.

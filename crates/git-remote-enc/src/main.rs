@@ -193,9 +193,8 @@ fn repack(target: &str, rewrite_history: bool) -> Result<()> {
     let c = remote.repack(rewrite_history)?;
     let human = enccore::progress::human;
     eprintln!(
-        "enc: repacked {target}: {} packs ({}) into {} ({})",
-        c.before.0,
-        human(c.before.1),
+        "enc: repacked {target}: {} packs into {} ({})",
+        c.before,
         c.after.0,
         human(c.after.1)
     );

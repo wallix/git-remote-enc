@@ -3,8 +3,20 @@
 ## Unreleased
 
 Manifests now use format version 4, which v0.1.0 refuses: every participant
-needs this release once anyone pushes with it.
+needs this release once anyone pushes with it. Existing clones migrate to
+the new local layout on their next fetch or push. Downgrading afterwards
+downloads the whole backend branch again.
 
+- The backend branch is kept in a repository of the helper's own
+  (`.git/enc/<key>/backend.git`), a partial clone: connecting downloads
+  commits and blobs under 1 MiB (manifests, small packs), larger pack blobs
+  when they are indexed. Encrypted blobs and `refs/enc/*` refs no longer
+  land in the user's repository. After migration, a later `git gc` frees the
+  space occupied by encrypted blobs in the user's repository once they
+  expire (`git gc --prune=now` frees it at once). Pack blobs are fetched by
+  id, which needs protocol v2 or `uploadpack.allowAnySHA1InWant` on a host
+  that supports filters. With git older than 2.45, the helper may download
+  pack blobs it did not ask for.
 - Encrypted packs over 1 GiB (`enc.partSize`) are stored as parts, and a
   push over 1 GiB (`enc.uploadBatch`) uploads them in several pushes ahead
   of the manifest.

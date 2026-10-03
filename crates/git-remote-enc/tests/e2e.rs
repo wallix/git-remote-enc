@@ -120,6 +120,8 @@ impl Sandbox {
         self.git_ok(&d, &["init", "-q", "--bare"]);
         // Keep received packs on disk so their sizes can be inspected.
         self.git_ok(&d, &["config", "transfer.unpackLimit", "1"]);
+        // As GitLab and GitHub: clients fetch pack blobs on demand.
+        self.git_ok(&d, &["config", "uploadpack.allowFilter", "true"]);
         d
     }
 
@@ -926,7 +928,18 @@ fn a_refused_identity_fails_before_the_backend_fetch() {
     sb.add_remote(&a, &url, &alice, &[&alice_pub, &bob_pub]);
     sb.git_ok(&a, &["push", "-q", "enc", "main"]);
     let b = sb.clone("bob", &url, &bob);
-    let tracking = || sb.git_ok(&b, &["for-each-ref", "refs/enc/"]);
+    let backend = backend_repo(&b);
+    let tracking = || {
+        sb.git_ok(
+            &b,
+            &[
+                "--git-dir",
+                backend.to_str().unwrap(),
+                "for-each-ref",
+                "refs/enc/",
+            ],
+        )
+    };
     let before = tracking();
     assert!(!before.is_empty());
 
@@ -956,6 +969,7 @@ fn local_trust_state_is_authenticated() {
     let state: Vec<PathBuf> = fs::read_dir(b.join(".git/enc"))
         .unwrap()
         .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
         .collect();
     assert_eq!(state.len(), 1, "{state:?}");
     let trust = state[0].join("trust");
@@ -996,7 +1010,8 @@ fn local_trust_state_is_authenticated() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!state[0].exists());
+    let marker = state[0].with_extension("known");
+    assert!(!state[0].exists() && !marker.exists());
     let err = sb.git_fails(&b, &["fetch", "origin"]);
     assert!(err.contains("no participant list"), "{err}");
     sb.git_ok(
@@ -1008,6 +1023,13 @@ fn local_trust_state_is_authenticated() {
             "origin",
         ],
     );
+
+    // The whole state directory lost, backend repository included: still
+    // refused, the contact is recorded outside it.
+    assert!(marker.exists());
+    fs::remove_dir_all(&state[0]).unwrap();
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(err.contains("trust state for origin"), "{err}");
 
     // The host deletes the branch: not mistaken for a new remote.
     sb.git_ok(&host, &["update-ref", "-d", "refs/heads/enc"]);
@@ -3095,4 +3117,268 @@ fn a_host_refusing_the_rewrite_leaves_the_remote_unchanged() {
         "refs/heads/enc"
     );
     assert_eq!(sb.pack_ids(&a, "enc").len(), 2);
+}
+
+/// The helper's backend repository of the only encrypted remote of `repo`.
+fn backend_repo(repo: &Path) -> PathBuf {
+    let dirs: Vec<PathBuf> = fs::read_dir(repo.join(".git/enc"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path().join("backend.git"))
+        .filter(|p| p.exists())
+        .collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    dirs.into_iter().next().unwrap()
+}
+
+#[test]
+fn the_backend_stays_out_of_the_user_repository() {
+    let sb = Sandbox::new("backend-repo");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_random(&a, "big", 2_000_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let pack_blob = sb
+        .git_ok(&host, &["ls-tree", "refs/heads/enc"])
+        .lines()
+        .find(|l| l.ends_with(".age"))
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_owned();
+
+    let b = sb.clone("bob", &url, &alice);
+    for r in [&a, &b] {
+        assert_eq!(sb.git_ok(r, &["for-each-ref", "refs/enc"]), "");
+        assert!(!sb.git(r, &["cat-file", "-e", &pack_blob]).status.success());
+    }
+    assert_eq!(
+        fs::read(b.join("big")).unwrap(),
+        fs::read(a.join("big")).unwrap()
+    );
+
+    // Listing reads the manifest only: the pack blob stays on the host.
+    let c = sb.repo("carol");
+    sb.git_ok(
+        &c,
+        &[
+            "-c",
+            &format!("enc.identity={}", alice.to_str().unwrap()),
+            "-c",
+            "enc.trustOnFirstUse=true",
+            "ls-remote",
+            &url,
+        ],
+    );
+    let backend = backend_repo(&c);
+    let present = sb
+        .cmd(&c, "git")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .args([
+            "--git-dir",
+            backend.to_str().unwrap(),
+            "cat-file",
+            "-e",
+            &pack_blob,
+        ])
+        .output()
+        .unwrap();
+    assert!(!present.status.success(), "the pack blob was downloaded");
+}
+
+#[test]
+fn transport_settings_of_the_repository_apply_to_the_backend() {
+    let sb = Sandbox::new("insteadof");
+    let host = sb.host();
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    // Only this repository's config knows where `vault:` is.
+    sb.git_ok(
+        &a,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", host.display()),
+            "vault:",
+        ],
+    );
+    sb.add_remote(&a, "enc::vault:", &alice, &[&alice_pub]);
+    sb.commit_text(&a, "f", "x\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.commit_text(&a, "g", "y\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    assert_eq!(
+        sb.git_ok(&host, &["rev-list", "--count", "refs/heads/enc"])
+            .trim(),
+        "2"
+    );
+}
+
+#[test]
+fn a_clone_from_before_the_backend_repository_carries_on() {
+    let sb = Sandbox::new("legacy");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_text(&a, "f", "x\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+
+    // As v0.1.0 left it: the backend branch tracked by a ref of the user's
+    // repository, objects included, and no backend repository.
+    let backend = backend_repo(&b);
+    let key = backend
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let legacy = format!("refs/enc/{key}");
+    sb.git_ok(
+        &b,
+        &[
+            "fetch",
+            "-q",
+            backend.to_str().unwrap(),
+            &format!("refs/enc/tip:{legacy}"),
+        ],
+    );
+    fs::remove_dir_all(&backend).unwrap();
+
+    sb.commit_text(&a, "g", "y\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let out = sb.git(&b, &["pull", "-q", "origin", "main"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    // Still the remote it trusted: no first contact, no rewrite warning.
+    assert!(
+        !err.contains("first contact") && !err.contains("warning"),
+        "{err}"
+    );
+    assert_eq!(fs::read_to_string(b.join("g")).unwrap(), "y\n");
+    assert_eq!(sb.git_ok(&b, &["for-each-ref", "refs/enc"]), "");
+    backend_repo(&b);
+}
+
+#[test]
+fn hosts_without_partial_clone_support_still_work() {
+    let sb = Sandbox::new("no-filter");
+    let host = sb.host();
+    sb.git_ok(&host, &["config", "uploadpack.allowFilter", "false"]);
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_random(&a, "big", 2_000_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+    assert_eq!(
+        fs::read(b.join("big")).unwrap(),
+        fs::read(a.join("big")).unwrap()
+    );
+    sb.commit_text(&b, "g", "y\n");
+    sb.git_ok(&b, &["push", "-q", "origin", "main"]);
+    sb.git_ok(&a, &["pull", "-q", "enc", "main"]);
+}
+
+#[test]
+fn the_backend_repository_has_the_object_format_of_the_user_repository() {
+    let sb = Sandbox::new("object-format");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    // A SHA-1 repository and host, under a SHA-256 default.
+    let push = |file: &str| {
+        sb.commit_text(&a, file, "x\n");
+        let out = sb
+            .cmd(&a, "git")
+            .env("GIT_DEFAULT_HASH", "sha256")
+            .args(["push", "-q", "enc", "main"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    push("f");
+    push("g");
+    let backend = backend_repo(&a);
+    assert_eq!(
+        sb.git_ok(
+            &a,
+            &[
+                "--git-dir",
+                backend.to_str().unwrap(),
+                "rev-parse",
+                "--show-object-format",
+            ],
+        )
+        .trim(),
+        "sha1"
+    );
+    let b = sb.clone("bob", &url, &alice);
+    assert_eq!(fs::read_to_string(b.join("g")).unwrap(), "x\n");
+}
+
+#[test]
+fn a_backend_without_the_pack_blobs_pushes_and_repacks() {
+    let sb = Sandbox::new("no-pack-blobs");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_random(&a, "big", 2_000_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let pack_blob = sb
+        .git_ok(&host, &["ls-tree", "refs/heads/enc"])
+        .lines()
+        .find(|l| l.ends_with(".age"))
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap()
+        .to_owned();
+    let b = sb.clone("bob", &url, &alice);
+    // As a clone from before the backend repository: packs indexed, their
+    // blobs on the host only.
+    fs::remove_dir_all(backend_repo(&b)).unwrap();
+
+    sb.commit_text(&b, "g", "y\n");
+    sb.git_ok(&b, &["push", "-q", "origin", "main"]);
+    let (ok, _, err) = sb.enc(&b, &["repack", "origin"]);
+    assert!(ok, "{err}");
+    assert!(err.contains("2 packs") && err.contains("into 1"), "{err}");
+    let present = sb
+        .cmd(&b, "git")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .args([
+            "--git-dir",
+            backend_repo(&b).to_str().unwrap(),
+            "cat-file",
+            "-e",
+            &pack_blob,
+        ])
+        .output()
+        .unwrap();
+    assert!(!present.status.success(), "the pack blob was downloaded");
+
+    sb.git_ok(&a, &["pull", "-q", "enc", "main"]);
+    assert_eq!(fs::read_to_string(a.join("g")).unwrap(), "y\n");
+    let c = sb.clone("carol", &url, &alice);
+    assert_eq!(
+        fs::read(c.join("big")).unwrap(),
+        fs::read(a.join("big")).unwrap()
+    );
 }
