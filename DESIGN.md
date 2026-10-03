@@ -306,6 +306,9 @@ ignores the individual wants and downloads every pack it has not indexed yet:
 Order matters because `--fix-thin` completes a thin pack with base objects
 that must already be present.
 
+Configured identities are loaded, and a key passphrase asked for, before the
+branch fetch, which on a first clone downloads every pack.
+
 The packs reach the object store through `index-pack` run by the helper, not
 through `git fetch`, which would otherwise check them. The helper therefore
 checks every object as `fetch.fsckObjects` would (a tree entry named `.git`,

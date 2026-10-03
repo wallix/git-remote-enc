@@ -588,7 +588,8 @@ fn doctor(target: &str) -> Result<()> {
     let mut remote = Remote::open(Some(target), &url)?;
     remote.set_install_hook(false);
     let mut keys = Vec::new();
-    if remote.identity_paths().is_empty() {
+    let mut identities_ok = !remote.identity_paths().is_empty();
+    if !identities_ok {
         report(
             &mut ok,
             "identity",
@@ -613,6 +614,7 @@ fn doctor(target: &str) -> Result<()> {
                 })
                 .map_err(|e| format!("{e:#}")),
         };
+        identities_ok &= result.is_ok();
         report(&mut ok, &check, result);
     }
 
@@ -688,8 +690,10 @@ fn doctor(target: &str) -> Result<()> {
                 );
             }
         }
-    } else if let Err(e) = remote.pins() {
-        // Local state left from a remote the host no longer has.
+    } else if identities_ok && let Err(e) = remote.pins() {
+        // Local state remains after the remote disappears. Connecting loads
+        // identities, so skip this check if an identity already failed
+        // to avoid reporting it twice.
         report(&mut ok, "local state", Err(format!("{e:#}")));
     }
     if !ok {

@@ -316,6 +316,10 @@ impl Remote {
         if self.cfg.install_hook {
             crate::guard::ensure_hook()?;
         }
+        // Ask for a key passphrase before a potentially long download.
+        if !self.cfg.identity_paths.is_empty() {
+            self.identities()?;
+        }
         self.tip = self.backend.fetch_tip()?;
         // Every push appends to the backend history; a tip that does not
         // descend from the one seen before means the host rewrote it, and

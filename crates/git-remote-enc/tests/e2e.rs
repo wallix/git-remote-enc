@@ -895,6 +895,33 @@ fn first_contact_needs_a_known_signer() {
 }
 
 #[test]
+fn a_refused_identity_fails_before_the_backend_fetch() {
+    let sb = Sandbox::new("refusedid");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let (bob, bob_pub) = sb.keypair("bob");
+    let a = sb.repo("alice");
+    sb.commit_text(&a, "one", "1\n");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub, &bob_pub]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &bob);
+    let tracking = || sb.git_ok(&b, &["for-each-ref", "refs/enc/"]);
+    let before = tracking();
+    assert!(!before.is_empty());
+
+    sb.commit_text(&a, "two", "2\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let mut perms = fs::metadata(&bob).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+    fs::set_permissions(&bob, perms).unwrap();
+    let err = sb.git_fails(&b, &["fetch", "origin"]);
+    assert!(err.contains("accessible by others"), "{err}");
+    // The new backend tip was not fetched.
+    assert_eq!(tracking(), before);
+}
+
+#[test]
 fn local_trust_state_is_authenticated() {
     let sb = Sandbox::new("truststate");
     let host = sb.host();
