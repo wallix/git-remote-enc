@@ -306,6 +306,12 @@ ignores the individual wants and downloads every pack it has not indexed yet:
 Order matters because `--fix-thin` completes a thin pack with base objects
 that must already be present.
 
+**Progress.** The helper advertises the `option` capability and follows
+git's `option progress`: on for a terminal unless `-q`, or with `--progress`.
+It then shows git's own progress for the backend fetch and push, for
+`pack-objects` and for `index-pack`, and its own meter for verifying pack
+blobs.
+
 Configured identities are loaded, and a key passphrase asked for, before the
 branch fetch, which on a first clone downloads every pack.
 

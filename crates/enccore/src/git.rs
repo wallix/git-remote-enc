@@ -4,8 +4,10 @@
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -118,16 +120,138 @@ where
     Ok(out.stdout)
 }
 
+/// Collects a child's stderr on a thread, so a chatty command (progress
+/// output) never blocks on a full pipe; `tee` also copies its progress lines
+/// to ours as they arrive and leaves them out of the result. Errors are
+/// reported by the caller, and other messages (a host's hints) are not for
+/// the user.
+fn drain_stderr(child: &mut Child, tee: bool) -> Option<JoinHandle<String>> {
+    let mut err = child.stderr.take()?;
+    Some(std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut pending = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match err.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    // Keep the pipe open to EOF: closed, it would kill git
+                    // with SIGPIPE before it writes its error.
+                    let _ = std::io::copy(&mut err, &mut std::io::sink());
+                    break;
+                }
+            };
+            let chunk = buf.get(..n).unwrap_or_default();
+            if !tee {
+                kept.extend_from_slice(chunk);
+                continue;
+            }
+            pending.extend_from_slice(chunk);
+            let (lines, tail) = split_lines(&pending);
+            let mut stderr = std::io::stderr().lock();
+            for line in lines.into_iter().filter_map(|r| pending.get(r)) {
+                if is_meter(line) {
+                    // Best effort: this is progress output.
+                    let _ = stderr.write_all(line);
+                } else {
+                    kept.extend_from_slice(line);
+                }
+            }
+            let _ = stderr.flush();
+            pending.drain(..tail);
+        }
+        kept.append(&mut pending);
+        String::from_utf8_lossy(&kept).into_owned()
+    }))
+}
+
+/// The complete lines of `out`, each with its `\r` or `\n`, and where the
+/// incomplete tail starts.
+fn split_lines(out: &[u8]) -> (Vec<Range<usize>>, usize) {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (i, b) in out.iter().enumerate() {
+        if *b == b'\r' || *b == b'\n' {
+            let end = i.saturating_add(1);
+            lines.push(start..end);
+            start = end;
+        }
+    }
+    (lines, start)
+}
+
+/// Recognizes git's progress meters, including those relayed by the host.
+/// The list is deliberately partial; unrecognized meters stay in the output.
+fn is_meter(line: &[u8]) -> bool {
+    const METERS: [&[u8]; 8] = [
+        b"Enumerating objects",
+        b"Counting objects",
+        b"Compressing objects",
+        b"Writing objects",
+        b"Receiving objects",
+        b"Resolving deltas",
+        b"Unpacking objects",
+        b"Indexing objects",
+    ];
+    let line = line.strip_prefix(b"remote: ").unwrap_or(line);
+    METERS.iter().any(|m| line.starts_with(m))
+}
+
+fn join_stderr(handle: Option<JoinHandle<String>>) -> String {
+    handle.and_then(|h| h.join().ok()).unwrap_or_default()
+}
+
+/// [`run_status`], with git's stderr also shown as it arrives when `tee`:
+/// for `fetch`/`push --progress`.
+pub fn run_status_tee<I, S>(args: I, tee: bool) -> Result<(bool, Vec<u8>, String)>
+where
+    I: IntoIterator<Item = S> + Clone,
+    S: AsRef<OsStr>,
+{
+    let desc = describe(args.clone());
+    let mut child = command(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning `git {desc}`"))?;
+    let stderr = drain_stderr(&mut child, tee);
+    let mut stdout = Vec::new();
+    // Reaped and its stderr collected even when the read fails; the dropped
+    // pipe ends git if it is still writing.
+    let read = child
+        .stdout
+        .take()
+        .map_or(Ok(0), |mut o| o.read_to_end(&mut stdout));
+    let status = child.wait();
+    let stderr = join_stderr(stderr);
+    read.with_context(|| format!("reading `git {desc}`"))?;
+    let status = status.with_context(|| format!("waiting for `git {desc}`"))?;
+    Ok((status.success(), stdout, stderr))
+}
+
 /// A spawned git command whose stdout (or stdin) is consumed as a stream by
 /// the caller. [`Streaming::finish`] reaps it and surfaces a non-zero exit.
 pub struct Streaming {
     child: Child,
     desc: String,
+    stderr: Option<JoinHandle<String>>,
 }
 
 impl Streaming {
     /// Spawn with stdout piped; `input`, if any, is written to stdin first.
     pub fn reader<I, S>(args: I, input: Option<&[u8]>) -> Result<Self>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
+        Self::reader_tee(args, input, false)
+    }
+
+    /// [`Streaming::reader`], showing git's stderr as it arrives when `tee`.
+    pub fn reader_tee<I, S>(args: I, input: Option<&[u8]>, tee: bool) -> Result<Self>
     where
         I: IntoIterator<Item = S> + Clone,
         S: AsRef<OsStr>,
@@ -143,6 +267,7 @@ impl Streaming {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawning `git {desc}`"))?;
+        let stderr = drain_stderr(&mut child, tee);
         if let Some(input) = input {
             child
                 .stdin
@@ -150,7 +275,11 @@ impl Streaming {
                 .ok_or_else(|| anyhow!("no stdin for `git {desc}`"))?
                 .write_all(input)?;
         }
-        Ok(Self { child, desc })
+        Ok(Self {
+            child,
+            desc,
+            stderr,
+        })
     }
 
     /// Spawn with stdin piped for the caller to write into.
@@ -159,14 +288,28 @@ impl Streaming {
         I: IntoIterator<Item = S> + Clone,
         S: AsRef<OsStr>,
     {
+        Self::writer_tee(args, false)
+    }
+
+    /// [`Streaming::writer`], showing git's stderr as it arrives when `tee`.
+    pub fn writer_tee<I, S>(args: I, tee: bool) -> Result<Self>
+    where
+        I: IntoIterator<Item = S> + Clone,
+        S: AsRef<OsStr>,
+    {
         let desc = describe(args.clone());
-        let child = command(args)
+        let mut child = command(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawning `git {desc}`"))?;
-        Ok(Self { child, desc })
+        let stderr = drain_stderr(&mut child, tee);
+        Ok(Self {
+            child,
+            desc,
+            stderr,
+        })
     }
 
     pub fn stdout(&mut self) -> Result<std::process::ChildStdout> {
@@ -189,11 +332,8 @@ impl Streaming {
         if let Some(mut o) = self.child.stdout.take() {
             o.read_to_end(&mut stdout)?;
         }
-        let mut stderr = String::new();
-        if let Some(mut e) = self.child.stderr.take() {
-            e.read_to_string(&mut stderr)?;
-        }
         let status = self.child.wait()?;
+        let stderr = join_stderr(self.stderr.take());
         if !status.success() {
             bail!("`git {}` failed: {}", self.desc, stderr.trim());
         }
@@ -565,5 +705,24 @@ mod tests {
         }
         let out = run_input(["patch-id", "--stable"], log.as_bytes()).unwrap();
         assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 3000);
+    }
+
+    #[test]
+    fn split_lines_keeps_terminators_and_the_tail() {
+        let out = b"Receiving objects:  50%\rReceiving objects: 100%, done.\nremote: Tot";
+        let (lines, tail) = split_lines(out);
+        assert_eq!(lines, [0..24, 24..55]);
+        assert_eq!(&out[tail..], b"remote: Tot");
+        assert_eq!(split_lines(b""), (vec![], 0));
+        assert_eq!(split_lines(b"a\n\r"), (vec![0..2, 2..3], 3));
+    }
+
+    #[test]
+    fn is_meter_matches_local_and_relayed_meters() {
+        assert!(is_meter(b"Writing objects:  10% (1/10)\r"));
+        assert!(is_meter(b"remote: Counting objects: 3, done.\n"));
+        assert!(!is_meter(b"remote: Total 3 (delta 0), reused 0\n"));
+        assert!(!is_meter(b"fatal: couldn't find remote ref enc\n"));
+        assert!(!is_meter(b"remote: remote: Writing objects\n"));
     }
 }

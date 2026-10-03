@@ -4,6 +4,7 @@
 use anyhow::{Result, bail};
 
 use crate::git::{self, Oid, TreeEntry};
+use crate::progress;
 
 pub const DEFAULT_BRANCH: &str = "enc";
 
@@ -29,21 +30,27 @@ impl Backend {
     /// does not exist yet (a new remote); any other failure is an error.
     pub fn fetch_tip(&self) -> Result<Option<Oid>> {
         let refspec = format!("+{}:{}", self.branch, self.tracking_ref);
-        let (ok, _, stderr) = git::run_status([
-            // Fewer than `fetch.unpackLimit` objects (nearly every fetch
-            // here: a few large blobs) are unpacked into loose objects,
-            // deflated by default: slow for ciphertext, and useless.
-            "-c",
-            "core.looseCompression=0",
-            "fetch",
-            "-q",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--no-recurse-submodules",
-            "--",
-            &self.url,
-            &refspec,
-        ])?;
+        let progress = progress::enabled();
+        let (ok, _, stderr) = git::run_status_tee(
+            [
+                // Fewer than `fetch.unpackLimit` objects (nearly every fetch
+                // here: a few large blobs) are unpacked into loose objects,
+                // deflated by default: slow for ciphertext, and useless.
+                "-c",
+                "core.looseCompression=0",
+                "fetch",
+                // `-q` would also silence the download's own meter; without
+                // it, fetch's other output is kept off the terminal.
+                if progress { "--progress" } else { "-q" },
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                "--",
+                &self.url,
+                &refspec,
+            ],
+            progress,
+        )?;
         if !ok {
             if stderr.contains("couldn't find remote ref") {
                 return Ok(None);
@@ -96,22 +103,7 @@ impl Backend {
             expected_old.unwrap_or("")
         );
         let refspec = format!("{commit}:{}", self.branch);
-        // Backend objects are ciphertext: deflating them, or searching them
-        // for deltas, only costs time.
-        let (ok, _, stderr) = git::run_status([
-            "-c",
-            "pack.compression=0",
-            "-c",
-            "pack.window=0",
-            "push",
-            "-q",
-            "--no-verify",
-            "--no-recurse-submodules",
-            &lease,
-            "--",
-            &self.url,
-            &refspec,
-        ])?;
+        let (ok, stderr) = Self::git_push(&[&lease, "--", &self.url, &refspec])?;
         if ok {
             git::update_ref(&self.tracking_ref, commit)?;
             return Ok(PushOutcome::Done);
@@ -122,5 +114,29 @@ impl Backend {
             return Ok(PushOutcome::StaleLease);
         }
         Ok(PushOutcome::Failed(stderr.trim().to_owned()))
+    }
+
+    fn git_push(args: &[&str]) -> Result<(bool, String)> {
+        let progress = progress::enabled();
+        // Backend objects are ciphertext: deflating them, or searching them
+        // for deltas, only costs time.
+        let mut all = vec![
+            "-c",
+            "pack.compression=0",
+            "-c",
+            "pack.window=0",
+            "push",
+            "-q",
+            if progress {
+                "--progress"
+            } else {
+                "--no-progress"
+            },
+            "--no-verify",
+            "--no-recurse-submodules",
+        ];
+        all.extend_from_slice(args);
+        let (ok, _, stderr) = git::run_status_tee(all, progress)?;
+        Ok((ok, stderr))
     }
 }

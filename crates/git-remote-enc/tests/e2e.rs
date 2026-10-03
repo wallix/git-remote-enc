@@ -2120,3 +2120,65 @@ fn doctor_reports_what_would_get_in_the_way() {
         "{out}"
     );
 }
+
+#[test]
+fn progress_follows_git() {
+    let sb = Sandbox::new("progress");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_random(&a, "f", 100_000);
+    let push = |args: &[&str]| {
+        let out = sb.cmd(&a, "git").args(args).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // Completed meters, as git closes them.
+    let done = |err: &str, meter: &str| {
+        err.split(['\r', '\n'])
+            .filter(|l| l.starts_with(meter) && l.ends_with(", done."))
+            .count()
+    };
+    let err = push(&["push", "--progress", "enc", "main"]);
+    // pack-objects, then the backend push.
+    assert_eq!(done(&err, "Writing objects: 100%"), 2, "{err}");
+    // A new remote's missing branch is expected, not reported.
+    assert!(!err.contains("fatal:"), "{err}");
+
+    let id = alice.to_str().unwrap();
+    let clone = |name: &str, flag: &str| {
+        let out = sb
+            .cmd(&sb.root, "git")
+            .args([
+                "-c",
+                &format!("enc.identity={id}"),
+                "-c",
+                "enc.trustOnFirstUse=true",
+                "-c",
+                "enc.installHook=false",
+                // The backend fetch indexes rather than unpacks, so its
+                // meter shows however short the download.
+                "-c",
+                "fetch.unpackLimit=1",
+                "clone",
+                flag,
+                &url,
+                name,
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let err = clone("bob", "--progress");
+    assert!(err.contains("enc: decrypting pack 1/1"), "{err}");
+    // The backend fetch, then index-pack.
+    assert_eq!(done(&err, "Receiving objects: 100%"), 2, "{err}");
+    let err = clone("carol", "-q");
+    assert!(
+        !err.contains("decrypting") && !err.contains("objects"),
+        "{err}"
+    );
+}

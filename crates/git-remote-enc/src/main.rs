@@ -18,6 +18,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
+use enccore::progress;
 use enccore::remote::{HistoryEntry, ParticipantDiff, PushStatus, RefSpec, Remote};
 
 fn main() {
@@ -720,7 +721,21 @@ fn helper(mut remote: Remote) -> Result<()> {
         let line = line?;
         match line.as_str() {
             "capabilities" => {
-                out.write_all(b"fetch\npush\n\n")?;
+                out.write_all(b"fetch\npush\noption\n\n")?;
+            }
+            l if l.starts_with("option ") => {
+                let reply = match l.strip_prefix("option ").and_then(|o| o.split_once(' ')) {
+                    Some(("progress", "true")) => {
+                        progress::set_enabled(true);
+                        "ok"
+                    }
+                    Some(("progress", "false")) => {
+                        progress::set_enabled(false);
+                        "ok"
+                    }
+                    _ => "unsupported",
+                };
+                writeln!(out, "{reply}")?;
             }
             "list" | "list for-push" => {
                 let (refs, head) = remote.list(line == "list for-push")?;

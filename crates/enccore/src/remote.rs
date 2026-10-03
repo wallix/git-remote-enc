@@ -15,6 +15,7 @@ use crate::crypto::{self, HashReader, HashWriter, Identity, Participant, TrustKe
 use crate::git::{self, Oid, Streaming, TreeEntry};
 use crate::info;
 use crate::manifest::{Manifest, Pack, join_envelope, split_envelope};
+use crate::progress::{self, Meter, MeterReader};
 use crate::state::{State, Trust};
 
 const MANIFEST_BLOB: &str = "manifest";
@@ -813,10 +814,8 @@ impl Remote {
             return Ok(());
         };
         let have = self.state.have()?;
-        for pack in &m.packs {
-            if have.contains(&pack.id) {
-                continue;
-            }
+        let todo: Vec<&Pack> = m.packs.iter().filter(|p| !have.contains(&p.id)).collect();
+        for (i, pack) in todo.iter().enumerate() {
             let blob = Backend::blob_oid(&self.tree, &pack.blob_name())
                 .ok_or_else(|| {
                     anyhow!(
@@ -825,21 +824,27 @@ impl Remote {
                     )
                 })?
                 .to_owned();
-            self.index_pack(pack, &blob)?;
+            let label = format!("pack {}/{}", i.saturating_add(1), todo.len());
+            self.index_pack(pack, &blob, &label)?;
             self.state.add_have(&pack.id)?;
         }
         Ok(())
     }
 
-    fn index_pack(&self, pack: &Pack, blob_oid: &str) -> Result<()> {
+    fn index_pack(&self, pack: &Pack, blob_oid: &str, label: &str) -> Result<()> {
         let key = age::x25519::Identity::from_str(&pack.key)
             .map_err(|e| anyhow!("pack {}: bad key in manifest: {e}", pack.id))?;
         // Check the blob against its name before anything reaches the
         // object store: one extra read of a local object.
+        let size = git::object_size(blob_oid)?;
         let mut cat = Streaming::reader(["cat-file", "blob", blob_oid], None)?;
-        let (mut hashed, digest) = HashReader::new(cat.stdout()?);
+        let (mut hashed, digest) = HashReader::new(MeterReader::new(
+            cat.stdout()?,
+            Meter::new(format!("verifying {label}"), Some(size)),
+        ));
         io::copy(&mut hashed, &mut io::sink())
             .with_context(|| format!("reading pack blob {}", pack.id))?;
+        drop(hashed);
         cat.finish()?;
         let got = crypto::finalize_shared(&digest);
         if got != pack.id {
@@ -851,9 +856,16 @@ impl Remote {
 
         let mut cat = Streaming::reader(["cat-file", "blob", blob_oid], None)?;
         let mut plain = crypto::decrypt_stream(&key, BufReader::new(cat.stdout()?))?;
+        let progress = progress::enabled();
+        if progress {
+            info(&format!("decrypting {label} ({})", progress::human(size)));
+        }
         let mut args = vec!["index-pack", "--stdin", "--fix-thin"];
+        if progress {
+            args.push("-v");
+        }
         args.extend(self.cfg.fsck.as_deref());
-        let mut index = Streaming::writer(args)?;
+        let mut index = Streaming::writer_tee(args, progress)?;
         {
             let mut stdin = index.stdin()?;
             io::copy(&mut plain, &mut stdin)
@@ -1214,16 +1226,18 @@ impl Remote {
             revs.push_str(e);
             revs.push('\n');
         }
-        let mut po = Streaming::reader(
+        let progress = progress::enabled();
+        let mut po = Streaming::reader_tee(
             [
                 "pack-objects",
                 "--revs",
                 "--thin",
                 "--stdout",
-                "-q",
+                if progress { "--all-progress" } else { "-q" },
                 "--delta-base-offset",
             ],
             Some(revs.as_bytes()),
+            progress,
         )?;
         let mut out = po.stdout()?;
         let mut header = [0u8; 12];

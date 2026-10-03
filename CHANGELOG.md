@@ -4,6 +4,8 @@
 
 - Faster clone, fetch and push of large repositories: encrypted data is no
   longer compressed or delta-searched locally.
+- Progress for the slow steps (backend download and upload, packing,
+  verifying and indexing packs), following git's `--progress`/`-q`.
 - The key passphrase is asked for before the download from the remote, not
   after it. Even against a remote nobody has pushed to yet, the identities
   must now be readable, including the default one (`~/.ssh/id_ed25519`, or
