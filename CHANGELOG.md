@@ -20,10 +20,12 @@ downloads the whole backend branch again.
 - Encrypted packs over 1 GiB (`enc.partSize`) are stored as parts, and a
   push over 1 GiB (`enc.uploadBatch`) uploads them in several pushes ahead
   of the manifest.
-- `git-remote-enc repack <remote>` merges every pack into one.
-  `--rewrite-history` also replaces the backend history so the host can
-  reclaim the old blobs; the manifest records the rewrite (`epoch`), so
-  participants are not warned of a host rewrite.
+- `git-remote-enc repack <remote>` replaces every pack by a snapshot of the
+  ref tips and a pack of the history behind them (named in the manifest's
+  `snapshot` item, for shallow clones). `--rewrite-history` also replaces
+  the backend history so the host can reclaim the old blobs; the manifest
+  records the rewrite (`epoch`), so participants are not warned of a host
+  rewrite.
 - Faster clone, fetch and push of large repositories: encrypted data is no
   longer compressed or delta-searched locally.
 - Progress for the slow steps (backend download and upload, packing,

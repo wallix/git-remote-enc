@@ -2800,6 +2800,9 @@ fn repack_merges_the_packs_in_place() {
     sb.git_ok(&a, &["push", "-q", "enc", "tmp"]);
     sb.git_ok(&a, &["push", "-q", "enc", ":tmp"]);
     sb.git_ok(&a, &["checkout", "-q", "main"]);
+    // An annotated tag on an older commit: the snapshot holds it, peeled.
+    sb.git_ok(&a, &["tag", "-a", "-m", "v1", "v1", "main~2"]);
+    sb.git_ok(&a, &["push", "-q", "enc", "v1"]);
     let b = sb.clone("bob", &url, &alice);
     let commits = |host: &Path| -> u32 {
         sb.git_ok(host, &["rev-list", "--count", "refs/heads/enc"])
@@ -2811,14 +2814,49 @@ fn repack_merges_the_packs_in_place() {
 
     let (ok, _, err) = sb.enc(&a, &["repack", "enc"]);
     assert!(ok, "{err}");
-    assert!(err.contains("4 packs") && err.contains("into 1"), "{err}");
+    // A snapshot of the tips, and the history behind them.
+    assert!(err.contains("5 packs") && err.contains("into 2"), "{err}");
     let tree = sb.git_ok(&host, &["ls-tree", "refs/heads/enc"]);
-    assert_eq!(tree.lines().count(), 2, "{tree}");
+    assert_eq!(tree.lines().count(), 3, "{tree}");
     assert_eq!(commits(&host), before + 1);
+    let m = sb.enc_ok(&a, &["manifest", "enc"]);
+    let tip = sb.git_ok(&a, &["rev-parse", "main"]);
+    let snapshot = m.lines().find(|l| l.starts_with("snapshot ")).unwrap();
+    let first_pack = m.lines().find(|l| l.starts_with("pack ")).unwrap();
+    assert_eq!(
+        snapshot.split(' ').nth(1),
+        first_pack.split(' ').nth(1),
+        "{m}"
+    );
+    let tagged = sb.git_ok(&a, &["rev-parse", "v1^{commit}"]);
+    let mut want = vec![tip.trim(), tagged.trim()];
+    want.sort_unstable();
+    let second_pack = m.lines().filter(|l| l.starts_with("pack ")).nth(1).unwrap();
+    assert_eq!(
+        snapshot.split(' ').nth(2),
+        second_pack.split(' ').nth(1),
+        "{m}"
+    );
+    assert_eq!(snapshot.split(' ').skip(3).collect::<Vec<_>>(), want, "{m}");
 
     // Existing clones carry on, in both directions.
     sb.commit_text(&b, "b", "b\n");
     sb.git_ok(&b, &["push", "-q", "origin", "main"]);
+    // Later pushes, and participant changes, carry the snapshot forward.
+    let snapshot_now = || {
+        let m = sb.enc_ok(&a, &["manifest", "enc"]);
+        m.lines()
+            .find(|l| l.starts_with("snapshot "))
+            .map(str::to_owned)
+    };
+    assert_eq!(snapshot_now().as_deref(), Some(snapshot));
+    let (_, dave_pub) = sb.keypair("dave");
+    sb.git_ok(
+        &a,
+        &["config", "--add", "remote.enc.enc-participants", &dave_pub],
+    );
+    sb.enc_ok(&a, &["participants", "--apply", "enc"]);
+    assert_eq!(snapshot_now().as_deref(), Some(snapshot));
     let out = sb.git(&a, &["pull", "-q", "enc", "main"]);
     assert!(
         out.status.success(),
@@ -2833,6 +2871,10 @@ fn repack_merges_the_packs_in_place() {
         fs::read(a.join("f0")).unwrap()
     );
     assert_eq!(fs::read_to_string(c.join("b")).unwrap(), "b\n");
+    assert_eq!(
+        sb.git_ok(&c, &["rev-parse", "v1^{commit}"]),
+        sb.git_ok(&a, &["rev-parse", "v1^{commit}"])
+    );
     assert!(
         !sb.git(&c, &["cat-file", "-e", gone.trim()])
             .status
@@ -2840,10 +2882,114 @@ fn repack_merges_the_packs_in_place() {
     );
     let log = sb.enc_ok(&c, &["log", "origin"]);
     assert!(
-        log.contains("repacked: its pack replaces all earlier ones"),
+        log.contains("repacked: its packs replace all earlier ones"),
         "{log}"
     );
     assert!(!log.contains("warning"), "{log}");
+}
+
+#[test]
+fn repack_of_a_single_commit_has_no_history_pack() {
+    let sb = Sandbox::new("repack-single");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_text(&a, "f", "f\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.git_ok(&a, &["push", "-q", "enc", "main:other"]);
+
+    let (ok, _, err) = sb.enc(&a, &["repack", "enc"]);
+    assert!(ok, "{err}");
+    assert!(err.contains("into 1"), "{err}");
+    let m = sb.enc_ok(&a, &["manifest", "enc"]);
+    let tip = sb.git_ok(&a, &["rev-parse", "main"]);
+    let pack = m.lines().find(|l| l.starts_with("pack ")).unwrap();
+    assert_eq!(
+        m.lines().filter(|l| l.starts_with("pack ")).count(),
+        1,
+        "{m}"
+    );
+    assert_eq!(
+        m.lines().find(|l| l.starts_with("snapshot ")),
+        Some(&*format!(
+            "snapshot {} - {}",
+            pack.split(' ').nth(1).unwrap(),
+            tip.trim()
+        )),
+        "{m}"
+    );
+    let c = sb.clone("carol", &url, &alice);
+    assert_eq!(fs::read_to_string(c.join("f")).unwrap(), "f\n");
+}
+
+#[test]
+fn repack_uploads_its_packs_in_shared_batches() {
+    let sb = Sandbox::new("repack-batched");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    // One file rewritten: the snapshot holds its last version, the history
+    // the two before.
+    for _ in 0..3 {
+        sb.commit_random(&a, "f", 40_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    // Two whole parts per batch: the snapshot's last part shares one with
+    // the history's first.
+    sb.git_ok(&a, &["config", "enc.partSize", "16k"]);
+    sb.git_ok(&a, &["config", "enc.uploadBatch", "36k"]);
+
+    let (ok, _, err) = sb.enc(&a, &["repack", "enc"]);
+    assert!(ok, "{err}");
+    let m = sb.enc_ok(&a, &["manifest", "enc"]);
+    let packs: Vec<&str> = m
+        .lines()
+        .filter_map(|l| l.strip_prefix("pack "))
+        .map(|l| l.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(packs.len(), 2, "{m}");
+    let snapshot = m.lines().find(|l| l.starts_with("snapshot ")).unwrap();
+    assert_eq!(
+        snapshot.split(' ').take(3).collect::<Vec<_>>(),
+        ["snapshot", packs[0], packs[1]],
+        "{m}"
+    );
+    assert_eq!(
+        sb.git_ok(&host, &["for-each-ref", "--format=%(refname)"])
+            .trim(),
+        "refs/heads/enc"
+    );
+    // A staging commit carries parts of both packs.
+    let commits = sb.git_ok(&host, &["rev-list", "refs/heads/enc"]);
+    let spans = commits.lines().any(|c| {
+        let added = sb.git_ok(
+            &host,
+            &[
+                "diff-tree",
+                "-r",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "--diff-filter=A",
+                c,
+            ],
+        );
+        packs
+            .iter()
+            .all(|p| added.lines().any(|n| n.starts_with(&format!("{p}.age."))))
+    });
+    assert!(spans, "{commits}");
+
+    let c = sb.clone("carol", &url, &alice);
+    assert_eq!(
+        fs::read(c.join("f")).unwrap(),
+        fs::read(a.join("f")).unwrap()
+    );
+    assert_eq!(sb.git_ok(&c, &["rev-list", "--count", "main"]).trim(), "3");
 }
 
 #[test]
@@ -3026,9 +3172,12 @@ fn a_repack_that_lost_a_race_reuses_its_pack_for_the_same_refs() {
     let enc = enc_updates(&log);
     assert_eq!(enc.len(), 3, "{enc:?}");
     assert_eq!(enc[0], enc[2], "{enc:?}");
+    // The snapshot and history packs of the first attempt.
     let ids = sb.pack_ids(&a, "enc");
-    assert_eq!(ids.len(), 1, "{ids:?}");
-    assert!(enc[0].contains(&format!("{}.age", ids[0])), "{enc:?}");
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    for id in &ids {
+        assert!(enc[0].contains(&format!("{id}.age")), "{enc:?}");
+    }
     assert!(
         sb.enc_ok(&a, &["manifest", "enc"]).contains(&carol_pub),
         "the racer's participant change is kept"
@@ -3081,10 +3230,10 @@ fn a_repack_reported_failed_after_it_landed_is_done() {
     let (ok, _, err) = sb.enc(&a, &["repack", "enc"]);
     assert!(ok, "{err}");
     assert!(mark.exists() && err.contains("retrying"), "{err}");
-    assert!(err.contains("into 1"), "{err}");
+    assert!(err.contains("into 2"), "{err}");
     // Not repacked a second time.
     assert_eq!(commits(), before + 1);
-    assert_eq!(sb.pack_ids(&a, "enc").len(), 1);
+    assert_eq!(sb.pack_ids(&a, "enc").len(), 2);
     let c = sb.clone("carol", &url, &alice);
     assert_eq!(
         fs::read(c.join("f1")).unwrap(),
@@ -3359,7 +3508,7 @@ fn a_backend_without_the_pack_blobs_pushes_and_repacks() {
     sb.git_ok(&b, &["push", "-q", "origin", "main"]);
     let (ok, _, err) = sb.enc(&b, &["repack", "origin"]);
     assert!(ok, "{err}");
-    assert!(err.contains("2 packs") && err.contains("into 1"), "{err}");
+    assert!(err.contains("2 packs") && err.contains("into 2"), "{err}");
     let present = sb
         .cmd(&b, "git")
         .env("GIT_NO_LAZY_FETCH", "1")

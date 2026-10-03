@@ -154,6 +154,7 @@ pack a3c1...20 AGE-SECRET-KEY-1K7W...
 | `generation <n>` | strictly increasing per push; anti-rollback (section 6.2) |
 | `time <unix seconds>` | when the pusher wrote it, by the pusher's clock; for the audit trail only, never for trust decisions. New in version 2 |
 | `previous <sha256>` | hex SHA-256 of the previous generation's manifest text; absent on a remote's first manifest. Chains the history so the accepted manifest authenticates every one before it (section 6.6). New in version 3 |
+| `snapshot <pack> <history pack or -> <commit>…` | the pack of the last repack that holds the ref tips of then, each with its whole tree and no parents; the pack holding the rest of the history; and the snapshot's commits (section 7). Every pack but the history pack usually makes a shallow clone with those commits as its boundary; a pack or ref that needs objects or commits older than the snapshot needs the history pack too. Carried forward by every push. New in version 4 |
 | `epoch <generation>` | the generation the backend history starts at since a participant rewrote it (section 7); at most `generation`, carried forward by every push. New in version 4 |
 | `repo <hex>` | random id chosen at creation; detects a recreated remote |
 | `head <ref>` | what `HEAD` points to on clone (first pushed branch by default) |
@@ -167,9 +168,10 @@ Pack lines are ordered: a pack may be *thin* relative to every pack before it,
 so a reader indexes them in manifest order (section 5.2).
 
 A reader refuses a manifest that repeats `generation`, `time`, `previous`,
-`repo` or `head`, lists one ref name or one pack twice, or names a ref (in
-`ref` or `head`) that `git check-ref-format` would refuse or that does not
-start with `refs/`.
+`epoch`, `snapshot`, `repo` or `head`, lists one ref name or one pack twice,
+names a ref (in `ref` or `head`) that `git check-ref-format` would refuse or
+that does not start with `refs/`, or has a `snapshot` naming a pack it does
+not list.
 
 A reader holds the manifest in memory to decrypt and verify it, before it
 can tell who wrote it, so it refuses a manifest blob over 64 MiB (about
@@ -294,13 +296,13 @@ for-push`.
    already lists it (our push landed although git reported a failure; it is
    recorded as indexed), already holds every pushed tip, or a repack has
    dropped a pack it was built against. Their pack is still valid too. A
-   repack's pack (section 7) is not thin: it is kept whenever the refs are
-   unchanged, and a repack whose pack the new manifest lists alone has
-   landed and is done. The lease is checked by the client (`stale info`)
-   and enforced again by the server (old value mismatch); any rejection
-   after which the branch tip has moved is treated as a lost race, anything
-   else as a hard error.
-8. Move the tracking ref to the new commit, record the new pack as indexed
+   repack's packs (section 7) are not thin: they are kept whenever the refs
+   are unchanged, and a repack whose packs are exactly those the new
+   manifest lists has landed and is done. The lease is checked by the client
+   (`stale info`) and enforced again by the server (old value mismatch); any
+   rejection after which the branch tip has moved is treated as a lost race,
+   anything else as a hard error.
+8. Move the tracking ref to the new commit, record the new packs as indexed
    locally (its objects are ours), report `ok <dst>` per ref.
 
 The lease makes concurrent pushes safe: the manifest we replace is provably the
@@ -750,12 +752,20 @@ it, is a second flow from the machine to the host that bypasses the helper
   thousands of entries fine, but a very active repository may want
   **repacking**, `git-remote-enc repack <remote>`: index every pack, pack
   exactly what the manifest refs reach (objects only deleted refs reached are
-  dropped; the object count is checked against `rev-list --objects`), encrypt
-  it, and push a new generation listing only that pack, in a tree holding only
-  it and the manifest. Participants see an ordinary push, but its pack id is
-  in no other clone's `have`: every other participant's next fetch downloads
-  the whole repacked repository. It is explicit, never automatic, so a push
-  never surprises anyone with a full re-upload.
+  dropped) as two packs, and push a new generation listing only them, in a
+  tree holding only them and the manifest. The first, the **snapshot**, holds
+  the ref tips with their whole trees and no history (`rev-list --objects
+  --no-walk`, tags peeled), and the manifest's `snapshot` item names it and
+  the commits it holds; the second holds the rest. Neither is thin, and
+  together they must hold as many objects as `rev-list --objects` lists, or
+  nothing is pushed. Later pushes are thin against the refs, so the snapshot
+  and the packs after the history pack usually make a shallow clone; a pack
+  or ref that needs objects or commits older than the snapshot (a branch
+  forked from an older commit, a delta against an older object) needs the
+  history pack too. Participants see an ordinary push, but its pack ids are
+  in no other clone's `have`: every other participant's next fetch
+  downloads the whole repacked repository. It is explicit, never automatic,
+  so a push never surprises anyone with a full re-upload.
 - The old blobs stay reachable from the backend history. `repack
   --rewrite-history` makes the new commit descend from none of the old
   history instead (a root, or on top of its own staging chain; a forced update

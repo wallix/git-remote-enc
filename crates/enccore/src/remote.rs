@@ -14,7 +14,7 @@ use crate::config::Config;
 use crate::crypto::{self, HashReader, HashWriter, Identity, Participant, TrustKey};
 use crate::git::{self, Oid, Streaming, TreeEntry};
 use crate::info;
-use crate::manifest::{Manifest, Pack, join_envelope, split_envelope};
+use crate::manifest::{Manifest, Pack, Snapshot, join_envelope, split_envelope};
 use crate::parts::{self, BlobChain, PartWriter};
 use crate::progress::{self, Meter, MeterReader};
 use crate::state::{State, Trust};
@@ -976,7 +976,8 @@ impl Remote {
         self.push_with(specs, Op::Push)
     }
 
-    /// Replace every pack with one holding exactly what the refs reach, as a
+    /// Replace every pack with a snapshot of the ref tips and a pack of the
+    /// history behind them, together exactly what the refs reach, as a
     /// new generation; with `rewrite_history`, as a commit descending from
     /// none of the backend history, so the host can drop the old blobs.
     /// DESIGN.md §7.
@@ -992,7 +993,7 @@ impl Remote {
                 rewrite: rewrite_history,
             },
         )?;
-        // The new pack's blobs are local; the old ones may not be, so only
+        // The new packs' blobs are local; the old ones may not be, so only
         // their count is reported.
         let mut bytes = 0u64;
         for (_, ty, oid, name) in &self.tree {
@@ -1060,7 +1061,15 @@ impl Remote {
         bail!("the remote kept changing under us; retry the push")
     }
 
-    /// Delete a staged pack's upload branch from the host, if it has one.
+    /// Record a landed push's packs as indexed: their objects are ours.
+    fn add_haves(&self, staged: &Staged) -> Result<()> {
+        staged
+            .packs
+            .iter()
+            .try_for_each(|p| self.state.add_have(&p.id))
+    }
+
+    /// Delete staged packs' upload branch from the host, if they have one.
     fn discard(&self, staged: Staged) {
         if let Some(branch) = &staged.upload_branch
             && let Err(e) = self.backend.delete_upload(branch)
@@ -1235,18 +1244,21 @@ impl Remote {
             return Ok(Some(statuses));
         }
 
-        // A losing attempt's pack. Landed (the manifest lists it although
-        // git reported a failure): its objects are ours, so no fetch
-        // downloads it, and listing it again would make the manifest
-        // unreadable; a landed repack is done. Otherwise it is reused below
-        // for the same wants unless every pushed tip is already a ref
-        // (someone pushed the same tips: it would be redundant) or a repack
-        // has since dropped a pack it is thin against. A repack's pack is
-        // not thin: the same refs are enough.
+        // An attempt's packs land in one manifest, even if git reports failure.
+        // Their objects are local: mark them indexed to avoid downloading them.
+        // Listing them again would make the manifest unreadable. A repack is
+        // done if its packs are still the only ones listed. Otherwise reuse
+        // unlisted packs for the same wants, unless every pushed tip is already
+        // a ref (another push made them redundant) or a repack dropped a pack
+        // they are thin against. A repack's packs are not thin: unchanged refs
+        // suffice for reuse.
+        let listed = |id: &str| m.packs.iter().any(|p| p.id == id);
         let staged = match self.staged.take() {
-            Some(s) if m.packs.iter().any(|p| p.id == s.id) => {
-                let done = repack.is_some() && matches!(m.packs.as_slice(), [p] if p.id == s.id);
-                let added = self.state.add_have(&s.id);
+            Some(s) if s.packs.iter().any(|p| listed(&p.id)) => {
+                let done = repack.is_some()
+                    && m.packs.len() == s.packs.len()
+                    && s.packs.iter().all(|p| listed(&p.id));
+                let added = self.add_haves(&s);
                 self.discard(s);
                 added?;
                 if done {
@@ -1261,7 +1273,7 @@ impl Remote {
         if let Some(u) = usage {
             self.repack_before.get_or_insert(u);
         }
-        // The new pack is built from local objects: every pack must be
+        // The new packs are built from local objects: every pack must be
         // indexed here first.
         if repack.is_some() {
             self.fetch()?;
@@ -1315,44 +1327,38 @@ impl Remote {
                     || (wants.iter().any(|w| !known.contains(w))
                         && s.bases.iter().all(|b| m.packs.iter().any(|p| &p.id == b))))
         };
-        let pack = match staged {
+        let staged = match staged {
             Some(s) if reusable(&s) => Some(s),
             old => {
                 if let Some(old) = old {
                     self.discard(old);
                 }
-                if wants.is_empty() {
+                let bases = m.packs.iter().map(|p| p.id.clone()).collect();
+                let built = if wants.is_empty() {
+                    vec![]
+                } else if repack.is_some() {
+                    self.build_snapshot_and_history(&wants)?
+                } else {
+                    self.build_pack(&wants, &excludes, true)?
+                        .into_iter()
+                        .map(|p| (p, None))
+                        .collect()
+                };
+                if built.is_empty() {
                     None
                 } else {
-                    let bases = m.packs.iter().map(|p| p.id.clone()).collect();
-                    let built = self.build_pack(&wants, &excludes, repack.is_none())?;
-                    // The old packs are about to be dropped: the new one
-                    // must hold every object the refs reach.
-                    if repack.is_some()
-                        && let Some(b) = &built
-                    {
-                        let reachable = git::count_objects(&wants)?;
-                        if u64::from(b.count) != reachable {
-                            bail!(
-                                "the new pack holds {} objects but the refs reach {reachable}; \
-                                 nothing was changed",
-                                b.count
-                            );
-                        }
-                    }
-                    built
-                        .map(|p| self.stage(p, sorted_wants, bases))
-                        .transpose()?
+                    Some(self.stage(built, sorted_wants, bases)?)
                 }
             }
         };
         // Held by `self` from here on, so whatever ends this attempt, its
         // upload branch is deleted (`push_with`) or reused (a lost race).
-        self.staged = pack;
-        let pack = self
+        self.staged = staged;
+        let new_packs: Vec<StagedPack> = self
             .staged
             .as_ref()
-            .map(|p| (p.id.clone(), p.key.clone(), p.blobs.clone()));
+            .map(|s| s.packs.clone())
+            .unwrap_or_default();
 
         m.generation = m
             .generation
@@ -1382,14 +1388,24 @@ impl Remote {
         m.admins = admin_texts;
         if repack.is_some() {
             m.packs.clear();
+            m.snapshot = new_packs.iter().find_map(|p| {
+                p.snapshot.clone().map(|commits| Snapshot {
+                    pack: p.id.clone(),
+                    history: new_packs
+                        .iter()
+                        .find(|h| h.snapshot.is_none())
+                        .map(|h| h.id.clone()),
+                    commits,
+                })
+            });
         }
         if repack == Some(true) {
             m.epoch = Some(m.generation);
         }
-        if let Some((id, key, _)) = &pack {
+        for p in &new_packs {
             m.packs.push(Pack {
-                id: id.clone(),
-                key: String::clone(key),
+                id: p.id.clone(),
+                key: String::clone(&p.key),
             });
         }
 
@@ -1401,8 +1417,8 @@ impl Remote {
             MANIFEST_BLOB.to_owned(),
             self.backend.hash_object(&manifest_blob)?,
         )];
-        if let Some((_, _, blobs)) = &pack {
-            upserts.extend(blobs.iter().cloned());
+        for p in &new_packs {
+            upserts.extend(p.blobs.iter().cloned());
         }
         let upload = self.staged.as_ref().and_then(|s| s.upload_tip.clone());
         let commit = match repack {
@@ -1439,9 +1455,9 @@ impl Remote {
                 bail!("pushing to {}: {stderr}", self.backend.url)
             }
             PushOutcome::Done => {
-                if let Some(p) = self.staged.take() {
-                    let added = self.state.add_have(&p.id);
-                    self.discard(p);
+                if let Some(s) = self.staged.take() {
+                    let added = self.add_haves(&s);
+                    self.discard(s);
                     added?;
                 }
                 self.save_trust(&trust_in(&m, &text, Some(&commit)))?;
@@ -1490,18 +1506,27 @@ impl Remote {
             revs.push_str(e);
             revs.push('\n');
         }
+        let mut args = vec!["--revs"];
+        if thin {
+            args.push("--thin");
+        }
+        self.pack_objects(&args, revs.as_bytes(), 0)
+    }
+
+    /// `pack-objects --stdout` with `args` and `input`, encrypted to a fresh
+    /// key into temp files of at most `part_size` bytes, named after `slot`:
+    /// packs built before any is stored need distinct slots. `None` for an
+    /// empty pack.
+    fn pack_objects(&self, args: &[&str], input: &[u8], slot: usize) -> Result<Option<BuiltPack>> {
         let progress = progress::enabled();
-        let mut args = vec![
+        let mut all = vec![
             "pack-objects",
-            "--revs",
             "--stdout",
             if progress { "--all-progress" } else { "-q" },
             "--delta-base-offset",
         ];
-        if thin {
-            args.push("--thin");
-        }
-        let mut po = Streaming::reader_tee(args, Some(revs.as_bytes()), progress)?;
+        all.extend_from_slice(args);
+        let mut po = Streaming::reader_tee(all, Some(input), progress)?;
         let mut out = po.stdout()?;
         let mut header = [0u8; 12];
         out.read_exact(&mut header)
@@ -1517,7 +1542,10 @@ impl Remote {
         }
 
         let key = age::x25519::Identity::generate();
-        let writer = PartWriter::new(&self.state.temp_path("pack"), self.cfg.part_size);
+        let writer = PartWriter::new(
+            &self.state.temp_path(&format!("pack-{slot}")),
+            self.cfg.part_size,
+        );
         let mut enc = crypto::encrypt_stream(&key.to_public(), HashWriter::new(writer))?;
         enc.write_all(&header)?;
         io::copy(&mut out, &mut enc).context("encrypting pack")?;
@@ -1533,49 +1561,160 @@ impl Remote {
         Ok(Some(built))
     }
 
-    /// Store a built pack's parts as blobs and, when they exceed one upload
+    /// A repack's packs: one holding every ref tip with its whole tree and
+    /// no history (the snapshot, with the commits it holds), then one with
+    /// the rest of what the refs reach. Neither is thin.
+    fn build_snapshot_and_history(
+        &self,
+        tips: &[Oid],
+    ) -> Result<Vec<(BuiltPack, Option<Vec<Oid>>)>> {
+        let input = {
+            let mut s = tips.join("\n");
+            s.push('\n');
+            s
+        };
+        let snapshot = git::run_input(
+            ["rev-list", "--objects", "--no-walk", "--stdin"],
+            input.as_bytes(),
+        )?;
+        let mut in_snapshot = std::collections::HashSet::new();
+        for line in snapshot.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+            in_snapshot.insert(oid_key(line)?);
+        }
+        // Streamed: the whole object list is the largest thing a repack
+        // reads, and it is not held twice.
+        let mut rl =
+            Streaming::reader(["rev-list", "--objects", "--stdin"], Some(input.as_bytes()))?;
+        let mut history = Vec::new();
+        let mut reachable: u64 = 0;
+        let mut line = Vec::new();
+        let mut out = BufReader::new(rl.stdout()?);
+        loop {
+            line.clear();
+            if io::BufRead::read_until(&mut out, b'\n', &mut line)? == 0 {
+                break;
+            }
+            if line == b"\n" {
+                continue;
+            }
+            reachable = reachable.saturating_add(1);
+            if !in_snapshot.contains(&oid_key(&line)?) {
+                history.extend_from_slice(&line);
+                if !line.ends_with(b"\n") {
+                    history.push(b'\n');
+                }
+            }
+        }
+        drop(out);
+        rl.finish()?;
+        // The commits the tips name, tags peeled.
+        let mut peel = String::new();
+        for t in tips {
+            peel.push_str(&format!("{t}^{{commit}}\n"));
+        }
+        let peeled = git::run_input(
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            peel.as_bytes(),
+        )?;
+        let mut commits: Vec<Oid> = String::from_utf8(peeled)
+            .context("cat-file output is not UTF-8")?
+            .lines()
+            .filter_map(|l| l.strip_suffix(" commit").map(str::to_owned))
+            .collect();
+        commits.sort_unstable();
+        commits.dedup();
+
+        let mut built = Vec::new();
+        if let Some(p) = self.pack_objects(&[], &snapshot, 0)? {
+            built.push((p, Some(commits)));
+        }
+        if !history.is_empty()
+            && let Some(p) = self.pack_objects(&[], &history, 1)?
+        {
+            built.push((p, None));
+        }
+        // The old packs are about to be dropped: the new ones must hold
+        // every object the refs reach.
+        let packed = built
+            .iter()
+            .fold(0u64, |n, (p, _)| n.saturating_add(u64::from(p.count)));
+        if packed != reachable {
+            bail!(
+                "the new packs hold {packed} objects but the refs reach {reachable}; nothing was changed"
+            );
+        }
+        Ok(built)
+    }
+
+    /// Store built packs' parts as blobs and, when they exceed one upload
     /// batch, push them ahead of the manifest on a branch of their own, a
     /// batch at a time: the final push then sends only the manifest.
-    fn stage(&self, built: BuiltPack, wants: Vec<Oid>, bases: Vec<String>) -> Result<Staged> {
-        let names: Vec<String> = if built.paths.len() == 1 {
-            vec![format!("{}.age", built.id)]
-        } else {
-            (0..built.paths.len())
-                .map(|n| parts::part_name(&built.id, n))
-                .collect()
-        };
-        let sizes = built
-            .paths
+    fn stage(
+        &self,
+        built: Vec<(BuiltPack, Option<Vec<Oid>>)>,
+        wants: Vec<Oid>,
+        bases: Vec<String>,
+    ) -> Result<Staged> {
+        let mut packs = Vec::new();
+        let mut sizes = Vec::new();
+        let total = built
             .iter()
+            .flat_map(|(b, _)| &b.paths)
             .map(|p| Ok(std::fs::metadata(p)?.len()))
-            .collect::<Result<Vec<u64>>>()?;
-        let total = sizes.iter().fold(0u64, |a, s| a.saturating_add(*s));
-        let mut meter = Meter::new("storing pack", Some(total));
-        let mut blobs = Vec::new();
-        for ((name, path), size) in names.into_iter().zip(&built.paths).zip(&sizes) {
-            blobs.push((name, self.backend.hash_object_file(path)?));
-            // Best effort: the blob is in the object store now.
-            let _ = std::fs::remove_file(path);
-            meter.add(*size);
+            .collect::<Result<Vec<u64>>>()?
+            .iter()
+            .fold(0u64, |a, s| a.saturating_add(*s));
+        let label = if built.len() == 1 {
+            "storing pack"
+        } else {
+            "storing packs"
+        };
+        let mut meter = Meter::new(label, Some(total));
+        for (b, snapshot) in built {
+            let names: Vec<String> = if b.paths.len() == 1 {
+                vec![format!("{}.age", b.id)]
+            } else {
+                (0..b.paths.len())
+                    .map(|n| parts::part_name(&b.id, n))
+                    .collect()
+            };
+            let mut blobs = Vec::new();
+            for (name, path) in names.into_iter().zip(&b.paths) {
+                let size = std::fs::metadata(path)?.len();
+                blobs.push((name, self.backend.hash_object_file(path)?));
+                // Best effort: the blob is in the object store now.
+                let _ = std::fs::remove_file(path);
+                meter.add(size);
+                sizes.push(size);
+            }
+            packs.push(StagedPack {
+                id: b.id.clone(),
+                key: b.key.clone(),
+                blobs,
+                snapshot,
+            });
         }
         meter.finish();
 
         let mut staged = Staged {
             wants,
             bases,
-            id: built.id.clone(),
-            key: built.key.clone(),
-            blobs,
+            packs,
             upload_branch: None,
             upload_tip: None,
         };
+        let all_blobs: Vec<(String, Oid)> = staged
+            .packs
+            .iter()
+            .flat_map(|p| p.blobs.iter().cloned())
+            .collect();
         let batch = self.cfg.upload_batch;
-        if batch == 0 || total <= batch || staged.blobs.len() < 2 {
+        if batch == 0 || total <= batch || all_blobs.len() < 2 {
             return Ok(staged);
         }
         // Batches of whole parts, each at most `batch` bytes or one part.
         let mut batches: Vec<(Vec<(String, Oid)>, u64)> = Vec::new();
-        for (blob, size) in staged.blobs.iter().zip(&sizes) {
+        for (blob, size) in all_blobs.iter().zip(&sizes) {
             match batches.last_mut() {
                 Some((b, len)) if len.saturating_add(*size) <= batch => {
                     b.push(blob.clone());
@@ -1588,7 +1727,7 @@ impl Remote {
         for (i, (batch, len)) in batches.iter().enumerate() {
             if progress::enabled() {
                 info(&format!(
-                    "uploading pack {}, batch {}/{} ({})",
+                    "uploading {}, batch {}/{} ({})",
                     progress::human(total),
                     i.saturating_add(1),
                     batches.len(),
@@ -1755,6 +1894,25 @@ fn unpinned_hint(cfg: &Config) -> &'static str {
     }
 }
 
+/// Parse a `rev-list --objects` line's leading id into a compact binary set
+/// key for SHA-1 or SHA-256.
+fn oid_key(line: &[u8]) -> Result<[u8; 32]> {
+    let hex = line
+        .split(|b| matches!(b, b' ' | b'\n'))
+        .next()
+        .unwrap_or_default();
+    let bad = || anyhow!("rev-list printed {:?}", String::from_utf8_lossy(line));
+    if !matches!(hex.len(), 40 | 64) || !hex.iter().all(u8::is_ascii_hexdigit) {
+        return Err(bad());
+    }
+    let mut key = [0u8; 32];
+    for (k, pair) in key.iter_mut().zip(hex.as_chunks::<2>().0) {
+        let pair = std::str::from_utf8(pair).map_err(|_| bad())?;
+        *k = u8::from_str_radix(pair, 16).map_err(|_| bad())?;
+    }
+    Ok(key)
+}
+
 fn read_manifest_blob(backend: &Backend, oid: &str) -> Result<Vec<u8>> {
     backend.ensure_blobs(&[oid.to_owned()])?;
     let size = backend.object_size(oid)?;
@@ -1829,7 +1987,8 @@ enum Op {
     Push,
     /// The configured participant and admin lists.
     SetParticipants,
-    /// One pack for everything the refs reach, replacing all others.
+    /// A snapshot pack and a history pack for everything the refs reach,
+    /// replacing all others.
     Repack {
         rewrite: bool,
     },
@@ -1841,25 +2000,55 @@ pub struct Repacked {
     pub after: (usize, u64),
 }
 
-/// A pack whose blobs are in the local object store and, for a large one,
+/// Packs whose blobs are in the backend repository and, for large ones,
 /// already uploaded to `upload_branch`.
 struct Staged {
-    /// The new tips it was built for, sorted.
+    /// The new tips they were built for, sorted.
     wants: Vec<Oid>,
-    /// The ids of the packs listed when it was built.
+    /// The ids of the packs listed when they were built.
     bases: Vec<String>,
-    id: String,
-    key: Zeroizing<String>,
-    /// Tree name and blob of each part.
-    blobs: Vec<(String, Oid)>,
+    packs: Vec<StagedPack>,
     upload_branch: Option<String>,
     /// The last commit pushed to `upload_branch`.
     upload_tip: Option<Oid>,
 }
 
+#[derive(Clone)]
+struct StagedPack {
+    id: String,
+    key: Zeroizing<String>,
+    /// Tree name and blob of each part.
+    blobs: Vec<(String, Oid)>,
+    /// For a snapshot pack, the commits it holds without their parents.
+    snapshot: Option<Vec<Oid>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oid_keys() {
+        let a = format!("{}0f", "0".repeat(38));
+        let mut want = [0u8; 32];
+        want[19] = 0x0f;
+        assert_eq!(oid_key(a.as_bytes()).unwrap(), want);
+        assert_eq!(
+            oid_key(format!("{a} dir/file name\n").as_bytes()).unwrap(),
+            want
+        );
+        assert_eq!(oid_key(format!("{a}\n").as_bytes()).unwrap(), want);
+        assert_eq!(oid_key("f".repeat(64).as_bytes()).unwrap(), [0xff; 32]);
+        for bad in [
+            "",
+            "0f",
+            &"0".repeat(39),
+            &format!("+{}", "0".repeat(39)),
+            &"g".repeat(40),
+        ] {
+            assert!(oid_key(bad.as_bytes()).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn refspec_parsing() {

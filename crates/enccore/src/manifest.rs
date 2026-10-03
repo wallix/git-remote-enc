@@ -65,8 +65,24 @@ pub struct Manifest {
     pub refs: Vec<(String, String)>,
     /// In append order; a pack may be thin relative to earlier ones.
     pub packs: Vec<Pack>,
+    /// The pack of the last repack holding the ref tips as of then, each
+    /// with its whole tree and no history: with the packs after it, usually
+    /// a shallow clone. New in version 4.
+    pub snapshot: Option<Snapshot>,
     /// Unknown items, preserved verbatim for forward compatibility.
     pub extensions: Vec<String>,
+}
+
+/// A pack that holds commits without their parents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    /// One of the manifest's packs.
+    pub pack: String,
+    /// The pack holding the rest of the history as of the repack, if any:
+    /// the one pack a shallow clone usually does without.
+    pub history: Option<String>,
+    /// The commits it holds: the boundary of a shallow clone built from it.
+    pub commits: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -110,6 +126,7 @@ impl Manifest {
         let mut m = Manifest::default();
         let mut have_generation = false;
         let mut epoch_line = None;
+        let mut snapshot_line = None;
         let mut seen: Vec<&str> = Vec::new();
         for (idx, line) in lines {
             let lineno = idx.saturating_add(1);
@@ -122,7 +139,7 @@ impl Manifest {
             // Single-value items may appear only once.
             if matches!(
                 item,
-                "generation" | "time" | "previous" | "epoch" | "repo" | "head"
+                "generation" | "time" | "previous" | "epoch" | "repo" | "head" | "snapshot"
             ) {
                 if seen.contains(&item) {
                     return Err(ParseError::Duplicate(lineno, item.to_owned()));
@@ -162,7 +179,7 @@ impl Manifest {
                     .push(nonempty(rest).ok_or_else(malformed)?.to_owned()),
                 "ref" => {
                     let (oid, name) = rest.split_once(' ').ok_or_else(malformed)?;
-                    if !is_hex(oid) || !is_ref_name(name) {
+                    if !is_oid(oid) || !is_ref_name(name) {
                         return Err(malformed());
                     }
                     if m.ref_oid(name).is_some() {
@@ -183,6 +200,26 @@ impl Manifest {
                         key: key.to_owned(),
                     });
                 }
+                "snapshot" => {
+                    let mut words = rest.split(' ');
+                    let pack = words.next().unwrap_or_default();
+                    let history = words.next().unwrap_or_default();
+                    let commits: Vec<String> = words.map(str::to_owned).collect();
+                    let is_pack = |p: &str| p.len() == 64 && is_hex(p);
+                    if !is_pack(pack)
+                        || !(history == "-" || is_pack(history))
+                        || history == pack
+                        || !commits.iter().all(|c| is_oid(c))
+                    {
+                        return Err(malformed());
+                    }
+                    m.snapshot = Some(Snapshot {
+                        pack: pack.to_owned(),
+                        history: (history != "-").then(|| history.to_owned()),
+                        commits,
+                    });
+                    snapshot_line = Some(malformed());
+                }
                 _ => m.extensions.push(line.to_owned()),
             }
         }
@@ -194,6 +231,14 @@ impl Manifest {
         }
         if m.epoch.is_some_and(|e| e > m.generation)
             && let Some(e) = epoch_line
+        {
+            return Err(e);
+        }
+        if let Some(s) = &m.snapshot
+            && std::iter::once(&s.pack)
+                .chain(&s.history)
+                .any(|id| !m.packs.iter().any(|p| p.id == *id))
+            && let Some(e) = snapshot_line
         {
             return Err(e);
         }
@@ -240,6 +285,18 @@ impl Manifest {
         for p in &self.packs {
             let key = if with_keys { &p.key } else { REDACTED_KEY };
             out.push_str(&format!("pack {} {key}\n", p.id));
+        }
+        if let Some(s) = &self.snapshot {
+            out.push_str(&format!(
+                "snapshot {} {}",
+                s.pack,
+                s.history.as_deref().unwrap_or("-")
+            ));
+            for c in &s.commits {
+                out.push(' ');
+                out.push_str(c);
+            }
+            out.push('\n');
         }
         for e in &self.extensions {
             out.push_str(e);
@@ -296,6 +353,11 @@ fn is_hex(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A full SHA-1 or SHA-256 object id.
+fn is_oid(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && is_hex(s)
+}
+
 // ---- envelope -------------------------------------------------------------
 
 const SIG_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
@@ -327,7 +389,7 @@ pub fn join_envelope(manifest: &str, signature_pem: &str) -> Zeroizing<Vec<u8>> 
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "enc-manifest 4\ngeneration 3\nrepo abcdef0123\ntime 1790000000\nprevious 1111111111111111111111111111111111111111111111111111111111111111\nepoch 2\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nadmin ssh-ed25519 AAAAC3 alice\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nextn future stuff\n";
+    const SAMPLE: &str = "enc-manifest 4\ngeneration 3\nrepo abcdef0123\ntime 1790000000\nprevious 1111111111111111111111111111111111111111111111111111111111111111\nepoch 2\nhead refs/heads/main\nparticipant ssh-ed25519 AAAAC3 alice\nparticipant age1qqq\nadmin ssh-ed25519 AAAAC3 alice\nref 0123456789abcdef0123456789abcdef01234567 refs/heads/main\npack 0000000000000000000000000000000000000000000000000000000000000000 AGE-SECRET-KEY-1X\nsnapshot 0000000000000000000000000000000000000000000000000000000000000000 - 0123456789abcdef0123456789abcdef01234567\nextn future stuff\n";
 
     #[test]
     fn roundtrip() {
@@ -343,6 +405,10 @@ mod tests {
         assert_eq!(m.admins, vec!["ssh-ed25519 AAAAC3 alice"]);
         assert_eq!(m.refs.len(), 1);
         assert_eq!(m.packs.len(), 1);
+        let s = m.snapshot.as_ref().unwrap();
+        assert_eq!(s.pack, "0".repeat(64));
+        assert_eq!(s.history, None);
+        assert_eq!(s.commits, ["0123456789abcdef0123456789abcdef01234567"]);
         assert_eq!(m.extensions, vec!["extn future stuff"]);
         assert_eq!(*m.serialize(), SAMPLE);
         let shown = m.serialize_redacted();
@@ -376,6 +442,43 @@ mod tests {
             Manifest::parse("enc-manifest 1\nrepo x\n"),
             Err(ParseError::Missing("generation"))
         );
+        // A snapshot names one of the packs.
+        assert_eq!(
+            Manifest::parse(&format!(
+                "enc-manifest 4\ngeneration 1\nrepo x\nsnapshot {} - {}\n",
+                "1".repeat(64),
+                "2".repeat(40)
+            )),
+            Err(ParseError::Malformed(
+                4,
+                format!("snapshot {} - {}", "1".repeat(64), "2".repeat(40))
+            ))
+        );
+        // Its history pack is listed too, and is not the snapshot itself.
+        let (p0, p1) = ("0".repeat(64), "1".repeat(64));
+        let packs = format!("pack {p0} AGE-SECRET-KEY-1X\n");
+        let line = format!("snapshot {p0} {p1} {}", "2".repeat(40));
+        assert_eq!(
+            Manifest::parse(&format!(
+                "enc-manifest 4\ngeneration 1\nrepo x\n{packs}{line}\n"
+            )),
+            Err(ParseError::Malformed(5, line))
+        );
+        let packs = format!("{packs}pack {p1} AGE-SECRET-KEY-1Y\n");
+        for (snapshot, ok) in [
+            (format!("{p0} {p1} {}", "2".repeat(40)), true),
+            (format!("{p0} {p1} {}", "2".repeat(64)), true),
+            (format!("{p0} -"), true),
+            (format!("{p0} {p0} {}", "2".repeat(40)), false),
+            (format!("{p0} {p1} {}", "2".repeat(39)), false),
+            (format!("{p0} {p1} {}", "2".repeat(41)), false),
+            (format!("{p0} {p1}  {}", "2".repeat(40)), false),
+            (format!("{p0} {p1} {}", "g".repeat(40)), false),
+        ] {
+            let text =
+                format!("enc-manifest 4\ngeneration 1\nrepo x\n{packs}snapshot {snapshot}\n");
+            assert_eq!(Manifest::parse(&text).is_ok(), ok, "{snapshot}");
+        }
         // History cannot start after the manifest's own generation.
         assert_eq!(
             Manifest::parse("enc-manifest 4\nepoch 3\ngeneration 2\nrepo x\n"),
@@ -389,10 +492,30 @@ mod tests {
             Manifest::parse("enc-manifest 4\ngeneration 2\nepoch x\nrepo x\n"),
             Err(ParseError::Malformed(3, "epoch x".to_owned()))
         );
-        assert!(matches!(
-            Manifest::parse("enc-manifest 1\ngeneration 1\nrepo x\nref nothex refs/heads/x\n"),
-            Err(ParseError::Malformed(4, _))
-        ));
+        for oid in [
+            "nothex",
+            "0123abcd",
+            &"a".repeat(39),
+            &"a".repeat(41),
+            &"a".repeat(63),
+        ] {
+            assert!(
+                matches!(
+                    Manifest::parse(&format!(
+                        "enc-manifest 1\ngeneration 1\nrepo x\nref {oid} refs/heads/x\n"
+                    )),
+                    Err(ParseError::Malformed(4, _))
+                ),
+                "{oid}"
+            );
+        }
+        assert!(
+            Manifest::parse(&format!(
+                "enc-manifest 1\ngeneration 1\nrepo x\nref {} refs/heads/x\n",
+                "a".repeat(64)
+            ))
+            .is_ok()
+        );
         // Said twice, or a ref name git would refuse.
         let oid = "0123456789abcdef0123456789abcdef01234567";
         for (text, want) in [
@@ -403,10 +526,16 @@ mod tests {
                 &*format!("generation 1\nrepo x\nref {oid} refs/heads/a\nref {oid} refs/heads/a\n"),
                 "ref refs/heads/a",
             ),
+            (
+                &*format!(
+                    "generation 1\nrepo x\n{packs}snapshot {p0} {p1} {oid}\nsnapshot {p0} -\n"
+                ),
+                "snapshot",
+            ),
         ] {
             assert!(
                 matches!(
-                    Manifest::parse(&format!("enc-manifest 3\n{text}")),
+                    Manifest::parse(&format!("enc-manifest 4\n{text}")),
                     Err(ParseError::Duplicate(_, ref item)) if item == want
                 ),
                 "{text}"

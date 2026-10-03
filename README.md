@@ -184,8 +184,9 @@ directory (both are reported each time), nor with `enc.installHook=false`;
 puts it at the top of an existing shell hook (kept as `pre-push.enc-orig`),
 which then gets git's ref list on stdin as before.
 
-`git-remote-enc repack <remote>` replaces every encrypted pack by one holding
-what the refs reach, as an ordinary push; every other participant's next fetch
+`git-remote-enc repack <remote>` replaces every encrypted pack by two holding
+what the refs reach (a snapshot of the ref tips, and the history behind them),
+as an ordinary push; every other participant's next fetch
 then downloads the whole repository again. The old blobs stay in the backend
 branch's history; `repack --rewrite-history` replaces that history by a new
 commit that does not descend from it (the host must allow a forced update of

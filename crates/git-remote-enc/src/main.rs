@@ -262,7 +262,7 @@ fn log(remote: &mut Remote) -> Result<()> {
                     _ => {}
                 }
                 if repacked && !history_start {
-                    println!("  repacked: its pack replaces all earlier ones");
+                    println!("  repacked: its packs replace all earlier ones");
                 }
                 for r in refs {
                     println!("  ref {r}");
