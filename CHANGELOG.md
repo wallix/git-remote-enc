@@ -26,6 +26,14 @@ downloads the whole backend branch again.
   the backend history so the host can reclaim the old blobs; the manifest
   records the rewrite (`epoch`), so participants are not warned of a host
   rewrite.
+- Shallow clones: with `--depth`, a fetch downloads the last repack's
+  snapshot and the packs pushed since, skipping its history pack, which
+  `--unshallow` or `--deepen` fetch. A plain fetch after a later repack that
+  would cut the clone off its history downloads the history pack and
+  unshallows the clone; a fetch with `--depth` cuts it anew instead. Pushes
+  work as usual unless they reach a boundary other than the current
+  snapshot's commits; a fetch and `doctor` identify these commits.
+  `--shallow-since` and `--shallow-exclude` are refused.
 - Faster clone, fetch and push of large repositories: encrypted data is no
   longer compressed or delta-searched locally.
 - Progress for the slow steps (backend download and upload, packing,

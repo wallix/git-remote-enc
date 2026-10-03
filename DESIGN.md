@@ -333,9 +333,11 @@ range that reaches a boundary names parents it does not carry, and every
 fetch of it fails git's connectivity check. A push is refused when a commit
 reachable from the new tips but not from the manifest refs is a boundary,
 with a hint to `git fetch --unshallow`. A boundary the remote already holds is
-fine, so a shallow clone of a populated remote still pushes new commits. The
-helper does not unshallow by itself: the shallow file does not record which
-remote the clone came from, and the download can be the whole history.
+fine, so a shallow clone of a populated remote still pushes new commits. So is
+a boundary this remote set (section 5.2): a snapshot commit, whose parents
+the remote holds. The helper records the boundary it sets and fetches the
+history behind it when a fetch needs it; a boundary set by another remote it
+leaves alone, as the shallow file does not record where a boundary came from.
 
 ### 5.2 Fetch
 
@@ -354,6 +356,50 @@ ignores the individual wants and downloads every pack it has not indexed yet:
 
 Order matters because `--fix-thin` completes a thin pack with base objects
 that must already be present.
+
+**Shallow clones.** git passes `--depth` as `option depth <n>`, `--deepen`
+as `option depth <n>` followed by `option deepen-relative true`, and
+`--unshallow` as `option depth 2147483647`. The helper answers
+`--shallow-since` and `--shallow-exclude` (`option deepen-since`, `option
+deepen-not`) with an error, and fails the fetch that follows, as `git clone`
+goes on after an option's error. Packs are the unit, so a depth is honoured
+at their granularity: with a depth, or in a repository this remote already
+made shallow, a fetch skips the history pack of the manifest's `snapshot` and
+indexes every other pack: the snapshot, then the packs pushed since. The
+snapshot's commits whose parents are missing and that a manifest ref reaches
+(a branch deleted since the repack leaves its tip unreached) are added to
+`$GIT_DIR/shallow`, under git's `shallow.lock`, and recorded in
+`<common>/enc/<key>/shallow`, before the shallow file changes, so that
+deepening removes those and no other remote's. A recorded commit stays a
+boundary while it is present and its parents are not, across later repacks
+and fetches (`--unshallow` included) whose history pack does not hold them:
+a repack after an orphan was pushed has none, and a later history pack need
+not reach an older snapshot. One pruned since (by `git gc`) is dropped. The clone has at least the depth
+asked for: everything since the last repack. A pack that does not index
+without the history (`index-pack` reports unresolved deltas: their bases are
+there), or refs that do not reach the boundary through what was indexed (a
+push onto a commit older than the snapshot, as git's connectivity check
+`rev-list --objects --stdin --not --all` tells), fetch the history pack after
+all. So does, without a depth asked for, a snapshot commit that would be a
+new boundary (a repack since the last fetch, whose snapshot builds on
+commits not fetched before): the clone stays connected rather than cut
+anew. The cost: a plain fetch into a `--depth` clone that a repack has
+overtaken downloads the whole history pack and unshallows it, even when the
+clone has no local work to keep connected; a fetch with `--depth` cuts it
+anew instead. An explicit `--depth` may cut anew, and does not deepen a clone
+already shallow, which a note says. `--unshallow` and `--deepen`
+fetch it and remove the boundary; there is no depth between the two. With
+every pack indexed, a recorded commit that stays a boundary lacks parents
+the remote no longer holds: the fetch names it, and how to drop it (delete
+the local refs that reach it, expire the reflogs, `git gc --prune=now`). A
+remote with no snapshot (never repacked) is fetched whole, with a note.
+`$GIT_DIR/shallow` keeps its mode when rewritten; a new one gets
+`core.sharedRepository`'s.
+`repack` indexes the history pack first: it repacks everything. A push from
+a shallow clone may reach the boundary only at the current snapshot's
+commits, when it has a history pack: the remote holds their parents. Any
+other boundary commit (another remote's, or an older snapshot's whose
+history a later repack dropped) refuses the push.
 
 **Progress.** The helper advertises the `option` capability and follows
 git's `option progress`: on for a terminal unless `-q`, or with `--progress`.
@@ -413,6 +459,16 @@ every linked worktree, so trust accepted in one worktree holds in all):
   accepted. It is outside `<key>/` so that losing that directory, trust state
   and backend repository together, is not taken for a first contact.
 - `<common>/enc/<key>/have` — pack names already indexed.
+- `<common>/enc/<key>/shallow` — the boundary commits this remote added to
+  `$GIT_DIR/shallow` (section 5.2), which deepening removes. It survives
+  `forget`, `git remote remove` and a URL change, as those commits' parents
+  are still missing: to the remote under a new key (another URL or branch) or
+  any other remote, they are a boundary it cannot complete, which `doctor`
+  reports and a push reaching them is refused at. `git fetch --unshallow`
+  from the old URL and branch removes them; otherwise, once their parents
+  are present, delete them from `$GIT_DIR/shallow` and the list by hand.
+  One whose parents the remote no longer holds goes once no ref reaches it
+  and a `git gc` prunes it; `doctor` says so instead of `--unshallow`.
 - `<common>/enc/<key>/trust` — the last accepted manifest's `generation`,
   `repo` id, participant list, the SHA-256 of its text and the backend commit
   that carried it (section 6), ending
@@ -828,9 +884,9 @@ push or fetch, earlier and in one place:
   the difference, asks on the terminal (`--yes` skips) and applies it; a
   refusal restores the previous configuration.
 - `doctor <remote>` reports, without installing the guard: the host, the
-  identity files, the guard, a shallow clone, Git LFS, then the manifest
-  (first-contact and local-state refusals included), membership and pending
-  list changes.
+  identity files, the guard, Git LFS, then the manifest (first-contact and
+  local-state refusals included), membership, pending list changes and a
+  shallow boundary the remote cannot complete.
 
 ## 9. Failure modes and recovery
 
@@ -878,7 +934,8 @@ ed25519 keys:
 - a hostile object (a `.git` tree entry) is refused on fetch;
 - a push is refused, before the hook runs, while a pre-push hook runs Git
   LFS, and a push carrying LFS pointers is refused;
-- a push that reaches a shallow clone's boundary is refused;
+- a push that reaches a shallow clone's boundary is refused, unless this
+  remote set that boundary;
 - `install-hook --chain` runs the guard ahead of an existing hook, which
   still gets the ref list;
 - `init`, `invite` and `join` set a remote up end to end, `participants

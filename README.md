@@ -112,8 +112,9 @@ their identity and guard, then fetches. It is not secret, but it must reach
 them over a channel the host does not control.
 
 `git-remote-enc doctor <remote>` checks for push or fetch problems: the host and
-its credentials, identity files, the guard, a shallow clone, Git LFS, the
-manifest, whether you are a participant, and a pending participant change. It
+its credentials, identity files, the guard, Git LFS, the manifest, whether you
+are a participant, a pending participant change, and a shallow boundary the
+remote cannot complete. It
 exits 1 on a problem and installs nothing.
 
 ## Joining by hand
@@ -194,6 +195,13 @@ the branch), after which the host reclaims the space when it prunes
 unreachable objects (GitLab: Settings > General > Advanced > Housekeeping).
 The other participants' clones carry on, and are told a participant repacked
 the remote.
+
+After a repack, `git clone --depth 1 enc::…` downloads the snapshot and what
+was pushed since, not the history pack; `git fetch --unshallow` fetches it,
+and so does a fetch that needs it, a plain fetch after another repack among
+them. Depths are honoured at the granularity of
+packs: any depth gets everything since the last repack. `--shallow-since` and
+`--shallow-exclude` are refused.
 
 `git-remote-enc forget <remote>` drops the local trust state of a remote, which
 the helper otherwise refuses to discard when the remote was recreated,

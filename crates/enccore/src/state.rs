@@ -109,6 +109,36 @@ impl State {
         Ok(())
     }
 
+    /// The commits this remote made shallow boundaries of the repository
+    /// (`.git/shallow`), so that deepening removes those and no others.
+    pub fn boundary(&self) -> Result<BTreeSet<String>> {
+        match fs::read_to_string(self.dir.join("shallow")) {
+            Ok(s) => Ok(s
+                .lines()
+                .map(str::to_owned)
+                .filter(|l| !l.is_empty())
+                .collect()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+            Err(e) => Err(e).context("reading shallow boundary list"),
+        }
+    }
+
+    pub fn set_boundary(&self, commits: &BTreeSet<String>) -> Result<()> {
+        let path = self.dir.join("shallow");
+        if commits.is_empty() {
+            return match fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(e).context("removing shallow boundary list")
+                }
+                _ => Ok(()),
+            };
+        }
+        let tmp = self.temp_path("shallow");
+        let text: String = commits.iter().map(|c| format!("{c}\n")).collect();
+        fs::write(&tmp, text).context("writing shallow boundary list")?;
+        fs::rename(&tmp, path).context("replacing shallow boundary list")
+    }
+
     /// The accepted trust state, authenticated with whichever of `keys` it
     /// names. A file that fails authentication is an error, never a first
     /// contact.
@@ -168,16 +198,35 @@ impl State {
         Ok(())
     }
 
-    /// Delete everything kept for this remote. The caller removes the
-    /// legacy ref.
-    pub fn forget(&self) -> Result<()> {
-        fs::remove_dir_all(&self.dir)
-            .with_context(|| format!("removing {}", self.dir.display()))?;
+    /// Delete this remote's state except its shallow boundary list: removing
+    /// those commits from `.git/shallow` would hide their missing parents.
+    /// Returns whether the list was kept. The caller removes the legacy ref.
+    pub fn forget(&self) -> Result<bool> {
+        let kept = !self.boundary()?.is_empty();
+        if kept {
+            for e in fs::read_dir(&self.dir)
+                .with_context(|| format!("reading {}", self.dir.display()))?
+            {
+                let path = e?.path();
+                if path.file_name() == Some(std::ffi::OsStr::new("shallow")) {
+                    continue;
+                }
+                if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                }
+                .with_context(|| format!("removing {}", path.display()))?;
+            }
+        } else {
+            fs::remove_dir_all(&self.dir)
+                .with_context(|| format!("removing {}", self.dir.display()))?;
+        }
         match fs::remove_file(self.known_path()) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 Err(e).context("removing the contact marker")
             }
-            _ => Ok(()),
+            _ => Ok(kept),
         }
     }
 
@@ -304,6 +353,27 @@ mod tests {
         );
         assert!(!old.exists());
         assert!(!old_dir.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn forget_keeps_the_shallow_boundary_list() {
+        let root = std::env::temp_dir().join(format!("enc-forget-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let s = State::open(&root, "url", "refs/heads/enc").unwrap();
+        s.add_have("p").unwrap();
+        s.mark_known().unwrap();
+        assert!(!s.forget().unwrap());
+        assert!(!s.dir().exists() && !s.is_known());
+
+        let s = State::open(&root, "url", "refs/heads/enc").unwrap();
+        s.add_have("p").unwrap();
+        let boundary: BTreeSet<String> = ["c".to_owned()].into();
+        s.set_boundary(&boundary).unwrap();
+        assert!(s.forget().unwrap());
+        let left: Vec<_> = fs::read_dir(s.dir()).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1);
+        assert_eq!(s.boundary().unwrap(), boundary);
         fs::remove_dir_all(&root).unwrap();
     }
 

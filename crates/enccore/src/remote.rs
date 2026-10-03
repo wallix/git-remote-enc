@@ -1,5 +1,6 @@
 //! An encrypted remote: connect, list, fetch, push. DESIGN.md §5, §6.
 
+use std::collections::BTreeSet;
 use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -197,7 +198,13 @@ pub struct Remote {
     staged: Option<Staged>,
     /// Packs in the manifest before the current repack's first attempt.
     repack_before: Option<usize>,
+    /// `option depth` from git, for the next fetch.
+    depth: Option<u64>,
+    deepen_relative: bool,
 }
+
+/// `option depth` for `git fetch --unshallow`.
+pub const UNSHALLOW: u64 = 0x7fff_ffff;
 
 impl Remote {
     /// `name` is git's remote name (absent when it equals the URL); `url` is
@@ -227,6 +234,8 @@ impl Remote {
             trust_keys: None,
             staged: None,
             repack_before: None,
+            depth: None,
+            deepen_relative: false,
         })
     }
 
@@ -301,13 +310,69 @@ impl Remote {
     }
 
     /// Drop the local state kept for this remote: accepted trust, indexed
-    /// packs and the backend repository. Returns the directory removed.
-    pub fn forget(&mut self) -> Result<PathBuf> {
-        self.state.forget()?;
+    /// packs and the backend repository. Returns the directory removed, and
+    /// whether the list of the shallow boundary this remote set stays in it.
+    pub fn forget(&mut self) -> Result<(PathBuf, bool)> {
+        let kept = self.state.forget()?;
         if git::rev_parse(&self.state.legacy_ref)?.is_some() {
             git::delete_ref(&self.state.legacy_ref)?;
         }
-        Ok(self.state.dir().to_owned())
+        Ok((self.state.dir().to_owned(), kept))
+    }
+
+    /// The repository's shallow boundary commits the remote cannot
+    /// complete, which a push must not reach: all but those this remote set
+    /// from its current snapshot. Without a manifest (not connected, or no
+    /// remote yet), every one.
+    pub fn incomplete_boundary(&self) -> Result<Vec<Oid>> {
+        let completable = self.completable_boundary(self.manifest.as_ref())?;
+        Ok(git::shallow_commits()?
+            .into_iter()
+            .filter(|c| !completable.contains(c))
+            .collect())
+    }
+
+    /// The boundary commits this remote set whose parents it holds: the
+    /// snapshot's, when it has a history pack. An older snapshot's may have
+    /// lost them to a later repack.
+    ///
+    /// Only those `.git/shallow` lists: one recorded but not written there
+    /// (an interrupted update) is not a boundary this remote set.
+    fn completable_boundary(&self, m: Option<&Manifest>) -> Result<BTreeSet<Oid>> {
+        let Some(s) = m
+            .and_then(|m| m.snapshot.as_ref())
+            .filter(|s| s.history.is_some())
+        else {
+            return Ok(BTreeSet::new());
+        };
+        let mine = self.state.boundary()?;
+        let listed = git::shallow_commits()?;
+        Ok(s.commits
+            .iter()
+            .filter(|c| mine.contains(*c) && listed.contains(*c))
+            .cloned()
+            .collect())
+    }
+
+    /// The boundary commits this remote set that no fetch from it
+    /// completes: every pack of the manifest is indexed, and their parents
+    /// are still missing. Without a manifest, none.
+    pub fn stuck_boundary(&self) -> Result<BTreeSet<Oid>> {
+        let Some(m) = &self.manifest else {
+            return Ok(BTreeSet::new());
+        };
+        let have = self.state.have()?;
+        if m.packs.iter().any(|p| !have.contains(&p.id)) {
+            return Ok(BTreeSet::new());
+        }
+        let listed = git::shallow_commits()?;
+        let candidates: Vec<Oid> = self
+            .state
+            .boundary()?
+            .into_iter()
+            .filter(|c| listed.contains(c))
+            .collect();
+        lacking_parents(&candidates)
     }
 
     // ---- connect ----------------------------------------------------------
@@ -897,45 +962,257 @@ impl Remote {
 
     // ---- fetch ------------------------------------------------------------
 
-    /// Index every pack not yet indexed locally, in manifest order.
+    /// `git fetch --depth`: `option depth`, and `option deepen-relative`
+    /// for `--deepen`. [`UNSHALLOW`] asks for the whole history.
+    pub fn set_depth(&mut self, depth: u64) {
+        self.depth = Some(depth);
+    }
+
+    pub fn set_deepen_relative(&mut self, on: bool) {
+        self.deepen_relative = on;
+    }
+
+    /// Index every pack not yet indexed locally, in manifest order. A
+    /// shallow clone does without the last repack's history pack: asked
+    /// for with a depth, or already shallow, it gets the snapshot and the
+    /// packs pushed since, the snapshot's commits as its boundary. Without
+    /// a depth, a boundary that would cut it off its history fetches that
+    /// history instead.
     pub fn fetch(&mut self) -> Result<()> {
+        let deepen = self.depth == Some(UNSHALLOW) || self.deepen_relative;
+        self.fetch_packs(deepen)
+    }
+
+    /// `full`: the history pack too. When nothing is skipped, the boundary
+    /// commits this remote set whose parents are now here stop being one.
+    fn fetch_packs(&mut self, full: bool) -> Result<()> {
         self.connect()?;
         let Some(m) = self.manifest.clone() else {
             return Ok(());
         };
         let have = self.state.have()?;
-        let todo: Vec<&Pack> = m.packs.iter().filter(|p| !have.contains(&p.id)).collect();
+        let mine = self.state.boundary()?;
+        let history = m
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.history.clone())
+            .filter(|h| !have.contains(h));
+        let shallow = !full && history.is_some() && (self.depth.is_some() || !mine.is_empty());
+        let listed = git::shallow_commits()?;
+        if shallow && self.depth.is_some() && !listed.is_empty() {
+            // The boundary may be another remote's alone.
+            let what = if mine.iter().any(|c| listed.contains(c)) {
+                format!("a shallow clone of {}", self.label)
+            } else {
+                format!("this shallow clone from {}", self.label)
+            };
+            info(&format!(
+                "--depth does not deepen {what}: it gets the last repack's snapshot and the \
+                 packs since; --deepen or --unshallow fetches the older history"
+            ));
+        }
+        if self.depth.is_some() && !full && m.snapshot.is_none() {
+            info(&format!(
+                "{} has no snapshot to make a shallow clone from, fetching all of its history; \
+                 `git-remote-enc repack {}` makes one",
+                self.label, self.label
+            ));
+        }
+        let skipped = if shallow { history.clone() } else { None };
+        let todo: Vec<&Pack> = m
+            .packs
+            .iter()
+            .filter(|p| !have.contains(&p.id) && Some(&p.id) != skipped.as_ref())
+            .collect();
         let blobs = todo
             .iter()
-            .map(|pack| {
-                parts::find(&self.tree, &pack.id).ok_or_else(|| {
-                    anyhow!(
-                        "pack {} listed in manifest is missing on the remote",
-                        pack.id
-                    )
-                })
-            })
+            .map(|pack| self.pack_blobs(pack))
             .collect::<Result<Vec<_>>>()?;
         // One download for every pack still needed.
         self.backend.ensure_blobs(&blobs.concat())?;
-        for (i, (pack, blobs)) in todo.iter().zip(blobs).enumerate() {
+        let mut shallow = shallow;
+        for (i, (pack, blobs)) in todo.iter().zip(&blobs).enumerate() {
             let label = format!("pack {}/{}", i.saturating_add(1), todo.len());
-            self.index_pack(pack, blobs, &label)?;
+            if let Err(e) = self.index_pack(pack, blobs, &label) {
+                // Pushed onto history the snapshot does not hold: its
+                // delta bases are in the history pack. git runs in the C
+                // locale, so its message is stable.
+                let Some(h) = skipped
+                    .as_ref()
+                    .filter(|_| shallow && format!("{e:#}").contains("unresolved delta"))
+                else {
+                    return Err(e);
+                };
+                info(&format!(
+                    "{label} builds on history older than the snapshot; fetching that history"
+                ));
+                self.index_history(&m, h)?;
+                shallow = false;
+                self.index_pack(pack, blobs, &label)?;
+            }
             self.state.add_have(&pack.id)?;
+        }
+        if shallow || !mine.is_empty() {
+            let boundary = self.plan_boundary(&m, shallow)?;
+            // Without a depth asked for, the clone stays connected: a new
+            // boundary commit (a repack since the last fetch) would cut the
+            // refs off the history fetched before.
+            if shallow
+                && self.depth.is_none()
+                && let Some(h) = &skipped
+                && let Some(c) = boundary.iter().find(|c| !mine.contains(*c))
+            {
+                info(&format!(
+                    "the snapshot's commit {c} does not connect to the history here; fetching that history"
+                ));
+                self.index_history(&m, h)?;
+                shallow = false;
+                self.update_boundary(&m, false)?;
+            } else {
+                self.set_boundary(&boundary, shallow)?;
+            }
+        }
+        // A commit pushed onto history older than the snapshot has parents
+        // only the history pack holds.
+        if shallow
+            && let Some(h) = &skipped
+            && let Err(why) = refs_complete(&m)
+        {
+            info(&format!(
+                "a ref builds on history older than the snapshot; fetching that history ({why})"
+            ));
+            self.index_history(&m, h)?;
+            self.update_boundary(&m, false)?;
         }
         Ok(())
     }
 
+    fn index_history(&mut self, m: &Manifest, id: &str) -> Result<()> {
+        let pack = m
+            .packs
+            .iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| anyhow!("history pack {id} is not in the manifest"))?;
+        let blobs = self.pack_blobs(pack)?;
+        self.backend.ensure_blobs(&blobs)?;
+        self.index_pack(pack, &blobs, "history pack")?;
+        self.state.add_have(id)
+    }
+
+    /// The blobs holding `pack`, in order.
+    fn pack_blobs(&self, pack: &Pack) -> Result<Vec<Oid>> {
+        parts::find(&self.tree, &pack.id).ok_or_else(|| {
+            anyhow!(
+                "pack {} listed in manifest is missing on the remote",
+                pack.id
+            )
+        })
+    }
+
+    /// When `shallow`, make the snapshot's commits that a manifest ref
+    /// reaches and whose parents are missing a boundary of the repository;
+    /// drop from the boundary this remote set the commits whose parents are
+    /// now here, or that are gone.
+    fn update_boundary(&self, m: &Manifest, shallow: bool) -> Result<()> {
+        let boundary = self.plan_boundary(m, shallow)?;
+        self.set_boundary(&boundary, shallow)
+    }
+
+    /// The boundary this remote sets: the commits it set whose parents are
+    /// still missing and, when `shallow`, the snapshot's.
+    fn plan_boundary(&self, m: &Manifest, shallow: bool) -> Result<BTreeSet<Oid>> {
+        let mine = self.state.boundary()?;
+        // A recorded commit stays a boundary while its parents are missing,
+        // whatever the manifest now says: a later repack (an orphan pushed
+        // and repacked, a history pack that does not reach an older
+        // snapshot) need not bring them. A commit gone (pruned by a gc) is
+        // no boundary.
+        let mut candidates = mine.clone();
+        if shallow && let Some(s) = &m.snapshot {
+            candidates.extend(s.commits.iter().cloned());
+        }
+        let candidates: Vec<Oid> = candidates.into_iter().collect();
+        let lacking = lacking_parents(&candidates)?;
+        // A snapshot commit no ref reaches any more (its branch was deleted
+        // since the repack) needs no boundary: a gc prunes it.
+        let reached = if lacking.iter().any(|c| !mine.contains(c)) {
+            self.reached_from_refs(m, &lacking)
+        } else {
+            None
+        };
+        Ok(lacking
+            .into_iter()
+            .filter(|c| mine.contains(c) || reached.as_ref().is_none_or(|r| r.contains(c)))
+            .collect())
+    }
+
+    /// Make `new_mine` the boundary this remote set. Not `shallow`, every
+    /// pack is indexed: those that stay lack parents the remote no longer
+    /// holds.
+    fn set_boundary(&self, new_mine: &BTreeSet<Oid>, shallow: bool) -> Result<()> {
+        let mine = self.state.boundary()?;
+        if !shallow && !new_mine.is_empty() {
+            info(&format!(
+                "{} no longer holds the parents of {}, which stay shallow boundaries here; to drop \
+                 them, delete the local refs that reach them, then run `git reflog expire \
+                 --expire-unreachable=now --all` and `git gc --prune=now`",
+                self.label,
+                new_mine.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        // Recorded before `.git/shallow` changes, so that an interruption
+        // leaves no boundary of this remote's unrecorded.
+        let all: BTreeSet<Oid> = mine.union(new_mine).cloned().collect();
+        if all != mine {
+            self.state.set_boundary(&all)?;
+        }
+        let gone: BTreeSet<Oid> = mine.difference(new_mine).cloned().collect();
+        git::update_shallow(&gone, new_mine)?;
+        if *new_mine != all {
+            self.state.set_boundary(new_mine)?;
+        }
+        Ok(())
+    }
+
+    /// Commits reachable from the manifest refs with `boundary` added to the
+    /// repository's shallow boundary. Returns `None` if reachability cannot
+    /// be determined (a ref reaches missing history); all candidates are
+    /// then kept.
+    fn reached_from_refs(&self, m: &Manifest, boundary: &BTreeSet<Oid>) -> Option<BTreeSet<Oid>> {
+        let reached = (|| {
+            let mut all = git::shallow_commits()?;
+            all.extend(boundary.iter().cloned());
+            let path = self.state.temp_path("shallow-file");
+            let text: String = all.iter().map(|c| format!("{c}\n")).collect();
+            std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+            let tips: Vec<Oid> = m.refs.iter().map(|(oid, _)| oid.clone()).collect();
+            let reached = git::reached_with_shallow(&tips, &path);
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            reached
+        })();
+        // The refs are checked after this, and the history fetched for them.
+        match reached {
+            Ok(r) => Some(r),
+            Err(e) => {
+                info(&format!(
+                    "cannot tell which snapshot commits the refs reach, keeping them all as the \
+                     shallow boundary: {e:#}"
+                ));
+                None
+            }
+        }
+    }
+
     /// Decrypt the pack held by `blobs` (its parts, in order) into the object
     /// store.
-    fn index_pack(&self, pack: &Pack, blobs: Vec<Oid>, label: &str) -> Result<()> {
+    fn index_pack(&self, pack: &Pack, blobs: &[Oid], label: &str) -> Result<()> {
         let key = age::x25519::Identity::from_str(&pack.key)
             .map_err(|e| anyhow!("pack {}: bad key in manifest: {e}", pack.id))?;
         // Check the blob against its name before anything reaches the
         // object store: one extra read of a local object.
-        let size = parts::total_size(&self.backend, &blobs)?;
+        let size = parts::total_size(&self.backend, blobs)?;
         let (mut hashed, digest) = HashReader::new(MeterReader::new(
-            BlobChain::new(&self.backend, blobs.clone()),
+            BlobChain::new(&self.backend, blobs.to_vec()),
             Meter::new(format!("verifying {label}"), Some(size)),
         ));
         io::copy(&mut hashed, &mut io::sink())
@@ -949,8 +1226,10 @@ impl Remote {
             );
         }
 
-        let mut plain =
-            crypto::decrypt_stream(&key, BufReader::new(BlobChain::new(&self.backend, blobs)))?;
+        let mut plain = crypto::decrypt_stream(
+            &key,
+            BufReader::new(BlobChain::new(&self.backend, blobs.to_vec())),
+        )?;
         let progress = progress::enabled();
         if progress {
             info(&format!("decrypting {label} ({})", progress::human(size)));
@@ -1274,9 +1553,9 @@ impl Remote {
             self.repack_before.get_or_insert(u);
         }
         // The new packs are built from local objects: every pack must be
-        // indexed here first.
+        // indexed here first, a shallow clone's history included.
         if repack.is_some() {
-            self.fetch()?;
+            self.fetch_packs(true)?;
         }
 
         let known: Vec<Oid> = m.refs.iter().map(|(oid, _)| oid.clone()).collect();
@@ -1310,13 +1589,20 @@ impl Remote {
             );
         }
         // A shallow clone's pack would reference parents it does not hold,
-        // and every fetch of it would fail.
-        if let Some(c) = git::shallow_boundaries(&wants, &excludes)?.first() {
+        // and every fetch of it would fail. Not so at a boundary the remote
+        // completes: a commit of its snapshot, whose history pack holds the
+        // parents.
+        let completable = self.completable_boundary(Some(&m))?;
+        if let Some(c) = git::shallow_boundaries(&wants, &excludes)?
+            .iter()
+            .find(|c| !completable.contains(*c))
+        {
             bail!(
                 "this clone is shallow and the pushed history reaches its boundary at {c}, whose \
-                 parents are not here: the other participants could not fetch the push. Fetch the \
-                 full history first (git fetch --unshallow <the remote it was cloned from>), then \
-                 push again"
+                 parents are neither here nor on {}: the other participants could not fetch the \
+                 push. Fetch the full history first (git fetch --unshallow <the remote it was \
+                 cloned from>), then push again",
+                self.label
             );
         }
         let mut sorted_wants = wants.clone();
@@ -1922,6 +2208,53 @@ fn read_manifest_blob(backend: &Backend, oid: &str) -> Result<Vec<u8>> {
         );
     }
     backend.cat_blob(oid)
+}
+
+/// The locally present commits in `commits` with at least one missing parent.
+fn lacking_parents(commits: &[Oid]) -> Result<BTreeSet<Oid>> {
+    let parents = git::commit_parents(commits)?;
+    let named: Vec<Oid> = parents
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let present: BTreeSet<Oid> = git::have_objects(&named)?.into_iter().collect();
+    Ok(parents
+        .into_iter()
+        .filter(|(_, p)| p.iter().any(|p| !present.contains(p)))
+        .map(|(c, _)| c)
+        .collect())
+}
+
+/// Check that everything reachable from the manifest refs is present, down
+/// to the repository's shallow boundary, using git's connectivity check.
+/// Returns the reason on failure.
+fn refs_complete(m: &Manifest) -> std::result::Result<(), String> {
+    let mut input = String::new();
+    for (oid, _) in &m.refs {
+        input.push_str(oid);
+        input.push('\n');
+    }
+    // A failure for any other reason also fetches the history: the safe
+    // side.
+    git::run_input(
+        [
+            "rev-list",
+            "--objects",
+            "--quiet",
+            "--stdin",
+            "--not",
+            "--all",
+        ],
+        input.as_bytes(),
+    )
+    .map(|_| ())
+    .map_err(|e| {
+        let e = format!("{e:#}");
+        e.lines().next().unwrap_or_default().to_owned()
+    })
 }
 
 /// Do two key lists name the same keys, comments and order aside?

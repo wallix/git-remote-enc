@@ -3,6 +3,7 @@
 //! git sets it for a remote helper ([`USER`] and the free functions), or in
 //! another repository (a [`Git`] made by [`Git::at`]).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::ops::Range;
@@ -770,22 +771,261 @@ fn rev_list_input(tips: &[Oid], excludes: &[Oid]) -> String {
     revs
 }
 
-/// The commits of `tips` minus `excludes` that are shallow boundaries of
-/// this clone: their parents are missing here, so a pack of that range
-/// references commits it cannot carry.
-pub fn shallow_boundaries(tips: &[Oid], excludes: &[Oid]) -> Result<Vec<Oid>> {
-    let path = run_line([
+/// The repository's `.git/shallow`.
+pub fn shallow_path() -> Result<PathBuf> {
+    Ok(run_line([
         "rev-parse",
         "--path-format=absolute",
         "--git-path",
         "shallow",
+    ])?
+    .into())
+}
+
+/// The shallow boundary commits of the repository.
+pub fn shallow_commits() -> Result<BTreeSet<String>> {
+    read_shallow(&shallow_path()?)
+}
+
+fn read_shallow(path: &Path) -> Result<BTreeSet<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(s
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Remove `remove` from the repository's shallow boundary and add `add`,
+/// under git's `shallow.lock`. An empty boundary removes the file, which
+/// makes the repository complete.
+pub fn update_shallow(remove: &BTreeSet<String>, add: &BTreeSet<String>) -> Result<()> {
+    let shared = shared_repository()?;
+    update_shallow_file(
+        &shallow_path()?,
+        remove,
+        add,
+        shared.as_ref().map(Option::as_deref),
+    )
+}
+
+/// `core.sharedRepository`: `Some(None)` when set without a value, which
+/// `git config --get` would print as empty.
+fn shared_repository() -> Result<Option<Option<String>>> {
+    let (ok, out, _) = run_status([
+        "config",
+        "--null",
+        "--get-regexp",
+        "^core\\.sharedrepository$",
     ])?;
-    let shallow = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e) => return Err(e).with_context(|| format!("reading {path}")),
+    if !ok {
+        return Ok(None);
+    }
+    // `<key>\n<value>\0`, or `<key>\0` when valueless; the last one wins.
+    let Some(last) = out.split(|&b| b == 0).rfind(|e| !e.is_empty()) else {
+        return Ok(None);
     };
-    let shallow: std::collections::HashSet<&str> = shallow.lines().collect();
+    let value = match last.iter().position(|&b| b == b'\n') {
+        Some(at) => Some(
+            String::from_utf8(
+                last.get(at.saturating_add(1)..)
+                    .unwrap_or_default()
+                    .to_vec(),
+            )
+            .context("core.sharedRepository is not UTF-8")?,
+        ),
+        None => None,
+    };
+    Ok(Some(value))
+}
+
+/// The mode git gives a file it creates as `mode` in a repository with
+/// `core.sharedRepository` set to `shared` (`None`: valueless), as its
+/// `git_config_perm` and `calc_shared_perm`.
+fn shared_file_mode(shared: Option<&str>, mode: u32) -> Result<u32> {
+    const GROUP: u32 = 0o660;
+    const EVERYBODY: u32 = 0o664;
+    // The bits to add, or the exact mode.
+    let (tweak, exact) = match shared {
+        None | Some("group") => (GROUP, false),
+        Some("umask") => return Ok(mode),
+        Some("all" | "world" | "everybody") => (EVERYBODY, false),
+        Some(v) => match u32::from_str_radix(v, 8) {
+            // strtol's: an empty value is 0.
+            _ if v.is_empty() => return Ok(mode),
+            Ok(0) => return Ok(mode),
+            Ok(1) => (GROUP, false),
+            Ok(2) => (EVERYBODY, false),
+            Ok(i) if i & 0o600 == 0o600 => (i & 0o666, true),
+            Ok(i) => bail!(
+                "core.sharedRepository = {v}: the owner of files must always have read and \
+                 write permissions (0{i:o})"
+            ),
+            // Not octal: a boolean, as git_config_bool.
+            Err(_) => match v.to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" => (GROUP, false),
+                "false" | "no" | "off" => return Ok(mode),
+                // A decimal integer, nonzero as it holds an 8 or a 9.
+                d if d.bytes().all(|b| b.is_ascii_digit()) && d.contains(['8', '9']) => {
+                    (GROUP, false)
+                }
+                _ => bail!("core.sharedRepository = {v} is not understood"),
+            },
+        },
+    };
+    let mut tweak = tweak;
+    if mode & 0o200 == 0 {
+        tweak &= !0o222;
+    }
+    if mode & 0o100 != 0 {
+        tweak |= (tweak & 0o444) >> 2;
+    }
+    Ok(if exact {
+        (mode & !0o777) | tweak
+    } else {
+        mode | tweak
+    })
+}
+
+fn update_shallow_file(
+    path: &Path,
+    remove: &BTreeSet<String>,
+    add: &BTreeSet<String>,
+    shared: Option<Option<&str>>,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut lock = path.as_os_str().to_owned();
+    lock.push(".lock");
+    let lock = PathBuf::from(lock);
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+            "Unable to create '{}': File exists. Another git process seems to be running in \
+             this repository; if none is, remove the file and try again",
+            lock.display()
+        ),
+        Err(e) => return Err(e).with_context(|| format!("creating {}", lock.display())),
+    };
+    let result = (|| {
+        // Read under the lock: git may have changed it since.
+        let before = read_shallow(path)?;
+        let mut after: BTreeSet<String> = before.difference(remove).cloned().collect();
+        after.extend(add.iter().cloned());
+        if after == before {
+            return Ok(false);
+        }
+        if after.is_empty() {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(e).with_context(|| format!("removing {}", path.display()));
+                }
+                _ => return Ok(false),
+            }
+        }
+        let text: String = after.iter().map(|c| format!("{c}\n")).collect();
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", lock.display()))?;
+        // The file keeps its mode (group write, in a shared repository); a
+        // new one gets core.sharedRepository's.
+        let mode = match std::fs::metadata(path) {
+            Ok(m) => m.permissions().mode() & 0o7777,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let created = file
+                    .metadata()
+                    .with_context(|| format!("reading {}", lock.display()))?
+                    .permissions()
+                    .mode();
+                shared.map_or(Ok(created), |s| shared_file_mode(s, created))?
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("setting the mode of {}", lock.display()))?;
+        std::fs::rename(&lock, path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(true)
+    })();
+    // Renamed into place, or released.
+    if !matches!(result, Ok(true)) {
+        std::fs::remove_file(&lock).with_context(|| format!("removing {}", lock.display()))?;
+    }
+    result.map(|_| ())
+}
+
+/// Commits reachable from the tips present locally, using the file `shallow`
+/// as the repository's boundary instead of `.git/shallow`.
+pub fn reached_with_shallow(tips: &[Oid], shallow: &Path) -> Result<BTreeSet<Oid>> {
+    let mut input = tips.join("\n");
+    input.push('\n');
+    let mut args = vec![OsString::from("--shallow-file"), shallow.into()];
+    args.extend(["rev-list", "--ignore-missing", "--stdin"].map(OsString::from));
+    let out = run_input(args, input.as_bytes())?;
+    Ok(String::from_utf8(out)
+        .context("rev-list output is not UTF-8")?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The parents each of `commits` names, from the objects themselves (git
+/// hides a boundary commit's parents). Absent commits are left out.
+pub fn commit_parents(commits: &[Oid]) -> Result<BTreeMap<Oid, Vec<Oid>>> {
+    let mut parents = BTreeMap::new();
+    if commits.is_empty() {
+        return Ok(parents);
+    }
+    let mut input = commits.join("\n");
+    input.push('\n');
+    // `<oid> <type> <size>\n<content>\n`, or `<oid> missing\n`, in input order.
+    let out = run_input(["cat-file", "--batch"], input.as_bytes())?;
+    let mut rest = out.as_slice();
+    for c in commits {
+        let header_end = rest
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| anyhow!("short cat-file --batch output"))?;
+        let header = std::str::from_utf8(rest.get(..header_end).unwrap_or_default())
+            .context("malformed cat-file --batch header")?;
+        let fields: Vec<&str> = header.split(' ').collect();
+        let (ty, size) = match fields.as_slice() {
+            [_, "missing"] => {
+                rest = rest.get(header_end.saturating_add(1)..).unwrap_or_default();
+                continue;
+            }
+            [_, ty, size] => (*ty, size.parse::<usize>().ok()),
+            _ => (header, None),
+        };
+        let size = size.ok_or_else(|| anyhow!("malformed cat-file --batch header `{header}`"))?;
+        let start = header_end.saturating_add(1);
+        let end = start.saturating_add(size);
+        let content = rest
+            .get(start..end)
+            .ok_or_else(|| anyhow!("short cat-file --batch output"))?;
+        if ty == "commit" {
+            let named = String::from_utf8_lossy(content)
+                .lines()
+                .take_while(|l| !l.is_empty())
+                .filter_map(|l| l.strip_prefix("parent "))
+                .map(str::to_owned)
+                .collect();
+            parents.insert(c.clone(), named);
+        }
+        rest = rest.get(end.saturating_add(1)..).unwrap_or_default();
+    }
+    Ok(parents)
+}
+
+/// The commits of `tips` minus `excludes` that are shallow boundaries of
+/// this clone: their parents are missing here, so a pack of that range
+/// references commits it cannot carry.
+pub fn shallow_boundaries(tips: &[Oid], excludes: &[Oid]) -> Result<Vec<Oid>> {
+    let shallow = shallow_commits()?;
     if shallow.is_empty() {
         return Ok(vec![]);
     }
@@ -796,7 +1036,7 @@ pub fn shallow_boundaries(tips: &[Oid], excludes: &[Oid]) -> Result<Vec<Oid>> {
     Ok(String::from_utf8(listed)
         .context("rev-list output is not UTF-8")?
         .lines()
-        .filter(|c| shallow.contains(c))
+        .filter(|c| shallow.contains(*c))
         .map(str::to_owned)
         .collect())
 }
@@ -896,6 +1136,77 @@ mod tests {
         let c = USER.command(["status"]);
         assert!(c.get_envs().all(|(_, v)| v.is_some()));
         assert_eq!(c.get_args().next(), Some(OsStr::new("status")));
+    }
+
+    #[test]
+    fn update_shallow_file_takes_gits_lock() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("enc-shallow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shallow");
+        let set = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        std::fs::write(&path, "a\nb\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        update_shallow_file(&path, &set(&["a"]), &set(&["c"]), None).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b\nc\n");
+        // Its mode stays.
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o664);
+
+        // Held by another process: nothing changes, and its lock stays.
+        let lock = dir.join("shallow.lock");
+        std::fs::write(&lock, "").unwrap();
+        let err = update_shallow_file(&path, &set(&["b"]), &set(&[]), None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("shallow.lock': File exists"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "b\nc\n");
+        assert!(lock.exists());
+        std::fs::remove_file(&lock).unwrap();
+
+        update_shallow_file(&path, &set(&["b", "c"]), &set(&[]), None).unwrap();
+        assert!(!path.exists() && !lock.exists());
+
+        // A new file gets core.sharedRepository's mode.
+        update_shallow_file(&path, &set(&[]), &set(&["d"]), Some(Some("0640"))).unwrap();
+        assert_eq!(mode(&path), 0o640);
+        std::fs::remove_file(&path).unwrap();
+        update_shallow_file(&path, &set(&[]), &set(&["d"]), Some(Some("group"))).unwrap();
+        assert_eq!(mode(&path) & 0o660, 0o660);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shared_file_mode_follows_gits_config_perm() {
+        let m = |s: Option<&str>| shared_file_mode(s, 0o644).unwrap();
+        // Valueless is true.
+        assert_eq!(m(None), 0o664);
+        for v in ["umask", "", "0", "00", "false", "No", "OFF"] {
+            assert_eq!(m(Some(v)), 0o644, "{v}");
+        }
+        for v in ["group", "1", "true", "Yes", "on", "9"] {
+            assert_eq!(m(Some(v)), 0o664, "{v}");
+        }
+        for v in ["all", "world", "everybody", "2"] {
+            assert_eq!(m(Some(v)), 0o664, "{v}");
+        }
+        assert_eq!(shared_file_mode(Some("all"), 0o600).unwrap(), 0o664);
+        assert_eq!(shared_file_mode(Some("group"), 0o600).unwrap(), 0o660);
+        // An exact mode replaces the permission bits, never with x or
+        // others' write.
+        assert_eq!(m(Some("0640")), 0o640);
+        assert_eq!(m(Some("0777")), 0o666);
+        assert_eq!(
+            shared_file_mode(Some("0640"), 0o100_755).unwrap(),
+            0o100_750
+        );
+        // Without the owner's write, nobody gets it.
+        assert_eq!(shared_file_mode(Some("group"), 0o444).unwrap(), 0o444);
+        // Keywords are case-sensitive; the owner must read and write.
+        for v in ["Group", "ALL", "Umask", "0400", "0200", "0060", "bogus"] {
+            assert!(shared_file_mode(Some(v), 0o644).is_err(), "{v}");
+        }
     }
 
     #[test]

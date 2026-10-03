@@ -3531,3 +3531,602 @@ fn a_backend_without_the_pack_blobs_pushes_and_repacks() {
         fs::read(a.join("big")).unwrap()
     );
 }
+
+/// Alice's repository with `n` pushes, each rewriting `data`, repacked.
+fn repacked_history(sb: &Sandbox, n: usize) -> (PathBuf, String, PathBuf) {
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    // Over the backend's 1 MiB filter once repacked: the history pack stays
+    // on the host until needed.
+    for _ in 0..n {
+        sb.commit_random(&a, "data", 400_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    sb.enc_ok(&a, &["repack", "enc"]);
+    (a, url, alice)
+}
+
+fn shallow_clone(sb: &Sandbox, name: &str, url: &str, identity: &Path) -> (PathBuf, String) {
+    let id = identity.to_str().unwrap();
+    let out = sb
+        .cmd(&sb.root, "git")
+        .args([
+            "-c",
+            &format!("enc.identity={id}"),
+            "-c",
+            "enc.trustOnFirstUse=true",
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            url,
+            name,
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{err}");
+    let d = sb.root.join(name);
+    sb.git_ok(&d, &["config", "remote.origin.enc-identity", id]);
+    (d, err)
+}
+
+#[test]
+fn a_shallow_clone_does_without_the_history() {
+    let sb = Sandbox::new("shallow");
+    let (a, url, alice) = repacked_history(&sb, 4);
+    // Pushed after the repack: part of a shallow clone.
+    sb.commit_random(&a, "data", 50_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let old = sb.git_ok(&a, &["rev-parse", "main~3:data"]);
+
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    assert_eq!(
+        sb.git_ok(&c, &["rev-parse", "--is-shallow-repository"])
+            .trim(),
+        "true"
+    );
+    assert_eq!(sb.git_ok(&c, &["rev-list", "--count", "HEAD"]).trim(), "2");
+    assert_eq!(
+        fs::read(c.join("data")).unwrap(),
+        fs::read(a.join("data")).unwrap()
+    );
+    assert!(!sb.git(&c, &["cat-file", "-e", old.trim()]).status.success());
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+
+    // A plain fetch keeps it shallow; pushing from it works.
+    sb.commit_random(&a, "data", 50_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.git_ok(&c, &["pull", "-q", "origin", "main"]);
+    assert_eq!(
+        sb.git_ok(&c, &["rev-parse", "--is-shallow-repository"])
+            .trim(),
+        "true"
+    );
+    assert!(!sb.git(&c, &["cat-file", "-e", old.trim()]).status.success());
+    sb.commit_text(&c, "c", "c\n");
+    sb.git_ok(&c, &["push", "-q", "origin", "main"]);
+    sb.git_ok(&a, &["pull", "-q", "enc", "main"]);
+    assert_eq!(fs::read_to_string(a.join("c")).unwrap(), "c\n");
+
+    // The history pack never left the host.
+    let m = sb.enc_ok(&a, &["manifest", "enc"]);
+    let history = m
+        .lines()
+        .find(|l| l.starts_with("snapshot "))
+        .and_then(|l| l.split(' ').nth(2))
+        .unwrap()
+        .to_owned();
+    let tree = sb.git_ok(&a.join("../host.git"), &["ls-tree", "refs/heads/enc"]);
+    let blob = tree
+        .lines()
+        .find(|l| l.ends_with(&format!("{history}.age")))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .unwrap()
+        .to_owned();
+    let in_backend = |r: &Path| {
+        sb.cmd(r, "git")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args([
+                "--git-dir",
+                backend_repo(r).to_str().unwrap(),
+                "cat-file",
+                "-e",
+                &blob,
+            ])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(!in_backend(&c));
+
+    sb.git_ok(&c, &["fetch", "-q", "--unshallow", "origin"]);
+    assert!(in_backend(&c));
+    assert_eq!(
+        sb.git_ok(&c, &["rev-parse", "--is-shallow-repository"])
+            .trim(),
+        "false"
+    );
+    sb.git_ok(&c, &["cat-file", "-e", old.trim()]);
+    assert_eq!(
+        sb.git_ok(&c, &["rev-list", "--count", "HEAD"]),
+        sb.git_ok(&a, &["rev-list", "--count", "HEAD"])
+    );
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+}
+
+#[test]
+fn a_shallow_clone_fetches_the_history_a_ref_builds_on() {
+    let sb = Sandbox::new("shallow-old-base");
+    let (a, url, alice) = repacked_history(&sb, 4);
+    // A branch off a commit only the history pack holds.
+    sb.git_ok(&a, &["checkout", "-q", "-b", "old", "main~2"]);
+    sb.commit_text(&a, "o", "o\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "old"]);
+
+    let (c, err) = shallow_clone(&sb, "carol", &url, &alice);
+    assert!(err.contains("older than the snapshot"), "{err}");
+    assert_eq!(
+        sb.git_ok(&c, &["rev-parse", "--is-shallow-repository"])
+            .trim(),
+        "false"
+    );
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+    sb.git_ok(&c, &["fetch", "-q", "origin", "old"]);
+    assert_eq!(
+        sb.git_ok(&c, &["rev-parse", "FETCH_HEAD"]),
+        sb.git_ok(&a, &["rev-parse", "old"])
+    );
+}
+
+#[test]
+fn a_remote_never_repacked_clones_in_full_with_a_depth() {
+    let sb = Sandbox::new("shallow-none");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for i in 0..3 {
+        sb.commit_text(&a, "f", &format!("{i}\n"));
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    let (c, err) = shallow_clone(&sb, "carol", &url, &alice);
+    assert!(err.contains("no snapshot"), "{err}");
+    assert_eq!(sb.git_ok(&c, &["rev-list", "--count", "HEAD"]).trim(), "3");
+}
+
+fn is_shallow(sb: &Sandbox, repo: &Path) -> bool {
+    sb.git_ok(repo, &["rev-parse", "--is-shallow-repository"])
+        .trim()
+        == "true"
+}
+
+fn shallow_file(repo: &Path) -> String {
+    fs::read_to_string(repo.join(".git/shallow")).unwrap_or_default()
+}
+
+#[test]
+fn a_shallow_clone_keeps_its_boundary_when_the_history_is_dropped() {
+    let sb = Sandbox::new("shallow-orphan");
+    let (a, url, alice) = repacked_history(&sb, 3);
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    let tip = sb.git_ok(&c, &["rev-parse", "HEAD"]).trim().to_owned();
+    assert!(shallow_file(&c).contains(&tip));
+
+    // An orphan replaces main and a repack drops the old history: the
+    // snapshot has no history pack that could complete the boundary.
+    sb.git_ok(&a, &["checkout", "-q", "--orphan", "fresh"]);
+    sb.commit_text(&a, "f", "f\n");
+    sb.git_ok(&a, &["push", "-q", "--force", "enc", "fresh:main"]);
+    sb.enc_ok(&a, &["repack", "enc"]);
+    let m = sb.enc_ok(&a, &["manifest", "enc"]);
+    let snapshot = m.lines().find(|l| l.starts_with("snapshot ")).unwrap();
+    assert_eq!(snapshot.split(' ').nth(2), Some("-"), "{snapshot}");
+
+    sb.git_ok(&c, &["fetch", "-q", "origin"]);
+    assert!(shallow_file(&c).contains(&tip));
+    sb.git_ok(&c, &["fsck", "--no-progress"]);
+    sb.git_ok(&c, &["log", "--oneline", "main"]);
+    sb.git_ok(&c, &["fetch", "-q", "--unshallow", "origin"]);
+    assert!(shallow_file(&c).contains(&tip));
+    sb.git_ok(&c, &["log", "--oneline", "main"]);
+}
+
+#[test]
+fn a_push_reaching_a_dropped_snapshot_is_refused() {
+    let sb = Sandbox::new("shallow-dropped");
+    let (a, url, alice) = repacked_history(&sb, 3);
+    sb.git_ok(&a, &["checkout", "-q", "-b", "tmp", "main~2"]);
+    sb.commit_text(&a, "s", "s1\n");
+    sb.commit_text(&a, "s", "s2\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "tmp"]);
+    sb.enc_ok(&a, &["repack", "enc"]);
+    let s2 = sb.git_ok(&a, &["rev-parse", "tmp"]).trim().to_owned();
+
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    sb.git_ok(
+        &c,
+        &["fetch", "-q", "origin", "tmp:refs/remotes/origin/tmp"],
+    );
+    assert!(shallow_file(&c).contains(&s2));
+
+    // s1 leaves the remote: s2's parent is nowhere a participant can get it.
+    sb.git_ok(&a, &["push", "-q", "enc", ":tmp"]);
+    sb.enc_ok(&a, &["repack", "enc"]);
+
+    let (ok, out, _) = sb.enc(&c, &["doctor", "origin"]);
+    assert!(
+        !ok && out.contains(&format!(
+            "FAIL  shallow boundary: the clone is shallow at {s2},"
+        )),
+        "{out}"
+    );
+    sb.git_ok(&c, &["checkout", "-q", "-b", "t2", "origin/tmp"]);
+    sb.commit_text(&c, "t2", "t2\n");
+    let err = sb.git_fails(&c, &["push", "origin", "t2"]);
+    assert!(
+        err.contains(&format!("reaches its boundary at {s2}"))
+            && err.contains("git fetch --unshallow"),
+        "{err}"
+    );
+    let (d, _) = shallow_clone(&sb, "dave", &url, &alice);
+    sb.git_ok(&d, &["fetch", "-q", "--unshallow", "origin"]);
+    sb.git_ok(&d, &["fsck", "--connectivity-only"]);
+}
+
+#[test]
+fn a_shallow_clone_fetches_the_history_a_pack_deltas_against() {
+    let sb = Sandbox::new("shallow-delta");
+    let (a, url, alice) = repacked_history(&sb, 4);
+    // A blob only the history pack holds is the delta base of this push.
+    sb.git_ok(&a, &["checkout", "-q", "-b", "side", "main~2"]);
+    let mut data = fs::read(a.join("data")).unwrap();
+    data[1000] ^= 0xff;
+    fs::write(a.join("data"), data).unwrap();
+    sb.git_ok(&a, &["commit", "-qam", "side"]);
+    sb.git_ok(&a, &["push", "-q", "enc", "side"]);
+
+    let (c, err) = shallow_clone(&sb, "carol", &url, &alice);
+    assert!(
+        err.contains("builds on history older than the snapshot") && !err.contains("a ref builds"),
+        "{err}"
+    );
+    assert!(!is_shallow(&sb, &c));
+    sb.git_ok(&c, &["fetch", "-q", "origin", "side"]);
+    assert_eq!(
+        sb.git_ok(&c, &["rev-parse", "FETCH_HEAD"]),
+        sb.git_ok(&a, &["rev-parse", "side"])
+    );
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+}
+
+#[test]
+fn a_shallow_clone_survives_a_deleted_branch_and_a_gc() {
+    let sb = Sandbox::new("shallow-gc");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    for _ in 0..4 {
+        sb.commit_random(&a, "data", 400_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    // A snapshot commit that no ref reaches once tmp is deleted.
+    sb.git_ok(&a, &["push", "-q", "enc", "main~2:refs/heads/tmp"]);
+    sb.enc_ok(&a, &["repack", "enc"]);
+    let tmp = sb.git_ok(&a, &["rev-parse", "main~2"]).trim().to_owned();
+
+    // Cloned while tmp exists: tmp is part of the boundary.
+    let (before, _) = shallow_clone(&sb, "before", &url, &alice);
+    sb.git_ok(
+        &before,
+        &["fetch", "-q", "origin", "tmp:refs/remotes/origin/tmp"],
+    );
+    assert!(shallow_file(&before).contains(&tmp));
+    let (pusher, _) = shallow_clone(&sb, "pusher", &url, &alice);
+    sb.git_ok(
+        &pusher,
+        &["fetch", "-q", "origin", "tmp:refs/remotes/origin/tmp"],
+    );
+
+    sb.git_ok(&a, &["push", "-q", "enc", ":tmp"]);
+
+    // Cloned after: no ref reaches tmp, which is no boundary.
+    let (after, _) = shallow_clone(&sb, "after", &url, &alice);
+    assert!(!shallow_file(&after).contains(&tmp));
+    assert!(is_shallow(&sb, &after));
+
+    sb.git_ok(&before, &["update-ref", "-d", "refs/remotes/origin/tmp"]);
+    for c in [&before, &after] {
+        sb.git_ok(c, &["gc", "-q", "--prune=now"]);
+    }
+    assert!(!sb.git(&before, &["cat-file", "-e", &tmp]).status.success());
+    sb.commit_random(&a, "data", 50_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    for c in [&before, &after] {
+        sb.git_ok(c, &["pull", "-q", "origin", "main"]);
+        assert!(is_shallow(&sb, c));
+        assert!(!shallow_file(c).contains(&tmp));
+        sb.git_ok(c, &["fsck", "--connectivity-only"]);
+    }
+
+    // A push reaching the boundary this remote set is not refused: the
+    // remote holds its parents.
+    sb.git_ok(&pusher, &["checkout", "-q", "-b", "t2", "origin/tmp"]);
+    sb.commit_text(&pusher, "t2", "t2\n");
+    sb.git_ok(&pusher, &["push", "-q", "origin", "t2"]);
+    sb.git_ok(&a, &["fetch", "-q", "enc", "t2"]);
+    sb.git_ok(&a, &["fsck", "--connectivity-only"]);
+}
+
+#[test]
+fn deepen_fetches_the_whole_history() {
+    let sb = Sandbox::new("shallow-deepen");
+    let (a, url, alice) = repacked_history(&sb, 3);
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    assert!(is_shallow(&sb, &c));
+    sb.git_ok(&c, &["fetch", "-q", "--deepen", "1", "origin"]);
+    assert!(!is_shallow(&sb, &c));
+    assert_eq!(
+        sb.git_ok(&c, &["rev-list", "--count", "HEAD"]),
+        sb.git_ok(&a, &["rev-list", "--count", "HEAD"])
+    );
+}
+
+#[test]
+fn unshallow_keeps_another_remotes_boundary() {
+    let sb = Sandbox::new("shallow-foreign");
+    let (_, url, alice) = repacked_history(&sb, 3);
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    let out = sb.enc_ok(&c, &["doctor", "origin"]);
+    assert!(out.contains("ok    shallow boundary"), "{out}");
+
+    let public = sb.dir("public.git");
+    sb.git_ok(&public, &["init", "-q", "--bare"]);
+    let seed = sb.repo("seed");
+    sb.commit_text(&seed, "one", "1\n");
+    sb.commit_text(&seed, "two", "2\n");
+    sb.git_ok(&seed, &["push", "-q", public.to_str().unwrap(), "main"]);
+    let public_url = format!("file://{}", public.display());
+    sb.git_ok(
+        &c,
+        &[
+            "fetch",
+            "-q",
+            "--depth=1",
+            &public_url,
+            "main:refs/heads/pub",
+        ],
+    );
+    let pub_tip = sb.git_ok(&c, &["rev-parse", "pub"]).trim().to_owned();
+    assert!(shallow_file(&c).contains(&pub_tip));
+
+    sb.git_ok(&c, &["fetch", "-q", "--unshallow", "origin"]);
+    assert_eq!(shallow_file(&c), format!("{pub_tip}\n"));
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+
+    let (ok, out, _) = sb.enc(&c, &["doctor", "origin"]);
+    assert!(
+        !ok && out.contains(&format!(
+            "FAIL  shallow boundary: the clone is shallow at {pub_tip},"
+        )),
+        "{out}"
+    );
+    // That boundary still blocks a push.
+    sb.git_ok(&c, &["checkout", "-q", "pub"]);
+    let err = sb.git_fails(&c, &["push", "origin", "pub"]);
+    assert!(err.contains("this clone is shallow"), "{err}");
+}
+
+#[test]
+fn a_shallow_clone_repacks() {
+    let sb = Sandbox::new("shallow-repack");
+    let (a, url, alice) = repacked_history(&sb, 3);
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    sb.enc_ok(&c, &["repack", "origin"]);
+    assert!(!is_shallow(&sb, &c));
+    sb.git_ok(&a, &["pull", "-q", "enc", "main"]);
+    let (d, _) = shallow_clone(&sb, "dave", &url, &alice);
+    assert!(is_shallow(&sb, &d));
+    sb.git_ok(&d, &["fetch", "-q", "--unshallow", "origin"]);
+    assert_eq!(
+        sb.git_ok(&d, &["rev-list", "--count", "HEAD"]),
+        sb.git_ok(&a, &["rev-list", "--count", "HEAD"])
+    );
+}
+
+#[test]
+fn a_shallow_clone_keeps_its_boundary_across_repacks() {
+    let sb = Sandbox::new("shallow-second-repack");
+    let (a, url, alice) = repacked_history(&sb, 3);
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    let first = shallow_file(&c);
+    assert!(!first.is_empty());
+
+    sb.commit_random(&a, "data", 50_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.enc_ok(&a, &["repack", "enc"]);
+    sb.commit_random(&a, "data", 50_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    sb.git_ok(&c, &["pull", "-q", "origin", "main"]);
+    assert_eq!(shallow_file(&c), first);
+    assert_eq!(
+        fs::read(c.join("data")).unwrap(),
+        fs::read(a.join("data")).unwrap()
+    );
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+
+    sb.git_ok(&c, &["fetch", "-q", "--unshallow", "origin"]);
+    assert!(!is_shallow(&sb, &c));
+    assert_eq!(
+        sb.git_ok(&c, &["rev-list", "--count", "HEAD"]),
+        sb.git_ok(&a, &["rev-list", "--count", "HEAD"])
+    );
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+}
+
+/// Run a git command, require success, and return its stderr.
+fn git_err(sb: &Sandbox, repo: &Path, args: &[&str]) -> String {
+    let out = sb.git(repo, args);
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "git {args:?} failed:\n{err}");
+    err
+}
+
+#[test]
+fn a_plain_fetch_after_a_repack_keeps_a_shallow_clone_connected() {
+    let sb = Sandbox::new("shallow-reconnect");
+    let (a, url, alice) = repacked_history(&sb, 3);
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    let tip = sb.git_ok(&c, &["rev-parse", "HEAD"]).trim().to_owned();
+
+    // Neither commit reaches carol before the repack: the new snapshot's
+    // commit would be a boundary cut off from her history.
+    for _ in 0..2 {
+        sb.commit_random(&a, "data", 50_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    sb.enc_ok(&a, &["repack", "enc"]);
+
+    let err = git_err(&sb, &c, &["fetch", "origin"]);
+    assert!(err.contains("does not connect"), "{err}");
+    assert!(!err.contains("forced update"), "{err}");
+    sb.git_ok(&c, &["merge-base", "--is-ancestor", &tip, "origin/main"]);
+    sb.git_ok(&c, &["pull", "-q", "origin", "main"]);
+    assert_eq!(
+        sb.git_ok(&c, &["rev-parse", "HEAD"]),
+        sb.git_ok(&a, &["rev-parse", "HEAD"])
+    );
+    assert!(!is_shallow(&sb, &c));
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+}
+
+#[test]
+fn a_depth_on_a_shallow_clone_says_it_does_not_deepen() {
+    let sb = Sandbox::new("shallow-redepth");
+    let (a, url, alice) = repacked_history(&sb, 3);
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    sb.commit_random(&a, "data", 50_000);
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let err = git_err(&sb, &c, &["fetch", "--depth=3", "origin"]);
+    assert!(err.contains("--depth does not deepen"), "{err}");
+    assert!(is_shallow(&sb, &c));
+}
+
+#[test]
+fn unshallow_reports_a_boundary_the_remote_no_longer_completes() {
+    let sb = Sandbox::new("shallow-stuck");
+    let (a, url, alice) = repacked_history(&sb, 3);
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    let tip = sb.git_ok(&c, &["rev-parse", "HEAD"]).trim().to_owned();
+
+    // main drops tip and its parent; the next repack's history pack does
+    // not hold that parent.
+    sb.git_ok(&a, &["reset", "-q", "--hard", "HEAD~2"]);
+    sb.commit_text(&a, "x", "x\n");
+    sb.git_ok(&a, &["push", "-q", "--force", "enc", "main"]);
+    sb.commit_text(&a, "y", "y\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.enc_ok(&a, &["repack", "enc"]);
+
+    let err = git_err(&sb, &c, &["fetch", "--unshallow", "origin"]);
+    assert!(
+        err.contains(&format!("origin no longer holds the parents of {tip}")),
+        "{err}"
+    );
+    assert_eq!(shallow_file(&c), format!("{tip}\n"));
+    let (ok, out, _) = sb.enc(&c, &["doctor", "origin"]);
+    assert!(
+        !ok && out.contains(&format!(
+            "the clone is shallow at {tip}, whose parents origin no longer holds"
+        )) && !out.contains("--unshallow"),
+        "{out}"
+    );
+
+    // A later repack: the plain fetch does not add a boundary cut off from
+    // the history fetched.
+    for f in ["z", "w"] {
+        sb.commit_text(&a, f, "z\n");
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    sb.enc_ok(&a, &["repack", "enc"]);
+    sb.git_ok(&c, &["fetch", "-q", "origin"]);
+    assert_eq!(shallow_file(&c), format!("{tip}\n"));
+    assert_eq!(
+        sb.git_ok(&c, &["rev-list", "--count", "origin/main"]),
+        sb.git_ok(&a, &["rev-list", "--count", "main"])
+    );
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+
+    // As the hint says: no ref reaching it, then a gc, drops it.
+    sb.git_ok(&c, &["reset", "-q", "--hard", "origin/main"]);
+    sb.git_ok(
+        &c,
+        &["reflog", "expire", "--expire-unreachable=now", "--all"],
+    );
+    sb.git_ok(&c, &["gc", "-q", "--prune=now"]);
+    assert!(!is_shallow(&sb, &c));
+    sb.git_ok(&c, &["fsck", "--connectivity-only"]);
+}
+
+#[test]
+fn doctor_does_not_call_a_boundary_with_its_parents_here_stuck() {
+    let sb = Sandbox::new("shallow-not-stuck");
+    let (a, url, alice) = repacked_history(&sb, 3);
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    let tip = sb.git_ok(&c, &["rev-parse", "HEAD"]).trim().to_owned();
+    // tip is no longer the snapshot's.
+    sb.commit_text(&a, "x", "x\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    sb.enc_ok(&a, &["repack", "enc"]);
+    sb.git_ok(&c, &["fetch", "-q", "--unshallow", "origin"]);
+    assert!(!is_shallow(&sb, &c));
+
+    // Recorded as a boundary again, parents and every pack here.
+    fs::write(c.join(".git/shallow"), format!("{tip}\n")).unwrap();
+    let state = backend_repo(&c).parent().unwrap().to_owned();
+    fs::write(state.join("shallow"), format!("{tip}\n")).unwrap();
+    let (_, out, _) = sb.enc(&c, &["doctor", "origin"]);
+    assert!(!out.contains("no longer holds"), "{out}");
+}
+
+#[test]
+fn shallow_since_and_exclude_are_refused() {
+    let sb = Sandbox::new("shallow-since");
+    let (_, url, alice) = repacked_history(&sb, 2);
+    let id = alice.to_str().unwrap();
+    for opt in ["--shallow-since=2000-01-01", "--shallow-exclude=main"] {
+        let out = sb
+            .cmd(&sb.root, "git")
+            .args([
+                "-c",
+                &format!("enc.identity={id}"),
+                "-c",
+                "enc.trustOnFirstUse=true",
+                "clone",
+                "-q",
+                opt,
+                &url,
+                "carol",
+            ])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        let flag = opt.split('=').next().unwrap();
+        assert!(
+            !out.status.success() && err.contains(&format!("{flag} is not supported")),
+            "{err}"
+        );
+        assert!(!sb.root.join("carol").exists());
+    }
+    let (c, _) = shallow_clone(&sb, "carol", &url, &alice);
+    let err = sb.git_fails(&c, &["fetch", "--shallow-since=2000-01-01", "origin"]);
+    assert!(err.contains("--shallow-since is not supported"), "{err}");
+}

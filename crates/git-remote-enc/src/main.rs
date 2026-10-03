@@ -102,9 +102,19 @@ fn run() -> Result<()> {
             repack(target, o.flag("--rewrite-history"))
         }
         [cmd, target] if cmd == "forget" => {
-            let dir = open_by_name_or_url(target)?.forget()?;
+            let (dir, kept) = open_by_name_or_url(target)?.forget()?;
+            let what = if kept {
+                format!(
+                    " but for {}, the shallow boundary it set, whose commits still lack their \
+                     parents: `git fetch --unshallow {target}` (same URL and branch) drops it, or \
+                     delete it once .git/shallow no longer lists them",
+                    dir.join("shallow").display()
+                )
+            } else {
+                String::new()
+            };
             eprintln!(
-                "enc: removed {}; the next contact with {target} is a first contact and needs a pinned participant list",
+                "enc: removed {}{what}; the next contact with {target} is a first contact and needs a pinned participant list",
                 dir.display()
             );
             Ok(())
@@ -459,7 +469,7 @@ fn add_remote(name: &str, url: &str, identity: Option<String>) -> Result<(PathBu
 fn warn_if_shallow() -> Result<()> {
     if enccore::setup::is_shallow()? {
         eprintln!(
-            "enc: warning: this clone is shallow; a push reaching its boundary is refused until `git fetch --unshallow <the remote it was cloned from>`"
+            "enc: warning: this clone is shallow; a push reaching a boundary that an encrypted remote did not set is refused until `git fetch --unshallow <the remote it was cloned from>`"
         );
     }
     Ok(())
@@ -681,18 +691,6 @@ fn doctor(target: &str) -> Result<()> {
     );
     report(
         &mut ok,
-        "full history",
-        if setup::is_shallow()? {
-            Err(
-                "the clone is shallow; `git fetch --unshallow <the remote it was cloned from>`"
-                    .to_owned(),
-            )
-        } else {
-            Ok(String::new())
-        },
-    );
-    report(
-        &mut ok,
         "Git LFS",
         match remote.lfs_refusal()? {
             Some(why) => Err(format!("a push is refused: {why} (README, Git LFS)")),
@@ -740,6 +738,41 @@ fn doctor(target: &str) -> Result<()> {
         // to avoid reporting it twice.
         report(&mut ok, "local state", Err(format!("{e:#}")));
     }
+    // Checked against the manifest read above, if any: a boundary of the
+    // current snapshot's never blocks a push, as the remote holds its
+    // parents.
+    // Those this remote set and no longer completes even with every pack
+    // fetched: no fetch helps.
+    let stuck = remote.stuck_boundary()?;
+    let (stuck, incomplete): (Vec<_>, Vec<_>) = remote
+        .incomplete_boundary()?
+        .into_iter()
+        .partition(|c| stuck.contains(c));
+    let mut why = Vec::new();
+    if !incomplete.is_empty() {
+        why.push(format!(
+            "the clone is shallow at {}, whose parents {target} cannot complete: a push \
+             reaching it is refused; `git fetch --unshallow <the remote it was cloned from>`",
+            incomplete.join(", ")
+        ));
+    }
+    if !stuck.is_empty() {
+        why.push(format!(
+            "the clone is shallow at {}, whose parents {target} no longer holds: a push \
+             reaching it is refused; delete the local refs that reach it, then run `git reflog \
+             expire --expire-unreachable=now --all` and `git gc --prune=now`",
+            stuck.join(", ")
+        ));
+    }
+    report(
+        &mut ok,
+        "shallow boundary",
+        if why.is_empty() {
+            Ok(String::new())
+        } else {
+            Err(why.join("; "))
+        },
+    );
     if !ok {
         std::process::exit(1);
     }
@@ -759,6 +792,8 @@ fn helper(mut remote: Remote) -> Result<()> {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let mut out = io::stdout().lock();
+    // `git clone` goes on after an option's error: the fetch fails instead.
+    let mut refused = None;
 
     while let Some(line) = lines.next() {
         let line = line?;
@@ -775,6 +810,27 @@ fn helper(mut remote: Remote) -> Result<()> {
                     Some(("progress", "false")) => {
                         progress::set_enabled(false);
                         "ok"
+                    }
+                    Some(("depth", d)) => match d.parse() {
+                        Ok(d) => {
+                            remote.set_depth(d);
+                            "ok"
+                        }
+                        Err(_) => "error depth is not a number",
+                    },
+                    Some(("deepen-relative", v)) => {
+                        remote.set_deepen_relative(v == "true");
+                        "ok"
+                    }
+                    // Packs are the unit of a shallow fetch: no date or ref
+                    // bounds them.
+                    Some(("deepen-since", _)) => {
+                        refused = Some("--shallow-since");
+                        "error deepen-since is not supported"
+                    }
+                    Some(("deepen-not", _)) => {
+                        refused = Some("--shallow-exclude");
+                        "error deepen-not is not supported"
                     }
                     _ => "unsupported",
                 };
@@ -794,6 +850,12 @@ fn helper(mut remote: Remote) -> Result<()> {
                 // The batch's individual wants are irrelevant: every pack not
                 // yet indexed is fetched.
                 drain_batch(&mut lines)?;
+                if let Some(o) = refused {
+                    bail!(
+                        "{o} is not supported: a shallow fetch gets everything since the last \
+                         repack, as with --depth"
+                    );
+                }
                 remote.fetch()?;
                 out.write_all(b"\n")?;
             }
