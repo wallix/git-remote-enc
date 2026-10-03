@@ -3280,6 +3280,65 @@ fn backend_repo(repo: &Path) -> PathBuf {
     dirs.into_iter().next().unwrap()
 }
 
+/// Bytes of the files under `d`.
+fn dir_size(d: &Path) -> u64 {
+    fs::read_dir(d)
+        .map(|it| {
+            it.flatten()
+                .map(|e| match e.metadata() {
+                    Ok(m) if m.is_dir() => dir_size(&e.path()),
+                    Ok(m) => m.len(),
+                    Err(_) => 0,
+                })
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Check that `repo`'s backend keeps the tip's commit, tree and manifest
+/// and passes repack, gc and fsck with lazy fetching disabled.
+fn assert_backend_sound(sb: &Sandbox, repo: &Path) {
+    let backend = backend_repo(repo);
+    let git = |args: &[&str]| {
+        let out = sb
+            .cmd(repo, "git")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .arg("--git-dir")
+            .arg(&backend)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}: git {args:?}: {}",
+            backend.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let tip = git(&["rev-parse", "refs/enc/tip"]);
+    let tip = tip.trim();
+    for o in [tip, &format!("{tip}^{{tree}}"), &format!("{tip}:manifest")] {
+        git(&["cat-file", "-e", o]);
+    }
+    git(&["repack", "-d", "-q"]);
+    git(&["fsck", "--connectivity-only"]);
+    git(&["fsck", "--no-progress"]);
+    git(&["gc", "--auto", "-q"]);
+    assert!(!backend.join("gc.log").exists(), "{}", backend.display());
+    git(&[
+        "-c",
+        "repack.writeBitmaps=false",
+        "repack",
+        "-a",
+        "-d",
+        "-q",
+    ]);
+    // With bitmaps, which need a pack closed over its non-promisor objects:
+    // every landed push is sealed.
+    git(&["gc", "-q"]);
+}
+
 #[test]
 fn the_backend_stays_out_of_the_user_repository() {
     let sb = Sandbox::new("backend-repo");
@@ -3301,9 +3360,41 @@ fn the_backend_stays_out_of_the_user_repository() {
         .to_owned();
 
     let b = sb.clone("bob", &url, &alice);
+    // Neither the user's repository nor, once the pack is pushed or indexed,
+    // the backend repository keeps the ciphertext.
     for r in [&a, &b] {
         assert_eq!(sb.git_ok(r, &["for-each-ref", "refs/enc"]), "");
         assert!(!sb.git(r, &["cat-file", "-e", &pack_blob]).status.success());
+        let backend = backend_repo(r);
+        assert!(
+            dir_size(&backend) < 500_000,
+            "{}: {}",
+            backend.display(),
+            dir_size(&backend)
+        );
+        assert_backend_sound(&sb, r);
+    }
+    // And the next push and fetch do without it.
+    sb.commit_text(&b, "g", "y\n");
+    sb.git_ok(&b, &["push", "-q", "origin", "main"]);
+    sb.git_ok(&a, &["pull", "-q", "enc", "main"]);
+    assert_eq!(fs::read_to_string(a.join("g")).unwrap(), "y\n");
+    assert_backend_sound(&sb, &b);
+    assert_backend_sound(&sb, &a);
+    // A push that stores no blob is sealed too.
+    sb.git_ok(&a, &["push", "-q", "enc", "main:tmp"]);
+    sb.git_ok(&a, &["push", "-q", "enc", "--delete", "tmp"]);
+    assert_backend_sound(&sb, &a);
+    // Several pushes, then a repack, each fetched by the other.
+    for i in 0..3 {
+        sb.commit_text(&a, "h", &format!("{i}\n"));
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    }
+    sb.enc_ok(&a, &["repack", "enc"]);
+    sb.git_ok(&b, &["pull", "-q", "origin", "main"]);
+    assert_eq!(fs::read_to_string(b.join("h")).unwrap(), "2\n");
+    for r in [&a, &b] {
+        assert_backend_sound(&sb, r);
     }
     assert_eq!(
         fs::read(b.join("big")).unwrap(),
@@ -3337,6 +3428,44 @@ fn the_backend_stays_out_of_the_user_repository() {
         .output()
         .unwrap();
     assert!(!present.status.success(), "the pack blob was downloaded");
+}
+
+#[test]
+fn a_pushed_part_over_the_big_file_threshold_is_dropped_too() {
+    let sb = Sandbox::new("backend-bigfile");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_random(&a, "big", 2_000_000);
+    // `hash-object` writes the part into a pack of its own, not loose.
+    let out = sb
+        .cmd(&a, "git")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.bigFileThreshold")
+        .env("GIT_CONFIG_VALUE_0", "100k")
+        .args(["push", "-q", "enc", "main"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let backend = backend_repo(&a);
+    assert!(
+        dir_size(&backend) < 500_000,
+        "{}: {}",
+        backend.display(),
+        dir_size(&backend)
+    );
+    assert_backend_sound(&sb, &a);
+    let b = sb.clone("bob", &url, &alice);
+    assert_eq!(
+        fs::read(b.join("big")).unwrap(),
+        fs::read(a.join("big")).unwrap()
+    );
 }
 
 #[test]
@@ -3644,8 +3773,9 @@ fn a_shallow_clone_does_without_the_history() {
     };
     assert!(!in_backend(&c));
 
+    // Fetched, indexed, and dropped again.
     sb.git_ok(&c, &["fetch", "-q", "--unshallow", "origin"]);
-    assert!(in_backend(&c));
+    assert!(!in_backend(&c));
     assert_eq!(
         sb.git_ok(&c, &["rev-parse", "--is-shallow-repository"])
             .trim(),

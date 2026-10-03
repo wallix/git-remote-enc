@@ -3,14 +3,14 @@
 //! §4.1, §5.1 steps 6–7, §5.4.
 
 use std::collections::HashSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::git::{self, Git, Oid, Streaming, TreeEntry};
-use crate::progress;
+use crate::{info, progress};
 
 pub const DEFAULT_BRANCH: &str = "enc";
 /// The message of a commit staging pack parts (DESIGN.md §5.1); the
@@ -108,6 +108,8 @@ impl Backend {
                 // `-q` would also silence the download's own meter; without
                 // it, fetch's other output is kept off the terminal.
                 if progress { "--progress" } else { "-q" },
+                // No merge of packs before `drop_fetched_blobs`.
+                "--no-auto-gc",
                 "--no-tags",
                 "--no-write-fetch-head",
                 "--no-recurse-submodules",
@@ -148,9 +150,12 @@ impl Backend {
         let progress = progress::enabled();
         let (ok, _, stderr) = self.git.run_status_tee(
             [
+                // A fetch from a promisor remote always keeps a pack: here
+                // one of pack blobs only, which `drop_fetched_blobs` drops.
                 "fetch",
                 // As in `fetch_tip`.
                 if progress { "--progress" } else { "-q" },
+                "--no-auto-gc",
                 "--no-tags",
                 "--no-write-fetch-head",
                 "--no-recurse-submodules",
@@ -170,6 +175,185 @@ impl Backend {
             );
         }
         Ok(())
+    }
+
+    /// Delete the packs `ensure_blobs` fetched, once the fetch's packs are
+    /// indexed: promisor packs whose objects are all among `blobs`, the
+    /// backend tree's pack blobs. Only `ensure_blobs` fetches one again. A
+    /// pack with a `.keep` (a fetch in flight) stays. Run `gc --auto`
+    /// afterwards. Best effort: leftovers only use disk space.
+    pub fn drop_fetched_blobs(&self, blobs: &HashSet<&str>) {
+        let Some(objects) = self.objects_dir() else {
+            return;
+        };
+        if packs_removable(&objects) {
+            let dir = objects.join("pack");
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    for e in entries.flatten() {
+                        let idx = e.path();
+                        if idx.extension().is_some_and(|x| x == "idx")
+                            && idx.with_extension("promisor").exists()
+                            && !idx.with_extension("keep").exists()
+                            && self.pack_within(&idx, |o| blobs.contains(o))
+                        {
+                            remove_pack(&idx);
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => info(&format!("warning: reading {}: {e}", dir.display())),
+            }
+        }
+        // In the foreground, so its result is this run's and it cannot race
+        // the next helper; a detached one that fails would also leave a
+        // `gc.log` that skips later auto gcs until `gc.logExpiry`.
+        match self
+            .git
+            .run_status(["-c", "gc.autoDetach=false", "gc", "--auto", "-q"])
+        {
+            Ok((true, _, _)) => {}
+            Ok((false, _, stderr)) => info(&format!(
+                "warning: `git gc --auto` failed in {}: {}",
+                objects.parent().unwrap_or(&objects).display(),
+                stderr.trim()
+            )),
+            Err(e) => info(&format!("warning: {e:#}")),
+        }
+    }
+
+    /// Delete the blobs `oids` this repository stored itself (a push's
+    /// parts): loose, or in a pack of their own when over
+    /// `core.bigFileThreshold`, which `hash-object` writes without a
+    /// `.promisor` file. Keep the blobs if [`Backend::seal`] fails.
+    /// Best effort: leftovers only use disk space.
+    pub fn drop_stored(&self, oids: &[Oid]) {
+        let Some(objects) = self.objects_dir() else {
+            return;
+        };
+        if !self.seal_or_warn(&objects) {
+            return;
+        }
+        let packed: HashSet<&str> = remove_loose(&objects, oids).into_iter().collect();
+        if packed.is_empty() || !packs_removable(&objects) {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(objects.join("pack")) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let idx = e.path();
+            if idx.extension().is_some_and(|x| x == "idx")
+                && !idx.with_extension("promisor").exists()
+                && !idx.with_extension("keep").exists()
+                && self.pack_within(&idx, |o| packed.contains(o))
+            {
+                remove_pack(&idx);
+            }
+        }
+    }
+
+    /// Like [`Backend::drop_stored`], but only for loose blobs after a
+    /// fetch, avoiding a scan of every pack index.
+    pub fn drop_loose(&self, oids: &[Oid]) {
+        let Some(objects) = self.objects_dir() else {
+            return;
+        };
+        if oids
+            .iter()
+            .any(|o| loose_path(&objects, o).is_some_and(|p| p.exists()))
+            && self.seal_or_warn(&objects)
+        {
+            remove_loose(&objects, oids);
+        }
+    }
+
+    /// Call [`Backend::seal`] after a successful push that stored no blob
+    /// (a ref deletion or participant change). Otherwise its non-promisor
+    /// commit has promisor ancestors, causing a full `git gc` to fail writing
+    /// bitmaps. Best effort.
+    pub fn seal_pushed(&self) {
+        if let Some(objects) = self.objects_dir() {
+            self.seal_or_warn(&objects);
+        }
+    }
+
+    /// Return whether [`Backend::seal`] succeeded, warning on failure.
+    fn seal_or_warn(&self, objects: &Path) -> bool {
+        self.seal(objects)
+            .inspect_err(|e| {
+                info(&format!(
+                    "warning: could not seal the backend commits; keeping their pack blobs: {e:#}"
+                ));
+            })
+            .is_ok()
+    }
+
+    /// Move the commits, trees and manifests reachable from the tracking ref
+    /// that no promisor pack holds or names (a push of ours: commit, staging
+    /// commits) into a promisor pack. git then treats the pack blobs they
+    /// name as promisor objects, which may be missing: without it, a
+    /// dropped one breaks `repack`, `gc` and `fsck`.
+    fn seal(&self, objects: &Path) -> Result<()> {
+        if self.tip()?.is_none() {
+            return Ok(());
+        }
+        let out = self.git.run([
+            "rev-list",
+            "--objects",
+            "--exclude-promisor-objects",
+            TRACKING_REF,
+        ])?;
+        let list = String::from_utf8(out).context("rev-list output is not UTF-8")?;
+        let mut input = String::new();
+        // `<oid>` for a commit, `<oid> ` for a root tree, `<oid> <name>`
+        // for a blob: the tree is flat.
+        for l in list.lines() {
+            let (oid, name) = l.split_once(' ').unwrap_or((l, ""));
+            if name.is_empty() || name == MANIFEST_BLOB {
+                input.push_str(oid);
+                input.push('\n');
+            }
+        }
+        if input.is_empty() {
+            return Ok(());
+        }
+        let base = objects.join("pack").join("pack");
+        let out = self.git.run_input(
+            [
+                OsStr::new("pack-objects"),
+                OsStr::new("-q"),
+                base.as_os_str(),
+            ],
+            input.as_bytes(),
+        )?;
+        let hash = String::from_utf8(out).context("pack-objects output is not UTF-8")?;
+        let promisor = objects
+            .join("pack")
+            .join(format!("pack-{}.promisor", hash.trim()));
+        std::fs::File::create(&promisor)
+            .with_context(|| format!("creating {}", promisor.display()))?;
+        self.git.run(["prune-packed", "-q"])?;
+        Ok(())
+    }
+
+    /// Whether pack `idx` is nonempty and every object satisfies `keep`.
+    fn pack_within(&self, idx: &Path, keep: impl Fn(&str) -> bool) -> bool {
+        // `<offset> <oid> (<crc>)` per object.
+        let Ok(out) = std::fs::read(idx).and_then(|i| {
+            self.git
+                .run_input(["show-index"], &i)
+                .map_err(std::io::Error::other)
+        }) else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&out);
+        let mut ids = text.lines().map(|l| l.split(' ').nth(1)).peekable();
+        ids.peek().is_some() && ids.all(|o| o.is_some_and(&keep))
+    }
+
+    fn objects_dir(&self) -> Option<PathBuf> {
+        self.git.dir().map(|d| d.join("objects"))
     }
 
     /// A present blob's content.
@@ -427,6 +611,35 @@ impl Backend {
     }
 }
 
+/// The path of loose object `oid`.
+fn loose_path(objects: &Path, oid: &str) -> Option<PathBuf> {
+    Some(objects.join(oid.get(..2)?).join(oid.get(2..)?))
+}
+
+/// Delete the loose objects among `oids`; the others are returned.
+fn remove_loose<'a>(objects: &Path, oids: &'a [Oid]) -> Vec<&'a str> {
+    oids.iter()
+        .filter(|o| loose_path(objects, o).is_none_or(|p| std::fs::remove_file(p).is_err()))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Whether a pack can be deleted by its files: not when a multi-pack-index
+/// lists it, which would then name a missing pack.
+fn packs_removable(objects: &Path) -> bool {
+    let pack = objects.join("pack");
+    !pack.join("multi-pack-index").exists() && !pack.join("multi-pack-index.d").exists()
+}
+
+/// Delete pack `idx` and its companion files. Best effort: leftovers only
+/// use disk space.
+fn remove_pack(idx: &Path) {
+    // The index goes first: without it the pack is invisible.
+    for ext in ["idx", "pack", "rev", "bitmap", "mtimes", "promisor"] {
+        let _ = std::fs::remove_file(idx.with_extension(ext));
+    }
+}
+
 /// A bare repository at `dir` that fetches `url` as a partial clone:
 /// commits, trees and manifests come with the branch, pack blobs on demand.
 /// Its object format is the user repository's, which held the backend
@@ -453,14 +666,15 @@ fn create(dir: &Path, url: &str) -> Result<()> {
         // Ciphertext: deflating it, or searching it for deltas, only costs
         // time (a lot of it for pack parts, which are under
         // core.bigFileThreshold). Set the loose and pack levels themselves:
-        // a user's explicit one beats `core.compression`. A fetch of fewer
-        // than `fetch.unpackLimit` objects (nearly every one here: a few
-        // large blobs) is unpacked into loose objects.
+        // a user's explicit one beats `core.compression`.
         ("core.compression", "0"),
         ("core.looseCompression", "0"),
         ("pack.compression", "0"),
         ("pack.window", "0"),
         ("core.logAllRefUpdates", "false"),
+        // Never merge packs by count: a fetched pack blob's pack must stay
+        // its own until dropped (`drop_fetched_blobs`).
+        ("gc.autoPackLimit", "0"),
     ] {
         git.run(["config", k, v])?;
     }

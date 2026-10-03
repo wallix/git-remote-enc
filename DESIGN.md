@@ -488,10 +488,27 @@ repository. Once an embargo ends, the clone is deleted (on an encrypted disk,
 that is the whole cleanup), and the backend branch and any mirror of it are
 deleted on the host once the audit trail (`log`) has been exported.
 
-The pack blobs fetched for indexing stay in the backend repository, so a
-clone still costs roughly twice its size locally. They are only needed again
-to index a pack anew, and could be dropped once indexed; that is not done
-yet.
+Pack blobs do not stay in the backend repository once used. A push's part
+blobs, written loose (or, over `core.bigFileThreshold`, in a pack of their
+own), are deleted once the host has them, or once the attempt is abandoned;
+a push that lost a race keeps them for its retry. Before deletion, and after
+every successful push, the commits, trees and manifests reachable from the
+tracking ref that no promisor pack holds or names (a push of ours) move into
+a pack with a `.promisor` file: git then treats the pack blobs they name as
+promisor objects, which may be missing, and `repack`, `gc` and `fsck` do not
+fail on a dropped one. A fetch from a promisor remote always keeps the pack
+it receives, so pack blobs fetched by id land in packs of their own; once
+the fetch's packs are indexed, the promisor packs that hold only pack blobs
+of the backend tree are deleted, as are loose copies of them, except packs
+with a `.keep` (a fetch in flight). Only reindexing a pack
+(`ensure_blobs`) fetches a deleted pack blob again: backend commands run
+with `GIT_NO_LAZY_FETCH`. No pack is deleted while a `multi-pack-index`
+exists, which would name it. Backend fetches run with `--no-auto-gc` and the
+repository has `gc.autoPackLimit=0` to keep blob packs separate until
+deletion. The helper then runs `gc --auto` in the foreground
+(`gc.autoDetach=false`), so it cannot race the next helper run, and reports
+a failure. Pack blobs under the 1 MiB filter that arrived with the branch
+remain, as do all pack blobs fetched from a host without filter support.
 
 ## 6. Trust model
 
@@ -833,9 +850,8 @@ it, is a second flow from the machine to the host that bypasses the helper
   starts at the epoch, from which the generation bound counts (section 6.2).
   A participant could already push a rewrite; `epoch` only lets it be told
   apart from the host's.
-- Local 2× storage: the backend repository fetches pack blobs on demand
-  (5.4) but keeps them once indexed. Dropping them after indexing would
-  remove the second copy.
+- Local storage: the decrypted objects, plus commits, trees and manifests of
+  the backend branch; pack blobs are dropped once indexed or pushed (5.4).
 - Thin packs give cross-push deltas for modified files. Unlike gcrypt, a
   100-byte change to a 1 MB file costs roughly the delta, not 1 MB.
 

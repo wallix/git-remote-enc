@@ -11,12 +11,15 @@ downloads the whole backend branch again.
   (`.git/enc/<key>/backend.git`), a partial clone: connecting downloads
   commits and blobs under 1 MiB (manifests, small packs), larger pack blobs
   when they are indexed. Encrypted blobs and `refs/enc/*` refs no longer
-  land in the user's repository. After migration, a later `git gc` frees the
-  space occupied by encrypted blobs in the user's repository once they
-  expire (`git gc --prune=now` frees it at once). Pack blobs are fetched by
-  id, which needs protocol v2 or `uploadpack.allowAnySHA1InWant` on a host
-  that supports filters. With git older than 2.45, the helper may download
-  pack blobs it did not ask for.
+  land in the user's repository, and the backend repository drops pack blobs
+  fetched for indexing or pushed once done with them: a new or migrated
+  clone no longer takes twice its size (pack blobs under 1 MiB, or all of
+  them on a host without filter support, stay). After migration, a later
+  `git gc` frees the space occupied by encrypted blobs in the user's
+  repository once they expire (`git gc --prune=now` frees it at once). Pack
+  blobs are fetched by id, which needs protocol v2 or
+  `uploadpack.allowAnySHA1InWant` on a host that supports filters. With git
+  older than 2.45, the helper may download pack blobs it did not ask for.
 - Encrypted packs over 1 GiB (`enc.partSize`) are stored as parts, and a
   push over 1 GiB (`enc.uploadBatch`) uploads them in several pushes ahead
   of the manifest.

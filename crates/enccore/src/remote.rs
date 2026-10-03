@@ -198,6 +198,8 @@ pub struct Remote {
     staged: Option<Staged>,
     /// Packs in the manifest before the current repack's first attempt.
     repack_before: Option<usize>,
+    /// Pack blob bytes stored by the last successful push.
+    pushed_bytes: u64,
     /// `option depth` from git, for the next fetch.
     depth: Option<u64>,
     deepen_relative: bool,
@@ -234,6 +236,7 @@ impl Remote {
             trust_keys: None,
             staged: None,
             repack_before: None,
+            pushed_bytes: 0,
             depth: None,
             deepen_relative: false,
         })
@@ -1084,6 +1087,18 @@ impl Remote {
             self.index_history(&m, h)?;
             self.update_boundary(&m, false)?;
         }
+        // Indexed: the ciphertext stays on the host only. Pack blobs under
+        // the filter came packed with the branch and stay; ones stored here
+        // (a push of ours) and fetched by id go.
+        let parts: Vec<Oid> = self
+            .tree
+            .iter()
+            .filter(|(_, ty, _, name)| ty == "blob" && name != MANIFEST_BLOB)
+            .map(|(_, _, oid, _)| oid.clone())
+            .collect();
+        self.backend.drop_loose(&parts);
+        self.backend
+            .drop_fetched_blobs(&parts.iter().map(String::as_str).collect());
         Ok(())
     }
 
@@ -1266,23 +1281,20 @@ impl Remote {
             bail!("no encrypted remote at {}", self.backend.url);
         }
         self.repack_before = None;
+        self.pushed_bytes = 0;
         self.push_with(
             &[],
             Op::Repack {
                 rewrite: rewrite_history,
             },
         )?;
-        // The new packs' blobs are local; the old ones may not be, so only
-        // their count is reported.
-        let mut bytes = 0u64;
-        for (_, ty, oid, name) in &self.tree {
-            if ty == "blob" && name != MANIFEST_BLOB {
-                bytes = bytes.saturating_add(self.backend.object_size(oid)?);
-            }
-        }
+        // The blobs are gone; their size was recorded when the push landed.
         Ok(Repacked {
             before: self.repack_before.unwrap_or_default(),
-            after: (self.manifest.as_ref().map_or(0, |m| m.packs.len()), bytes),
+            after: (
+                self.manifest.as_ref().map_or(0, |m| m.packs.len()),
+                self.pushed_bytes,
+            ),
         })
     }
 
@@ -1348,8 +1360,16 @@ impl Remote {
             .try_for_each(|p| self.state.add_have(&p.id))
     }
 
-    /// Delete staged packs' upload branch from the host, if they have one.
+    /// Delete staged packs' upload branch from the host, if they have one,
+    /// and their blobs here: landed, the ciphertext stays on the host only;
+    /// otherwise nothing uses them again.
     fn discard(&self, staged: Staged) {
+        let blobs: Vec<Oid> = staged
+            .packs
+            .iter()
+            .flat_map(|p| p.blobs.iter().map(|(_, oid)| oid.clone()))
+            .collect();
+        self.backend.drop_stored(&blobs);
         if let Some(branch) = &staged.upload_branch
             && let Err(e) = self.backend.delete_upload(branch)
         {
@@ -1538,6 +1558,9 @@ impl Remote {
                     && m.packs.len() == s.packs.len()
                     && s.packs.iter().all(|p| listed(&p.id));
                 let added = self.add_haves(&s);
+                if done {
+                    self.pushed_bytes = s.bytes;
+                }
                 self.discard(s);
                 added?;
                 if done {
@@ -1741,10 +1764,14 @@ impl Remote {
                 bail!("pushing to {}: {stderr}", self.backend.url)
             }
             PushOutcome::Done => {
+                self.pushed_bytes = 0;
                 if let Some(s) = self.staged.take() {
                     let added = self.add_haves(&s);
+                    self.pushed_bytes = s.bytes;
                     self.discard(s);
                     added?;
+                } else {
+                    self.backend.seal_pushed();
                 }
                 self.save_trust(&trust_in(&m, &text, Some(&commit)))?;
                 self.state.mark_known()?;
@@ -1986,6 +2013,7 @@ impl Remote {
             wants,
             bases,
             packs,
+            bytes: total,
             upload_branch: None,
             upload_tip: None,
         };
@@ -2341,6 +2369,8 @@ struct Staged {
     /// The ids of the packs listed when they were built.
     bases: Vec<String>,
     packs: Vec<StagedPack>,
+    /// Bytes of their blobs.
+    bytes: u64,
     upload_branch: Option<String>,
     /// The last commit pushed to `upload_branch`.
     upload_tip: Option<Oid>,
