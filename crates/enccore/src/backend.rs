@@ -88,6 +88,30 @@ impl Backend {
         self.git.rev_parse(TRACKING_REF)
     }
 
+    /// Move the tracking ref to `commit`, a landed push. The caller holds
+    /// the fetch lock, and checks that no fetch moved it since.
+    pub fn set_tip(&self, commit: &str) -> Result<()> {
+        self.git.update_ref(TRACKING_REF, commit)
+    }
+
+    /// The branch's commit on the host, if it exists, without fetching it:
+    /// the tracking ref stays at the last tip whose manifest was checked.
+    pub fn remote_tip(&self) -> Result<Option<Oid>> {
+        let (ok, out, stderr) = self.git.run_status(["ls-remote", "origin", &self.branch])?;
+        if !ok {
+            bail!("listing {} on {}: {}", self.branch, self.url, stderr.trim());
+        }
+        for line in out.split(|&b| b == b'\n') {
+            let line = std::str::from_utf8(line).context("ls-remote output is not UTF-8")?;
+            if let Some((oid, name)) = line.split_once('\t')
+                && name == self.branch
+            {
+                return Ok(Some(oid.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Forget the tracking ref: the next fetch is a first contact again.
     pub fn drop_tip(&self) -> Result<()> {
         if self.tip()?.is_some() {
@@ -98,7 +122,9 @@ impl Backend {
 
     /// Fetch the backend branch into the tracking ref, pack blobs left on the
     /// host. `None` when the branch does not exist yet (a new remote); any
-    /// other failure is an error.
+    /// other failure is an error. The caller holds the fetch lock
+    /// ([`crate::state::State::lock_fetch`]), as for every write of the
+    /// tracking ref: a concurrent update would fail this one.
     pub fn fetch_tip(&self) -> Result<Option<Oid>> {
         let refspec = format!("+{}:{TRACKING_REF}", self.branch);
         let progress = progress::enabled();
@@ -182,7 +208,9 @@ impl Backend {
     /// indexed: promisor packs whose objects are all among `blobs`, the
     /// backend tree's pack blobs. Only `ensure_blobs` fetches one again. A
     /// pack with a `.keep` (a fetch in flight) stays. Run `gc --auto`
-    /// afterwards. Best effort: leftovers only use disk space.
+    /// afterwards. The caller holds the fetch lock: no other helper of this
+    /// remote is reading the packs or sealing. Best effort: leftovers only
+    /// use disk space.
     pub fn drop_fetched_blobs(&self, blobs: &HashSet<&str>) {
         let Some(objects) = self.objects_dir() else {
             return;
@@ -226,8 +254,8 @@ impl Backend {
     /// Delete the blobs `oids` this repository stored itself (a push's
     /// parts): loose, or in a pack of their own when over
     /// `core.bigFileThreshold`, which `hash-object` writes without a
-    /// `.promisor` file. Keep the blobs if [`Backend::seal`] fails.
-    /// Best effort: leftovers only use disk space.
+    /// `.promisor` file. Keep the blobs if [`Backend::seal`] fails. The
+    /// caller holds the fetch lock. Best effort: leftovers only use disk space.
     pub fn drop_stored(&self, oids: &[Oid]) {
         let Some(objects) = self.objects_dir() else {
             return;
@@ -272,7 +300,7 @@ impl Backend {
     /// Call [`Backend::seal`] after a successful push that stored no blob
     /// (a ref deletion or participant change). Otherwise its non-promisor
     /// commit has promisor ancestors, causing a full `git gc` to fail writing
-    /// bitmaps. Best effort.
+    /// bitmaps. The caller holds the fetch lock. Best effort.
     pub fn seal_pushed(&self) {
         if let Some(objects) = self.objects_dir() {
             self.seal_or_warn(&objects);
@@ -540,7 +568,8 @@ impl Backend {
     }
 
     /// Compare-and-swap push of `commit` onto the branch, expecting the
-    /// branch to still be at `expected_old` (absent for a new remote).
+    /// branch to still be at `expected_old` (absent for a new remote). On
+    /// success the caller moves the tracking ref ([`Backend::set_tip`]).
     pub fn push(&self, commit: &str, expected_old: Option<&str>) -> Result<PushOutcome> {
         let lease = format!(
             "--force-with-lease={}:{}",
@@ -550,7 +579,6 @@ impl Backend {
         let refspec = format!("{commit}:{}", self.branch);
         let (ok, stderr) = self.git_push(&[&lease, "--", &self.url, &refspec])?;
         if ok {
-            self.git.update_ref(TRACKING_REF, commit)?;
             return Ok(PushOutcome::Done);
         }
         // Client-side lease check; a lost race can also surface as a

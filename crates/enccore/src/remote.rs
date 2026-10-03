@@ -304,8 +304,19 @@ impl Remote {
         Ok(self.trust_keys.clone().unwrap_or_default())
     }
 
+    /// Save `t` unless the trust state already accepted a later generation
+    /// (a concurrent fetch, its manifest checked against this one's
+    /// successor). Generations only grow, a rewrite's too. The caller holds
+    /// the fetch lock.
     fn save_trust(&mut self, t: &Trust) -> Result<()> {
         let keys = self.trust_keys()?;
+        if self
+            .state
+            .trust(&keys)?
+            .is_some_and(|stored| stored.generation > t.generation)
+        {
+            return Ok(());
+        }
         let key = keys
             .first()
             .ok_or_else(|| anyhow!("no private key to authenticate the local trust state with"))?;
@@ -316,6 +327,9 @@ impl Remote {
     /// packs and the backend repository. Returns the directory removed, and
     /// whether the list of the shallow boundary this remote set stays in it.
     pub fn forget(&mut self) -> Result<(PathBuf, bool)> {
+        // Wait for any running fetch. Removing the lock file does not
+        // release our lock; it stays held until this returns.
+        let _lock = self.state.lock_fetch()?;
         let kept = self.state.forget()?;
         if git::rev_parse(&self.state.legacy_ref)?.is_some() {
             git::delete_ref(&self.state.legacy_ref)?;
@@ -387,6 +401,18 @@ impl Remote {
         // Created on contact, so that `forget` leaves none behind.
         self.backend
             .create_if_missing(&self.state.temp_path("backend.git"))?;
+        if self.cfg.install_hook {
+            crate::guard::ensure_hook()?;
+        }
+        // Ask for a key passphrase before a potentially long download, and
+        // outside the lock.
+        if !self.cfg.identity_paths.is_empty() || self.cfg.signing_key.is_some() {
+            self.trust_keys()?;
+        }
+        // Held from reading the tracking ref through saving the trust state:
+        // another helper of this remote could move either in between, and
+        // the trust check would compare against a stale one.
+        let _lock = self.state.lock_fetch()?;
         // The contact marker is written once a manifest has been accepted:
         // with it present, missing trust state was lost, not never written.
         // The backend's tracking ref is not proof, as it moves before the
@@ -394,18 +420,11 @@ impl Remote {
         // own, the tracking ref was a ref of the user's, set only on
         // acceptance: it then stands in once, and goes.
         let legacy = git::rev_parse(&self.state.legacy_ref)?;
+        let known = legacy.is_some() || self.state.is_known();
         let previous_tip = match self.backend.tip()? {
             Some(t) => Some(t),
             None => legacy.clone(),
         };
-        let known = legacy.is_some() || self.state.is_known();
-        if self.cfg.install_hook {
-            crate::guard::ensure_hook()?;
-        }
-        // Ask for a key passphrase before a potentially long download.
-        if !self.cfg.identity_paths.is_empty() {
-            self.identities()?;
-        }
         self.tip = self.backend.fetch_tip()?;
         // Every push appends to the backend history; a tip that does not
         // descend from the one seen before means the host rewrote it, and
@@ -445,7 +464,9 @@ impl Remote {
                             self.warn_host_rewrite(old, new);
                         }
                         // A refused first contact leaves nothing that could
-                        // later appear accepted.
+                        // later appear accepted. Under the lock since `known`
+                        // and the fetch: no other helper accepted or moved
+                        // the tip since.
                         if !known {
                             // Best effort: the refusal is the error to report.
                             let _ = self.backend.drop_tip();
@@ -951,7 +972,10 @@ impl Remote {
         let oid = Backend::blob_oid(&tree, MANIFEST_BLOB)
             .ok_or_else(|| anyhow!("no manifest"))?
             .to_owned();
-        let blob = read_manifest_blob(&self.backend, &oid)?;
+        let blob = {
+            let _lock = self.state.lock_fetch()?;
+            read_manifest_blob(&self.backend, &oid)?
+        };
         let envelope = crypto::decrypt_to_vec(self.identities()?, &blob)?;
         let (text, sig) =
             split_envelope(&envelope).ok_or_else(|| anyhow!("manifest is not signed"))?;
@@ -990,6 +1014,7 @@ impl Remote {
     /// commits this remote set whose parents are now here stop being one.
     fn fetch_packs(&mut self, full: bool) -> Result<()> {
         self.connect()?;
+        let _lock = self.state.lock_fetch()?;
         let Some(m) = self.manifest.clone() else {
             return Ok(());
         };
@@ -1333,7 +1358,7 @@ impl Remote {
     fn push_with(&mut self, specs: &[RefSpec], op: Op) -> Result<Vec<PushStatus>> {
         let result = self.push_attempts(specs, op);
         if let Some(staged) = self.staged.take() {
-            self.discard(staged);
+            self.discard(staged, true);
         }
         result
     }
@@ -1362,14 +1387,22 @@ impl Remote {
 
     /// Delete staged packs' upload branch from the host, if they have one,
     /// and their blobs here: landed, the ciphertext stays on the host only;
-    /// otherwise nothing uses them again.
-    fn discard(&self, staged: Staged) {
-        let blobs: Vec<Oid> = staged
-            .packs
-            .iter()
-            .flat_map(|p| p.blobs.iter().map(|(_, oid)| oid.clone()))
-            .collect();
-        self.backend.drop_stored(&blobs);
+    /// otherwise nothing uses them again. Takes the fetch lock for the
+    /// latter, unless `drop_blobs` is false.
+    fn discard(&self, staged: Staged, drop_blobs: bool) {
+        if drop_blobs {
+            let blobs: Vec<Oid> = staged
+                .packs
+                .iter()
+                .flat_map(|p| p.blobs.iter().map(|(_, oid)| oid.clone()))
+                .collect();
+            match self.state.lock_fetch() {
+                Ok(_lock) => self.backend.drop_stored(&blobs),
+                Err(e) => info(&format!(
+                    "warning: keeping the pushed pack blobs in the backend repository: {e:#}"
+                )),
+            }
+        }
         if let Some(branch) = &staged.upload_branch
             && let Err(e) = self.backend.delete_upload(branch)
         {
@@ -1561,7 +1594,7 @@ impl Remote {
                 if done {
                     self.pushed_bytes = s.bytes;
                 }
-                self.discard(s);
+                self.discard(s, true);
                 added?;
                 if done {
                     return Ok(Some(statuses));
@@ -1640,7 +1673,7 @@ impl Remote {
             Some(s) if reusable(&s) => Some(s),
             old => {
                 if let Some(old) = old {
-                    self.discard(old);
+                    self.discard(old, true);
                 }
                 let bases = m.packs.iter().map(|p| p.id.clone()).collect();
                 let built = if wants.is_empty() {
@@ -1748,7 +1781,7 @@ impl Remote {
             PushOutcome::Failed(stderr) => {
                 // The lease is also enforced by the server; if the branch has
                 // moved since we read it, this was a lost race, not a failure.
-                if self.backend.fetch_tip()? != self.tip {
+                if self.backend.remote_tip()? != self.tip {
                     return Ok(None);
                 }
                 if repack == Some(true) {
@@ -1764,16 +1797,41 @@ impl Remote {
                 bail!("pushing to {}: {stderr}", self.backend.url)
             }
             PushOutcome::Done => {
+                // A lock failure must not report a landed push as failed.
+                // Leave the tracking ref, trust state and seal unchanged,
+                // as after another participant's push. The next connect
+                // fetches this commit and checks its manifest against the
+                // previous trust state. Keep the part blobs too: deleting
+                // them would leave the unsealed commit referencing missing
+                // non-promisor objects.
+                let locked = match self.state.lock_fetch() {
+                    Ok(_lock) => {
+                        // Unless a fetch since the push moved the tracking
+                        // ref (to this commit or past it): never backwards.
+                        if self.backend.tip()? == self.tip {
+                            self.backend.set_tip(&commit)?;
+                        }
+                        if self.staged.is_none() {
+                            self.backend.seal_pushed();
+                        }
+                        self.save_trust(&trust_in(&m, &text, Some(&commit)))?;
+                        true
+                    }
+                    Err(e) => {
+                        info(&format!(
+                            "warning: pushed, but not recorded locally; the next fetch \
+                             catches up: {e:#}"
+                        ));
+                        false
+                    }
+                };
                 self.pushed_bytes = 0;
                 if let Some(s) = self.staged.take() {
                     let added = self.add_haves(&s);
                     self.pushed_bytes = s.bytes;
-                    self.discard(s);
+                    self.discard(s, locked);
                     added?;
-                } else {
-                    self.backend.seal_pushed();
                 }
-                self.save_trust(&trust_in(&m, &text, Some(&commit)))?;
                 self.state.mark_known()?;
                 self.manifest_digest = Some(crypto::sha256_hex(text.as_bytes()));
                 self.tip = Some(commit.clone());
@@ -2062,7 +2120,7 @@ impl Remote {
                     staged.upload_tip = Some(commit);
                 }
                 Err(e) => {
-                    self.discard(staged);
+                    self.discard(staged, true);
                     return Err(e);
                 }
             }
@@ -2227,6 +2285,8 @@ fn oid_key(line: &[u8]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
+/// The manifest blob `oid`, fetched first if over the filter. The caller
+/// holds the fetch lock.
 fn read_manifest_blob(backend: &Backend, oid: &str) -> Result<Vec<u8>> {
     backend.ensure_blobs(&[oid.to_owned()])?;
     let size = backend.object_size(oid)?;

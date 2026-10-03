@@ -4,13 +4,15 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 use crate::crypto::{TrustKey, sha256_hex};
+use crate::progress;
 
 /// A temp file untouched for this long belongs to no running helper.
 const STALE_TEMP: Duration = Duration::from_secs(24 * 60 * 60);
@@ -107,6 +109,62 @@ impl State {
             .context("opening have list")?;
         writeln!(f, "{pack_id}")?;
         Ok(())
+    }
+
+    /// Hold the remote's fetch lock until the returned file is dropped.
+    /// Helpers of one remote in one repository take turns on the backend
+    /// repository's shared state: the tracking ref, which a concurrent
+    /// update would fail, the trust state, and the packs a fetch reads, then
+    /// drops, seals and `gc`s. An `flock(2)`: the kernel releases it when its
+    /// holder exits, crashed or not, so a leftover file is not a stale lock.
+    /// Waits as long as the holder runs. Where the filesystem has no
+    /// `flock` (some NFS mounts), warns once and goes on unlocked. Not
+    /// reentrant: a holder must not take it again.
+    pub fn lock_fetch(&self) -> Result<fs::File> {
+        static WAITED: AtomicBool = AtomicBool::new(false);
+        static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+        // `forget` deletes the file while holding it: a waiter then locks an
+        // unlinked file, and must lock the one now at the path instead.
+        const ATTEMPTS: usize = 8;
+        let path = self.dir.join("fetch.lock");
+        for _ in 0..ATTEMPTS {
+            let f = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            let locked = match f.try_lock() {
+                Ok(()) => Ok(()),
+                Err(fs::TryLockError::WouldBlock) => {
+                    if progress::enabled() && !WAITED.swap(true, Ordering::Relaxed) {
+                        crate::info("waiting for another fetch or push of this remote to finish");
+                    }
+                    f.lock()
+                }
+                Err(fs::TryLockError::Error(e)) => Err(e),
+            };
+            match locked {
+                Ok(()) => {}
+                Err(e) if lacks_flock(&e) => {
+                    if !UNSUPPORTED.swap(true, Ordering::Relaxed) {
+                        crate::info(&format!(
+                            "warning: {} cannot be locked ({e}): concurrent fetches and pushes \
+                             of this remote may fail",
+                            path.display()
+                        ));
+                    }
+                }
+                Err(e) => return Err(e).with_context(|| format!("locking {}", path.display())),
+            }
+            if is_at(&f, &path).with_context(|| format!("checking {}", path.display()))? {
+                return Ok(f);
+            }
+        }
+        bail!(
+            "locking {}: removed {ATTEMPTS} times while waiting for it",
+            path.display()
+        )
     }
 
     /// The commits this remote made shallow boundaries of the repository
@@ -316,6 +374,31 @@ fn read_trust(path: &Path, keys: &[TrustKey]) -> Result<Option<Trust>> {
     Ok(Some(t))
 }
 
+/// `ENOLCK`, which std maps to no specific `ErrorKind`.
+#[cfg(target_os = "linux")]
+const ENOLCK: Option<i32> = Some(37);
+#[cfg(target_os = "macos")]
+const ENOLCK: Option<i32> = Some(77);
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const ENOLCK: Option<i32> = None;
+
+/// Whether a lock failed because the filesystem has no `flock`: an
+/// unsupported operation, or `ENOLCK` (NFS without a lock daemon).
+fn lacks_flock(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported
+        || ENOLCK.is_some_and(|n| e.raw_os_error() == Some(n))
+}
+
+/// Whether `f` is still the file at `path`, not one unlinked or replaced.
+fn is_at(f: &fs::File, path: &Path) -> std::io::Result<bool> {
+    let held = f.metadata()?;
+    match fs::metadata(path) {
+        Ok(m) => Ok(m.dev() == held.dev() && m.ino() == held.ino()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +518,44 @@ mod tests {
                 assert_eq!(got, t, "{}", String::from_utf8_lossy(&input));
             }
         }
+        fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn lacks_flock_matches_unsupported_and_enolck() {
+        use std::io::{Error, ErrorKind};
+        assert!(lacks_flock(&Error::from(ErrorKind::Unsupported)));
+        assert!(!lacks_flock(&Error::from(ErrorKind::WouldBlock)));
+        assert!(!lacks_flock(&Error::from_raw_os_error(13))); // EACCES
+        #[cfg(target_os = "linux")]
+        assert!(lacks_flock(&Error::from_raw_os_error(37)));
+        #[cfg(target_os = "macos")]
+        assert!(lacks_flock(&Error::from_raw_os_error(77)));
+    }
+
+    #[test]
+    fn lock_fetch_follows_a_removed_lock_file() {
+        let root = std::env::temp_dir().join(format!("enc-lock-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let s = State::open(&root, "url", "refs/heads/enc").unwrap();
+        let path = s.dir().join("fetch.lock");
+        let held = s.lock_fetch().unwrap();
+        assert!(is_at(&held, &path).unwrap());
+        // A waiter, blocked on the file `forget` removes under it.
+        let waiter = std::thread::spawn({
+            let root = root.clone();
+            move || {
+                State::open(&root, "url", "refs/heads/enc")
+                    .unwrap()
+                    .lock_fetch()
+                    .unwrap()
+            }
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        fs::remove_file(&path).unwrap();
+        assert!(!is_at(&held, &path).unwrap());
+        drop(held);
+        let got = waiter.join().unwrap();
+        assert!(is_at(&got, &path).unwrap());
         fs::remove_dir_all(&root).unwrap();
     }
 }

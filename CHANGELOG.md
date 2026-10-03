@@ -45,6 +45,11 @@ downloads the whole backend branch again.
   after it. Even against a remote nobody has pushed to yet, the identities
   must now be readable, including the default one (`~/.ssh/id_ed25519`, or
   `user.signingkey` with `gpg.format = ssh`) when it exists.
+- Concurrent fetches and pushes of the same remote in one repository (such
+  as an editor's background fetch alongside your own) wait for each other
+  instead of failing or reporting a false rollback. While waiting, the
+  helper reports "waiting for another fetch or push of this remote to
+  finish".
 - A push that loses a race to another one reuses its encrypted pack on retry
   instead of rebuilding and re-uploading it.
 

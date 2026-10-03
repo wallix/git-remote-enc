@@ -4262,6 +4262,59 @@ fn shallow_since_and_exclude_are_refused() {
 }
 
 #[test]
+fn concurrent_fetches_of_one_remote_take_turns() {
+    let sb = Sandbox::new("concurrent-fetch");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_text(&a, "f", "0\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+    // A second name for the same remote: the same backend repository, but
+    // refs of its own, so that git does not serialise the two fetches.
+    sb.git_ok(&b, &["remote", "add", "again", &url]);
+    sb.git_ok(
+        &b,
+        &[
+            "config",
+            "remote.again.enc-identity",
+            alice.to_str().unwrap(),
+        ],
+    );
+    for round in 0..4 {
+        // Over the 1 MiB filter: fetched by id, then dropped.
+        sb.commit_random(&a, &format!("r{round}"), 1_500_000);
+        sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+        let fetches: Vec<_> = ["origin", "again"]
+            .iter()
+            .map(|r| {
+                sb.cmd(&b, "git")
+                    .args(["fetch", "-q", r])
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for f in fetches {
+            let out = f.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "round {round}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+    sb.git_ok(&b, &["merge", "-q", "--ff-only", "origin/main"]);
+    assert_eq!(
+        fs::read(b.join("r3")).unwrap(),
+        fs::read(a.join("r3")).unwrap()
+    );
+    assert_backend_sound(&sb, &b);
+}
+
+#[test]
 fn a_manifest_over_the_filter_is_fetched_once_and_kept() {
     let sb = Sandbox::new("big-manifest");
     let host = sb.host();
@@ -4338,5 +4391,153 @@ fn a_manifest_over_the_filter_is_fetched_once_and_kept() {
         "{fetches:#?}"
     );
     assert_eq!(packs(), before);
+    assert_backend_sound(&sb, &b);
+}
+
+/// Wait up to a minute for `cond`.
+fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !cond() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(60),
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_fetch_waits_for_the_lock() {
+    let sb = Sandbox::new("fetch-lock");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_text(&a, "f", "0\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+    sb.commit_text(&a, "f", "1\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+
+    // Another helper's lock.
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(backend_repo(&b).parent().unwrap().join("fetch.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let mut fetch = sb
+        .cmd(&b, "git")
+        .args(["fetch", "--progress", "origin"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = fetch.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            all.push_str(&line);
+            all.push('\n');
+            // The receiver is gone once the message was seen.
+            let _ = tx.send(line);
+        }
+        all
+    });
+    let start = std::time::Instant::now();
+    loop {
+        let line = rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap();
+        if line.contains("waiting for another fetch or push of this remote to finish") {
+            break;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(60));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert!(
+        fetch.try_wait().unwrap().is_none(),
+        "the fetch did not wait"
+    );
+    drop(lock);
+    let status = fetch.wait().unwrap();
+    let stderr = reader.join().unwrap();
+    assert!(status.success(), "{stderr}");
+    assert_eq!(
+        stderr.matches("waiting for another fetch").count(),
+        1,
+        "{stderr}"
+    );
+    sb.git_ok(&b, &["merge", "-q", "--ff-only", "origin/main"]);
+    assert_eq!(fs::read_to_string(b.join("f")).unwrap(), "1\n");
+}
+
+#[test]
+fn a_landed_push_does_not_take_back_a_later_fetch() {
+    let sb = Sandbox::new("push-vs-fetch");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_text(&a, "f", "0\n");
+    sb.git_ok(&a, &["push", "-q", "enc", "main"]);
+    let b = sb.clone("bob", &url, &alice);
+
+    // Hold the first push to land after this from returning, until `go`.
+    let landed = sb.root.join("landed");
+    let go = sb.root.join("go");
+    let hook = host.join("hooks/post-receive");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\n[ -e '{l}' ] && exit 0\n: >'{l}'\n\
+             while [ ! -e '{g}' ]; do sleep 0.1; done\n",
+            l = landed.display(),
+            g = go.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&hook).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    fs::set_permissions(&hook, perms).unwrap();
+
+    // Generation 2, from bob: landed on the host, not yet recorded.
+    sb.commit_text(&b, "g", "b\n");
+    let push = sb
+        .cmd(&b, "git")
+        .args(["push", "-q", "origin", "main"])
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("bob's push to land", || landed.exists());
+    // Generation 3, from alice, which bob then fetches.
+    sb.git_ok(&a, &["push", "-q", "enc", "main:other"]);
+    sb.git_ok(&b, &["fetch", "-q", "origin"]);
+    fs::write(&go, "").unwrap();
+    let out = push.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let backend = backend_repo(&b);
+    let tip = sb.git_ok(
+        &b,
+        &[
+            "--git-dir",
+            backend.to_str().unwrap(),
+            "rev-parse",
+            "refs/enc/tip",
+        ],
+    );
+    let hosted = sb.git_ok(&host, &["rev-parse", "refs/heads/enc"]);
+    assert_eq!(tip, hosted);
+    let trust = fs::read_to_string(backend.parent().unwrap().join("trust")).unwrap();
+    assert!(trust.starts_with("generation 3\n"), "{trust}");
+    sb.git_ok(&b, &["fetch", "-q", "origin"]);
     assert_backend_sound(&sb, &b);
 }

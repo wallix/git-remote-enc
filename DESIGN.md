@@ -459,6 +459,8 @@ every linked worktree, so trust accepted in one worktree holds in all):
   accepted. It is outside `<key>/` so that losing that directory, trust state
   and backend repository together, is not taken for a first contact.
 - `<common>/enc/<key>/have` — pack names already indexed.
+- `<common>/enc/<key>/fetch.lock` — an empty file whose `flock(2)` lock
+  helpers of the remote take turns on (below).
 - `<common>/enc/<key>/shallow` — the boundary commits this remote added to
   `$GIT_DIR/shallow` (section 5.2), which deepening removes. It survives
   `forget`, `git remote remove` and a URL change, as those commits' parents
@@ -511,6 +513,28 @@ deletion. The helper then runs `gc --auto` in the foreground
 (`gc.autoDetach=false`), so it cannot race the next helper run, and reports
 a failure. Pack blobs under the 1 MiB filter that arrived with the branch
 remain, as do all pack blobs fetched from a host without filter support.
+
+Helpers of one remote in one repository (an editor's or `git maintenance`'s
+background fetch next to the user's own fetch or push) take turns on
+`<common>/enc/<key>/fetch.lock` for what they share in the backend
+repository and the trust state: a connect from reading the tracking ref,
+through fetching and checking the manifest, to saving the trust state; a
+fetch from its download of pack blobs through indexing, dropping, sealing
+and `gc --auto`; and a landed push's move of the tracking ref (never
+backwards: not when a fetch moved it since), trust save, sealing and
+dropping of its parts. `forget` takes it too. A concurrent update of the
+tracking ref would fail a fetch, a trust state saved out of order would take
+an accepted generation back or report a rollback that is not one, and a drop
+could delete pack blobs another fetch is still indexing. A push's building,
+staging and upload run outside it, so fetches do not wait on them; a lost
+race checks the host's branch without fetching it, so the tracking ref only
+moves to a tip whose manifest is then checked. The lock is an `flock(2)`,
+which the kernel releases when its holder exits, crashed or killed: the file
+left behind is not a stale lock, and nothing needs cleaning up. A wait has
+no bound: a helper waits as long as the holder runs, a transport prompt (an
+SSH passphrase, HTTP credentials) during a locked fetch included. Where the
+filesystem has no `flock` (some NFS mounts), the helper warns and goes on
+without the lock.
 
 ## 6. Trust model
 
