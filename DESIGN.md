@@ -500,7 +500,9 @@ fail on a dropped one. A fetch from a promisor remote always keeps the pack
 it receives, so pack blobs fetched by id land in packs of their own; once
 the fetch's packs are indexed, the promisor packs that hold only pack blobs
 of the backend tree are deleted, as are loose copies of them, except packs
-with a `.keep` (a fetch in flight). Only reindexing a pack
+with a `.keep` (a fetch in flight). A manifest over the filter is fetched by
+id into its own promisor pack. Cleanup keeps this pack because the manifest
+is not a pack blob, so it is fetched only once. Only reindexing a pack
 (`ensure_blobs`) fetches a deleted pack blob again: backend commands run
 with `GIT_NO_LAZY_FETCH`. No pack is deleted while a `multi-pack-index`
 exists, which would name it. Backend fetches run with `--no-auto-gc` and the

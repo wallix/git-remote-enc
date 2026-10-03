@@ -133,7 +133,10 @@ impl Backend {
         self.tip()
     }
 
-    /// Fetch whichever of `oids` the backend repository lacks.
+    /// Fetch missing `oids`: pack blobs or a manifest over the filter.
+    /// A fetch from a promisor remote always keeps its pack.
+    /// `drop_fetched_blobs` preserves packs containing a manifest, so each
+    /// manifest is fetched only once.
     pub fn ensure_blobs(&self, oids: &[Oid]) -> Result<()> {
         let have: HashSet<Oid> = self.git.have_objects(oids)?.into_iter().collect();
         let missing: Vec<&str> = oids
@@ -150,8 +153,6 @@ impl Backend {
         let progress = progress::enabled();
         let (ok, _, stderr) = self.git.run_status_tee(
             [
-                // A fetch from a promisor remote always keeps a pack: here
-                // one of pack blobs only, which `drop_fetched_blobs` drops.
                 "fetch",
                 // As in `fetch_tip`.
                 if progress { "--progress" } else { "-q" },

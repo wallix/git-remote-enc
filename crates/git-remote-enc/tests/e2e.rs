@@ -4260,3 +4260,83 @@ fn shallow_since_and_exclude_are_refused() {
     let err = sb.git_fails(&c, &["fetch", "--shallow-since=2000-01-01", "origin"]);
     assert!(err.contains("--shallow-since is not supported"), "{err}");
 }
+
+#[test]
+fn a_manifest_over_the_filter_is_fetched_once_and_kept() {
+    let sb = Sandbox::new("big-manifest");
+    let host = sb.host();
+    let url = sb.url(&host, None);
+    let (alice, alice_pub) = sb.keypair("alice");
+    let a = sb.repo("alice");
+    sb.add_remote(&a, &url, &alice, &[&alice_pub]);
+    sb.commit_text(&a, "f", "0\n");
+    // Enough long ref names for a manifest over 1 MiB.
+    let head = sb.git_ok(&a, &["rev-parse", "HEAD"]).trim().to_owned();
+    let pad = "x".repeat(200);
+    let mut input = String::new();
+    for i in 0..5000 {
+        input.push_str(&format!("create refs/heads/b{i:05}-{pad} {head}\n"));
+    }
+    let mut child = sb
+        .cmd(&a, "git")
+        .args(["update-ref", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    sb.git_ok(&a, &["push", "-q", "enc", "refs/heads/*"]);
+
+    let b = sb.clone("bob", &url, &alice);
+    let backend = backend_repo(&b);
+    let out = sb
+        .cmd(&b, "git")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .arg("--git-dir")
+        .arg(&backend)
+        .args(["cat-file", "-s", "refs/enc/tip:manifest"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let size: u64 = String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(size > 1 << 20, "{size}");
+    let packs = || {
+        let mut v: Vec<_> = fs::read_dir(backend.join("objects/pack"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        v.sort();
+        v
+    };
+    let before = packs();
+    // Nothing new: the manifest is present, and not fetched again.
+    let trace = sb.root.join("trace");
+    let out = sb
+        .cmd(&b, "git")
+        .env("GIT_TRACE", &trace)
+        .args(["fetch", "-q", "origin"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let trace = fs::read_to_string(&trace).unwrap();
+    let fetches: Vec<&str> = trace
+        .lines()
+        .filter(|l| l.contains("built-in: git fetch"))
+        .collect();
+    assert!(
+        fetches.len() > 1 && !fetches.iter().any(|l| l.contains("--stdin")),
+        "{fetches:#?}"
+    );
+    assert_eq!(packs(), before);
+    assert_backend_sound(&sb, &b);
+}
